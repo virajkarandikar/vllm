@@ -271,4 +271,139 @@ class FastConformerCTC(nn.Module):
         return self.proj(hidden_states)  # [T, vocab]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        pass
+        nemo = {name: tensor for name, tensor in weights}
+
+        loaded_pairs: list[tuple[str, str]] = []
+        skipped: list[tuple[str, str]] = []
+
+        model_params = dict(self.named_parameters())
+        loaded_param_names: set[str] = set()
+
+        # helper to copy tensors with shape checking
+        def copy_(dst_param: torch.nn.Parameter, src: torch.Tensor,
+                dst_name: str, src_name: str):
+            if dst_param.shape != src.shape:
+                if src.dim() == 3 and src.shape[-1] == 1 and dst_param.shape == src.shape[:2]:
+                    dst_param.data.copy_(src.squeeze(-1))
+                else:
+                    skipped.append((src_name,
+                                    f"shape {tuple(src.shape)} -> {dst_name} {tuple(dst_param.shape)}"))
+                    return
+            else:
+                dst_param.data.copy_(src)
+            loaded_pairs.append((src_name, dst_name))
+            loaded_param_names.add(dst_name)
+
+        sub_map = [
+            ("encoder.pre_encode.conv.0.weight", self.subsample.conv0.weight, "subsample.conv0.weight"),
+            ("encoder.pre_encode.conv.0.bias",   self.subsample.conv0.bias,   "subsample.conv0.bias"),
+            ("encoder.pre_encode.conv.2.weight", self.subsample.conv2.weight, "subsample.conv2.weight"),
+            ("encoder.pre_encode.conv.2.bias",   self.subsample.conv2.bias,   "subsample.conv2.bias"),
+            ("encoder.pre_encode.conv.3.weight", self.subsample.conv3.weight, "subsample.conv3.weight"),
+            ("encoder.pre_encode.conv.3.bias",   self.subsample.conv3.bias,   "subsample.conv3.bias"),
+            ("encoder.pre_encode.conv.5.weight", self.subsample.conv5.weight, "subsample.conv5.weight"),
+            ("encoder.pre_encode.conv.5.bias",   self.subsample.conv5.bias,   "subsample.conv5.bias"),
+            ("encoder.pre_encode.conv.6.weight", self.subsample.conv6.weight, "subsample.conv6.weight"),
+            ("encoder.pre_encode.conv.6.bias",   self.subsample.conv6.bias,   "subsample.conv6.bias"),
+            ("encoder.pre_encode.out.weight",    self.subsample.out.weight,   "subsample.out.weight"),
+            ("encoder.pre_encode.out.bias",      self.subsample.out.bias,     "subsample.out.bias"),
+        ]
+        for n_src, p_dst, n_dst in sub_map:
+            if n_src in nemo:
+                copy_(p_dst, nemo[n_src], n_dst, n_src)
+
+        for i, blk in enumerate(self.blocks):
+            base = f"encoder.layers.{i}"
+
+            ln_pairs = [
+                (f"{base}.norm_feed_forward1.weight", blk.ff1.ln.weight, f"blocks.{i}.ff1.ln.weight"),
+                (f"{base}.norm_feed_forward1.bias",   blk.ff1.ln.bias,   f"blocks.{i}.ff1.ln.bias"),
+                (f"{base}.norm_self_att.weight",      blk.ln_attn.weight,f"blocks.{i}.ln_attn.weight"),
+                (f"{base}.norm_self_att.bias",        blk.ln_attn.bias,  f"blocks.{i}.ln_attn.bias"),
+                (f"{base}.norm_conv.weight",          blk.conv.ln.weight,f"blocks.{i}.conv.ln.weight"),
+                (f"{base}.norm_conv.bias",            blk.conv.ln.bias,  f"blocks.{i}.conv.ln.bias"),
+                (f"{base}.norm_feed_forward2.weight", blk.ff2.ln.weight, f"blocks.{i}.ff2.ln.weight"),
+                (f"{base}.norm_feed_forward2.bias",   blk.ff2.ln.bias,   f"blocks.{i}.ff2.ln.bias"),
+                (f"{base}.norm_out.weight",           blk.ln_out.weight, f"blocks.{i}.ln_out.weight"),
+                (f"{base}.norm_out.bias",             blk.ln_out.bias,   f"blocks.{i}.ln_out.bias"),
+            ]
+            for n_src, p_dst, n_dst in ln_pairs:
+                if n_src in nemo:
+                    copy_(p_dst, nemo[n_src], n_dst, n_src)
+
+            ffn1 = [
+                (f"{base}.feed_forward1.linear1.weight", blk.ff1.fc1.weight, f"blocks.{i}.ff1.fc1.weight"),
+                (f"{base}.feed_forward1.linear1.bias",   blk.ff1.fc1.bias,   f"blocks.{i}.ff1.fc1.bias"),
+                (f"{base}.feed_forward1.linear2.weight", blk.ff1.fc2.weight, f"blocks.{i}.ff1.fc2.weight"),
+                (f"{base}.feed_forward1.linear2.bias",   blk.ff1.fc2.bias,   f"blocks.{i}.ff1.fc2.bias"),
+            ]
+            for n_src, p_dst, n_dst in ffn1:
+                if n_src in nemo:
+                    copy_(p_dst, nemo[n_src], n_dst, n_src)
+
+            attn = [
+                (f"{base}.self_attn.linear_q.weight", blk.attn.q_proj.weight, f"blocks.{i}.attn.q_proj.weight"),
+                (f"{base}.self_attn.linear_q.bias",   blk.attn.q_proj.bias,   f"blocks.{i}.attn.q_proj.bias"),
+                (f"{base}.self_attn.linear_k.weight", blk.attn.k_proj.weight, f"blocks.{i}.attn.k_proj.weight"),
+                (f"{base}.self_attn.linear_k.bias",   blk.attn.k_proj.bias,   f"blocks.{i}.attn.k_proj.bias"),
+                (f"{base}.self_attn.linear_v.weight", blk.attn.v_proj.weight, f"blocks.{i}.attn.v_proj.weight"),
+                (f"{base}.self_attn.linear_v.bias",   blk.attn.v_proj.bias,   f"blocks.{i}.attn.v_proj.bias"),
+                (f"{base}.self_attn.linear_out.weight", blk.attn.o_proj.weight, f"blocks.{i}.attn.o_proj.weight"),
+                (f"{base}.self_attn.linear_out.bias",   blk.attn.o_proj.bias,   f"blocks.{i}.attn.o_proj.bias"),
+                (f"{base}.self_attn.linear_pos.weight", blk.attn.linear_pos.weight, f"blocks.{i}.attn.linear_pos.weight"),
+                (f"{base}.self_attn.pos_bias_u",        blk.attn.pos_bias_u,        f"blocks.{i}.attn.pos_bias_u"),
+                (f"{base}.self_attn.pos_bias_v",        blk.attn.pos_bias_v,        f"blocks.{i}.attn.pos_bias_v"),
+            ]
+            for n_src, p_dst, n_dst in attn:
+                if n_src in nemo:
+                    copy_(p_dst, nemo[n_src], n_dst, n_src)
+
+            conv = [
+                (f"{base}.conv.pointwise_conv1.weight", blk.conv.pw1.weight, f"blocks.{i}.conv.pw1.weight"),
+                (f"{base}.conv.pointwise_conv1.bias",   blk.conv.pw1.bias,   f"blocks.{i}.conv.pw1.bias"),
+                (f"{base}.conv.depthwise_conv.weight",  blk.conv.dw.weight,  f"blocks.{i}.conv.dw.weight"),
+                (f"{base}.conv.depthwise_conv.bias",    blk.conv.dw.bias,    f"blocks.{i}.conv.dw.bias"),
+                (f"{base}.conv.batch_norm.weight",      blk.conv.bn.weight,  f"blocks.{i}.conv.bn.weight"),
+                (f"{base}.conv.batch_norm.bias",        blk.conv.bn.bias,    f"blocks.{i}.conv.bn.bias"),
+                (f"{base}.conv.pointwise_conv2.weight", blk.conv.pw2.weight, f"blocks.{i}.conv.pw2.weight"),
+                (f"{base}.conv.pointwise_conv2.bias",   blk.conv.pw2.bias,   f"blocks.{i}.conv.pw2.bias"),
+            ]
+            for n_src, p_dst, n_dst in conv:
+                if n_src in nemo:
+                    copy_(p_dst, nemo[n_src], n_dst, n_src)
+
+            ffn2 = [
+                (f"{base}.feed_forward2.linear1.weight", blk.ff2.fc1.weight, f"blocks.{i}.ff2.fc1.weight"),
+                (f"{base}.feed_forward2.linear1.bias",   blk.ff2.fc1.bias,   f"blocks.{i}.ff2.fc1.bias"),
+                (f"{base}.feed_forward2.linear2.weight", blk.ff2.fc2.weight, f"blocks.{i}.ff2.fc2.weight"),
+                (f"{base}.feed_forward2.linear2.bias",   blk.ff2.fc2.bias,   f"blocks.{i}.ff2.fc2.bias"),
+            ]
+            for n_src, p_dst, n_dst in ffn2:
+                if n_src in nemo:
+                    copy_(p_dst, nemo[n_src], n_dst, n_src)
+
+        head_w = "ctc_decoder.decoder_layers.0.weight"
+        head_b = "ctc_decoder.decoder_layers.0.bias"
+        if head_w in nemo:
+            copy_(self.proj.weight, nemo[head_w], "proj.weight", head_w)
+        if head_b in nemo:
+            copy_(self.proj.bias, nemo[head_b], "proj.bias", head_b)
+
+        loaded_src = {src for (src, _) in loaded_pairs}
+
+        print(f"[load_weights] Loaded {len(loaded_pairs)} tensors.")
+
+        if skipped:
+            print(f"[load_weights] Skipped {len(skipped)} tensors (showing first 40):")
+            for n, why in skipped[:40]:
+                if n not in loaded_src:
+                    print(f"  - {n}: {why}")
+
+        unused_model_params = sorted(set(model_params.keys()) - loaded_param_names)
+        if unused_model_params:
+            print(f"[load_weights] Model params with NO checkpoint match ({len(unused_model_params)} shown first 40):")
+            for n in unused_model_params[:40]:
+                print(f"  - {n} : shape {tuple(model_params[n].shape)}")
+
+        if not skipped and not unused_model_params:
+            print("[load_weights] all weights loaded successfully.")
