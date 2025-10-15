@@ -227,7 +227,7 @@ class EarTTSForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        self.model = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
+        self.backbone = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
 
         # easy access of cruicial config params
         self.num_quantizers = self.config.num_quantizers
@@ -267,8 +267,8 @@ class EarTTSForCausalLM(nn.Module):
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # TODO: this should not be utilized
-        return self.model.get_input_embeddings(input_ids)
+        # this is for compatability, it is not supposed to be used
+        return self.backbone.get_input_embeddings(input_ids)
 
     def forward(
         self,
@@ -278,11 +278,11 @@ class EarTTSForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(
+        hidden_states = self.backbone(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
         codes = self._generate_step(hidden_states)  # quantizers x BT
-        return codes.transpose(0, 1).to(torch.float)
+        return codes.transpose(0, 1).to(inputs_embeds.dtype)
 
     def compute_logits(
         self,
