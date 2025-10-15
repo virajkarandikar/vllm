@@ -229,25 +229,14 @@ class EarTTSForCausalLM(nn.Module):
         self.config = vllm_config.model_config.hf_config
         self.model = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
 
-        # TODO: get it from config
-        self.num_quantizers = 31
-        self.codebook_size = 1024
-        self.num_iter = 8
-        self.top_p_or_k = 0.8
-        self.noise_scale = 0.8
-        self.exponent = 3.0
-        self.latent_size = 512
-        self.hidden_size = 1152
-        self.intermediate_size = 4608
-        self.mog_low_rank = 64
-        self.mog_num_layers = 3
-        self.mog_num_predictions = 1024
-        self.mog_min_log_std = -4.0
-        self.mog_eps = 1e-6
+        # easy access of cruicial config params
+        self.num_quantizers = self.config.num_quantizers
+        self.codebook_size = self.config.codebook_size
+        self.noise_scale = self.config.codebook_size
 
         # pre-compute how many tokens are unmasked at each iteration
-        rates = np.linspace(0.0, 1.0, self.num_iter + 1)[:-1].reshape(-1, 1)
-        masking_rates = np.power(1 - np.power(rates, self.exponent), 1 / self.exponent)
+        rates = np.linspace(0.0, 1.0, self.config.num_iter + 1)[:-1].reshape(-1, 1)
+        masking_rates = np.power(1 - np.power(rates, self.config.exponent), 1 / self.config.exponent)
         num_maskings = np.ceil(masking_rates * self.num_quantizers).astype(int)
         num_maskings_shifted = np.pad(num_maskings[1:], ((0, 1), (0, 0)), constant_values=0)
         sampling_per_step = num_maskings - num_maskings_shifted
@@ -260,21 +249,21 @@ class EarTTSForCausalLM(nn.Module):
         # the `codebook_size` token is reserved for padding
         # Store as Parameters so they can be used as tensors directly
         self.rvq_embeddings = nn.ParameterList([
-            nn.Parameter(torch.randn(self.codebook_size + 1, self.latent_size))
+            nn.Parameter(torch.randn(self.codebook_size + 1, self.config.latent_size))
             for _ in range(self.num_quantizers)
         ])
         self.padding_idx = self.codebook_size
-        self.embed_code = nn.Linear(self.latent_size, self.hidden_size, bias=False)
+        self.embed_code = nn.Linear(self.config.latent_size, self.config.hidden_size, bias=False)
         self.mog_head = MoGHead(
-            hidden_size=self.hidden_size,
-            intermediate_size=self.intermediate_size,
-            out_size=self.latent_size,
-            num_layers=self.mog_num_layers,
-            num_predictions=self.mog_num_predictions,
-            low_rank=self.mog_low_rank,
-            top_p_or_k=self.top_p_or_k,
-            min_log_std=self.mog_min_log_std,
-            eps=self.mog_eps,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            out_size=self.config.latent_size,
+            num_layers=self.config.mog_num_layers,
+            num_predictions=self.config.mog_num_predictions,
+            low_rank=self.config.mog_low_rank,
+            top_p_or_k=self.config.top_p_or_k,
+            min_log_std=self.config.mog_min_log_std,
+            eps=self.config.mog_eps,
         )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:

@@ -10,14 +10,30 @@ class EarTTSConfig(PretrainedConfig):
     
     def __init__(
         self,
+        # gemma 3 config
         hidden_size: int = 1152,
         intermediate_size: int = 4608,
         num_hidden_layers: int = 28,
         num_attention_heads: int = 16,
         num_key_value_heads: int = 16,
         head_dim: int = 72,
-        vocab_size: int = 32000,
+        vocab_size: int = 1,
         max_position_embeddings: int = 8192,
+
+        # custom config, related sampling
+        num_quantizers: int = 31,
+        codebook_size: int = 1024,
+        num_iter: int = 8,
+        top_p_or_k: float = 0.8,
+        noise_scale: float = 0.8,
+        exponent: float = 3.0,
+        latent_size: int = 512,
+        mog_low_rank: int = 64,
+        mog_num_layers: int = 3,
+        mog_num_predictions: int = 1024,
+        mog_min_log_std: float = -4.0,
+        mog_eps: float = 1e-6,
+
         # Gemma3-specific attributes required by Gemma3Model
         query_pre_attn_scalar: float = 256.0,  # Default attention scaling
         attention_bias: bool = False,  # Gemma models typically don't use attention bias
@@ -35,6 +51,7 @@ class EarTTSConfig(PretrainedConfig):
         is_causal: bool = True,  # Whether the model is causal
         **kwargs,
     ):
+        # gemma 3 config
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
@@ -44,6 +61,20 @@ class EarTTSConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         
+        # custom config, related sampling
+        self.num_quantizers = num_quantizers
+        self.codebook_size = codebook_size
+        self.num_iter = num_iter
+        self.top_p_or_k = top_p_or_k
+        self.noise_scale = noise_scale
+        self.exponent = exponent
+        self.latent_size = latent_size
+        self.mog_low_rank = mog_low_rank
+        self.mog_num_layers = mog_num_layers
+        self.mog_num_predictions = mog_num_predictions
+        self.mog_min_log_std = mog_min_log_std
+        self.mog_eps = mog_eps
+
         # Gemma3-specific attributes
         self.query_pre_attn_scalar = query_pre_attn_scalar
         self.attention_bias = attention_bias
