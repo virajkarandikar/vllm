@@ -46,21 +46,21 @@ class NemoSubsample8x2D(nn.Module):
         self.out = nn.Linear(256 * 11, d_out)  # 2816 -> 512
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [T, F]
-        T, F = x.shape
+        # x: [B, T, F]
+        B, T, F = x.shape
         assert F == self.mels, f"Expected mel dim {self.mels}, got {F}"
-        y = x.view(1, 1, T, F)             # [B=1, C=1, T, F]
-        y = self.act(self.conv0(y))        # [1, 256, T/2, F/2]
-        y = self.act(self.conv2(y))        # [1, 256, T/4, F/4]
-        y = self.act(self.conv3(y))        # [1, 256, T/4, F/4]
-        y = self.act(self.conv5(y))        # [1, 256, T/8, ~11]
-        y = self.act(self.conv6(y))        # [1, 256, T/8, 11]
+        y = x.view(B, 1, T, F)             # [B, C=1, T, F]
+        y = self.act(self.conv0(y))        # [B, 256, T/2, F/2]
+        y = self.act(self.conv2(y))        # [B, 256, T/4, F/4]
+        y = self.act(self.conv3(y))        # [B, 256, T/4, F/4]
+        y = self.act(self.conv5(y))        # [B, 256, T/8, ~11]
+        y = self.act(self.conv6(y))        # [B, 256, T/8, 11]
         B, C, T8, Fp = y.shape
         # Safety check: must be 11 so that C*Fp == 2816 for the Linear layer
         if C * Fp != 2816:
             raise RuntimeError(f"Subsampler produced C*F'={C}*{Fp}={C*Fp}, expected 2816.")
-        y = y.permute(2, 0, 1, 3).contiguous().view(T8, C * Fp)  # [T/8, 256*11]
-        y = self.out(y)                 # [T/8, d_out]
+        y = y.permute(2, 0, 1, 3).contiguous().view(B, T8, C * Fp)  # [B, T/8, 256*11]
+        y = self.out(y)                 # [B, T/8, d_out]
         return y
 
 
@@ -73,6 +73,7 @@ class ConformerFFN(nn.Module):
         self.drop = nn.Dropout(pdrop)
 
     def forward(self, x: torch.Tensor, scale: float = 0.5) -> torch.Tensor:
+        # x: [B, T, D]
         y = self.ln(x)
         y = self.fc2(F.silu(self.fc1(y)))
         return x + self.drop(y) * scale
@@ -156,12 +157,12 @@ class RelPosSelfAttention(nn.Module):
 
     @staticmethod
     def _rel_shift(x: torch.Tensor) -> torch.Tensor:
-        # x: [H, T, 2T-1] -> [H, T, T] (Transformer-XL trick)
-        H, T, _ = x.shape
-        x = F.pad(x, (1, 0))                      # [H, T, 2T]
-        x = x.view(H, -1, T)                      # [H, (T+ (T-1)), T] == [H, 2T-1 + 1 - 1, T] but using the known layout
-        x = x[:, 1:]                               # drop first row to shift
-        return x[:, :T]                            # [H, T, T]
+        # x: [B, H, T, 2T-1] -> [B, H, T, T] (Transformer-XL trick, batched)
+        B, H, T, m = x.shape
+        x = F.pad(x, (1, 0))  # pad width in dim=3 (2T-1 -> 2T)
+        x = x.view(B, H, -1, T)  # [B, H, (T + (T-1)), T]
+        x = x[:, :, 1:, :]  # drop the first element in new "S"-dim
+        return x[:, :, :T, :]  # return [B, H, T, T]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         attn_metadata = get_forward_context().attn_metadata
@@ -172,74 +173,82 @@ class RelPosSelfAttention(nn.Module):
             return self.forward_cache(x, attn_metadata[self.cache_prefix])
 
     def forward_no_cache(self, x: torch.Tensor) -> torch.Tensor:
-        T, D = x.shape
+        B, T, D = x.shape
         H, Dh = self.h, self.dh
-
-        q = self.q_proj(x).view(T, H, Dh).permute(1, 0, 2)  # [H, T, Dh]
-        k = self.k_proj(x).view(T, H, Dh).permute(1, 0, 2)  # [H, T, Dh]
-        v = self.v_proj(x).view(T, H, Dh).permute(1, 0, 2)  # [H, T, Dh]
-
+        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
+        k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
+        v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
         return self._attention_forward(q, k, v)
 
     def forward_cache(self, x: torch.Tensor, ctx: FastConformerMetadata) -> torch.Tensor:
-        T, D = x.shape
+        B, T, D = x.shape
         H, Dh = self.h, self.dh
 
-        q = self.q_proj(x).view(T, H, Dh).permute(1, 0, 2)      # [H, T, Dh]
-
-        assert ctx.num_reqs == 1, "bsz>1 not supported yet"
-        page_idx = ctx.slot_mapping[0]
+        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
+        k_new = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
+        v_new = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
 
         with torch.no_grad():
             kv_cache = self.cache.kv_cache[0]  # (2, n_pages, window, H, Dh)
-            k_cache = kv_cache[0][page_idx]  # [window, H, Dh]
-            v_cache = kv_cache[1][page_idx]  # [window, H, Dh]
+            k_cache = kv_cache[0][ctx.slot_mapping, ...]  # [B, window, H, Dh]
+            v_cache = kv_cache[1][ctx.slot_mapping, ...]  # [B, window, H, Dh]
 
-        k_new = self.k_proj(x).view(T, H, Dh).permute(1, 0, 2)  # [H, T, Dh]
-        v_new = self.v_proj(x).view(T, H, Dh).permute(1, 0, 2)  # [H, T, Dh]
+        k_cache = k_cache.permute(0, 2, 1, 3).contiguous()  # [B, H, window, Dh]
+        v_cache = v_cache.permute(0, 2, 1, 3).contiguous()  # [B, H, window, Dh]
 
-        # k_cat, v_cat: [H, window+T, Dh]
-        k_cat = torch.cat([k_cache.permute(1, 0, 2).reshape(H, -1, Dh), k_new], dim=1)
-        v_cat = torch.cat([v_cache.permute(1, 0, 2).reshape(H, -1, Dh), v_new], dim=1)
+        k_cat = torch.cat([k_cache, k_new], dim=2)  # [B, H, window+T, Dh]
+        v_cat = torch.cat([v_cache, v_new], dim=2)  # [B, H, window+T, Dh]
 
-        # update cache by rolling left
-        # TODO: this is unoptimized
-        new_k_cache = torch.cat([k_cache[T:], k_new.permute(1, 0, 2)], dim=0)   # [window, H, Dh]
-        new_v_cache = torch.cat([v_cache[T:], v_new.permute(1, 0, 2)], dim=0)   # [window, H, Dh]
+        # update kv cache by rolling left T
+        k_cache_new = torch.cat(
+            [k_cache[:, :, T:, :].permute(0, 2, 1, 3), k_new.permute(0, 2, 1, 3)], dim=1
+        )  # [B, window, H, Dh]
+        v_cache_new = torch.cat(
+            [v_cache[:, :, T:, :].permute(0, 2, 1, 3), v_new.permute(0, 2, 1, 3)], dim=1
+        )  # [B, window, H, Dh]
+
         with torch.no_grad():
-            self.cache.kv_cache[0][0][page_idx] = new_k_cache
-            self.cache.kv_cache[0][1][page_idx] = new_v_cache
+            self.cache.kv_cache[0][0][ctx.slot_mapping, ...] = k_cache_new
+            self.cache.kv_cache[0][1][ctx.slot_mapping, ...] = v_cache_new
 
         return self._attention_forward(q, k_cat, v_cat)
 
     def _attention_forward(self, q, k, v) -> torch.Tensor:
-        # q: [H, T, Dh], k/v: [H, S, Dh]
-        H, T, Dh = q.shape
-        S = k.shape[1]
+        # q, k, v: [B, H, T/S, Dh]
+        B, H, T, Dh = q.shape
+        S = k.shape[2]
         D = H * Dh
         device = q.device
         dtype = q.dtype
 
         # (q + u) @ k^T
-        q_with_u = q + self.pos_bias_u.unsqueeze(1)         # [H, T, Dh]
-        content_scores = torch.matmul(q_with_u, k.transpose(-2, -1))  # [H, T, S]
+        pos_bias_u = self.pos_bias_u.unsqueeze(0).unsqueeze(2)  # [1, H, 1, Dh]
+        q_with_u = q + pos_bias_u                               # [B, H, T, Dh]
+        content_scores = torch.matmul(q_with_u, k.transpose(-2, -1))  # [B, H, T, S]
 
-        rel = self._build_rel_sin_table(S, D, device, dtype)           # [2S-1, D]
-        rel = self.linear_pos(rel)                                     # [2S-1, D]
-        rel = rel.view(2 * S - 1, H, Dh).permute(1, 0, 2).contiguous() # [H, 2S-1, Dh]
+        # TODO: can we cache this?
+        rel = self._build_rel_sin_table(S, D, device, dtype)            # [2S-1, D]
+        rel = self.linear_pos(rel)                                      # [2S-1, D]
+        rel = rel.view(2 * S - 1, H, Dh).permute(1, 0, 2).contiguous()  # [H, 2S-1, Dh]
 
-        q_with_v = q + self.pos_bias_v.unsqueeze(1)                    # [H, T, Dh]
-        rel_scores = torch.matmul(q_with_v, rel.transpose(-2, -1))     # [H, T, 2S-1]
-        rel_scores = self._rel_shift(rel_scores)                       # [H, T, S]
+        # Compute (q + v) @ r^T with correct batching
+        pos_bias_v = self.pos_bias_v.unsqueeze(0).unsqueeze(2)          # [1, H, 1, Dh]
+        q_with_v = q + pos_bias_v                                      # [B, H, T, Dh]
+        rel_t = rel.transpose(1, 2)                                    # [H, Dh, 2S-1]
 
-        scores = (content_scores + rel_scores) * (Dh ** -0.5)          # [H, T, S]
+        # Compute: [B, H, T, Dh] x [H, Dh, 2S-1] -> [B, H, T, 2S-1]
+        rel_scores = torch.einsum('bhtd,hdm->bhtm', q_with_v, rel_t)   # [B, H, T, 2S-1]
+        rel_scores = self._rel_shift(rel_scores)                       # [B, H, T, S]
+
+        scores = (content_scores + rel_scores) * (Dh ** -0.5)          # [B, H, T, S]
 
         mask = build_local_band_mask(T, S, device=device, dtype=scores.dtype)  # [T, S]
-        scores = scores + mask.unsqueeze(0)  # broadcast over H
+        scores = scores + mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,S], broadcast over B, H
 
-        attn = F.softmax(scores, dim=-1)                               # [H, T, S]
-        y = torch.matmul(attn, v)                                      # [H, T, Dh]
-        y = y.permute(1, 0, 2).contiguous().view(T, D)                 # [T, D]
+        attn = F.softmax(scores, dim=-1)                               # [B, H, T, S]
+
+        y = torch.matmul(attn, v)                                      # [B, H, T, Dh]
+        y = y.transpose(1, 2).contiguous().view(B, T, D)               # [B, T, D]
         return self.o_proj(y)
 
 
@@ -255,22 +264,23 @@ class ConformerConvModule(nn.Module):
         self.pw2 = nn.Conv1d(d_model, d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [T, D]
-        y = self.ln(x)                      # [T, D]
-        y = y.transpose(0, 1).unsqueeze(0)  # [1, D, T]  (N, C, L)
+        # x: [B, T, D]
+        B, T, D = x.shape
+        y = self.ln(x)                         # [B, T, D]
+        y = y.transpose(1, 2)                  # [B, D, T] (N, C, L)
 
-        y = self.pw1(y)                     # [1, 2D, T]
-        a, b = y.chunk(2, dim=1)            # split along channel dim
-        y = a * torch.sigmoid(b)            # [1, D, T]
+        y = self.pw1(y)                        # [B, 2D, T]
+        a, b = y.chunk(2, dim=1)               # split along channel dim
+        y = a * torch.sigmoid(b)               # [B, D, T]
 
-        y = self.dw(y)                      # [1, D, T]
-        y = self.bn(y)                      # [1, D, T]  BN now sees C=D (good)
-        y = F.silu(y)
+        y = self.dw(y)                         # [B, D, T]
+        y = self.bn(y)                         # [B, D, T]
+        y = F.silu(y)                          # [B, D, T]
 
-        y = self.pw2(y)                     # [1, D, T]
-        y = y.squeeze(0).transpose(0, 1)    # [T, D]
+        y = self.pw2(y)                        # [B, D, T]
+        y = y.transpose(1, 2)                  # [B, T, D]
 
-        return x + y
+        return x + y                           # [B, T, D]
 
 
 class ConformerBlock(nn.Module):
@@ -302,7 +312,7 @@ class ConformerBlock(nn.Module):
 
 
 class FastConformerCTC(nn.Module):
-    """FastConformerCTC for vLLM, batchless I/O."""
+    """FastConformerCTC for vLLM."""
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -321,7 +331,7 @@ class FastConformerCTC(nn.Module):
         subs = config.subsampling or {}
         assert subs.get("type", "dw_striding") == "dw_striding", "Only 'dw_striding' subsampling is implemented"
         assert subs.get("factor", 8) == 8, "Only 8x subsampling is assumed"
-        mid_ch = subs.get("channels", 256)
+        mid_ch = subs.get("channels", 256) # unused for now
         self.subsample = NemoSubsample8x2D(d_out=self.d_model, mels=80)
 
         att_window = int(config.att_left_ctx + config.att_right_ctx)
@@ -346,6 +356,27 @@ class FastConformerCTC(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         raise Exception("not applicable for this model")
 
+    def _remove_ragged_format(self, x: torch.Tensor) -> torch.Tensor:
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata is None:
+            # attn_metadata is None during dummy runs
+            return x.unsqueeze(0)
+        ctx: FastConformerMetadata = attn_metadata.values()[0]
+        num_seqs = ctx.num_reqs
+        seq_lens = ctx.query_start_loc[1:] - ctx.query_start_loc[:-1]
+        if not torch.all(seq_lens == seq_lens[0]):
+            raise NotImplementedError(
+                "Ragged batch processing for variable sequence lengths is not supported"
+            )
+        batch_size = num_seqs
+        time_dim = seq_lens[0].item()
+        feature_dim = x.shape[-1]
+        return x.view(batch_size, time_dim, feature_dim)
+
+
+    def _add_ragged_format(self, x: torch.Tensor) -> torch.Tensor:
+        return x.squeeze(0)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -361,11 +392,14 @@ class FastConformerCTC(nn.Module):
         assert F == 640, f"expected feature dim=80*8, got {F}"
         x = x.view(T, 8, 80).reshape(T * 8, 80)
 
+        x = self._remove_ragged_format(x)
+
         x = self.subsample(x)
 
         for blk in self.blocks:
             x = blk(x)                 # [T/8, D]
 
+        x = self._add_ragged_format(x)
         return x
 
     def compute_logits(
