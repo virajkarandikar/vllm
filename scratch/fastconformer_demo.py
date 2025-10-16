@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import time
 from typing import List
 
 import torch
@@ -69,6 +70,8 @@ async def main():
     req_id = "asr-ctc-demo"
     emitted_ids: List[int] = []
 
+    latency_measurements: List[float] = []  # Per-token inference latencies
+
     first_packet = torch.randn(1, D_IN)
     gen_iter = engine.generate(
         request_id=req_id,
@@ -77,7 +80,7 @@ async def main():
         is_streaming=True,
     )
 
-    async def handle(output,step,compute_next=False):
+    async def handle(output, step, compute_next=False, latency=None):
         nonlocal emitted_ids
         hs = output.outputs[0].hidden_states[-1]  # [1,D]
         if hs is None or hs.numel() == 0:
@@ -89,13 +92,23 @@ async def main():
             ids = logits.argmax(dim=-1).tolist() # use greedy here
             emitted_ids.extend(ids)
             partial = sp.decode_ids(ctc_collapse(emitted_ids, blank_id)) if emitted_ids else ""
-            print(f"[step {step}] +{len(ids)} frames -> partial: {partial!r}")
+            if latency is not None:
+                print(f"[step {step}] +{len(ids)} frames -> partial: {partial!r} | latency: {latency*1000:.2f} ms")
+            else:
+                print(f"[step {step}] +{len(ids)} frames -> partial: {partial!r}")
         else:
-            print(f"[step {step}] -> hs shape: {hs.shape}")
+            if latency is not None:
+                print(f"[step {step}] -> hs shape: {hs.shape} | latency: {latency*1000:.2f} ms")
+            else:
+                print(f"[step {step}] -> hs shape: {hs.shape}")
 
     try:
+        t0 = time.perf_counter()
         first_out = await gen_iter.__anext__()
-        await handle(first_out,0)
+        t1 = time.perf_counter()
+        latency = t1 - t0
+        latency_measurements.append(latency)
+        await handle(first_out, 0, compute_next=False, latency=latency)
     except StopAsyncIteration as e:
         print(f"StopAsyncIteration: {e}")
         pass
@@ -104,8 +117,12 @@ async def main():
         pkt = torch.randn(1, D_IN)
         await engine.append_request(request_id=req_id, input_embeds=pkt)
         try:
+            t0 = time.perf_counter()
             out = await gen_iter.__anext__()
-            await handle(out,i)
+            t1 = time.perf_counter()
+            latency = t1 - t0
+            latency_measurements.append(latency)
+            await handle(out, i, compute_next=False, latency=latency)
         except StopAsyncIteration as e:
             print(f"StopAsyncIteration: {e}")
             break
@@ -114,6 +131,16 @@ async def main():
     print("\n=== FINAL ===")
     print("emitted_frames:", len(emitted_ids))
     print("decoded:", repr(final_text))
+
+    if latency_measurements:
+        import numpy as np
+        arr = np.array(latency_measurements)
+        print("latency...:")
+        print(f"steps measured: {len(latency_measurements)}")
+        print(f"mean latency:    {arr.mean()*1000:.2f} ms")
+        print(f"p50 latency:     {np.percentile(arr,50)*1000:.2f} ms")
+        print(f"p90 latency:     {np.percentile(arr,90)*1000:.2f} ms")
+        print(f"min/max latency: {arr.min()*1000:.2f} / {arr.max()*1000:.2f} ms")
 
 if __name__ == "__main__":
     asyncio.run(main())
