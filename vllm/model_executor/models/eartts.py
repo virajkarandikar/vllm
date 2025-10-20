@@ -228,20 +228,22 @@ class CharAwareSubwordEncoder(nn.Module):
 
 
 def depthsum_embedding(
-    code: torch.Tensor, rvq_embeddings: nn.ParameterList, padding_idx: int
+    code: torch.Tensor, rvq_embeddings: nn.ParameterList,
 ) -> torch.Tensor:
     """
     Embedds all codes into a single embedding.
     Args:
         code: Tensor (num_quantizers x BT) Acoustic codes to embed and add
+        rvq_embeddings: Tensor (num_quantizers x codebook_size x latent_size) RVQ embeddings
 
     Returns:
         Tensor (BT x latent_size) - embedded codes
     """
-    res = nn.functional.embedding(code[0], rvq_embeddings[0], padding_idx=padding_idx)
-    for i in range(1, len(rvq_embeddings)):
+    embs = nn.functional.pad(rvq_embeddings, [0, 0, 0, 1]) # num_quantizers x (codebook_size + 1) x latent_size
+    res = nn.functional.embedding(code[0], embs[0])
+    for i in range(1, len(embs)):
         res = res + nn.functional.embedding(
-            code[i], rvq_embeddings[i], padding_idx=padding_idx
+            code[i], embs[i]
         )
     return res
 
@@ -256,14 +258,7 @@ class EarTTSInputEmbedding(nn.Module):
             self.config.latent_size, self.config.hidden_size, bias=False
         )
         self.codebook_size = self.config.codebook_size
-        self.rvq_embeddings = nn.ParameterList(
-            [
-                nn.Parameter(
-                    torch.empty(self.config.codebook_size + 1, self.config.latent_size)
-                )
-                for _ in range(self.config.num_quantizers)
-            ]
-        )
+        self.rvq_embs = nn.Parameter(torch.empty(self.config.num_quantizers, self.config.codebook_size, self.config.latent_size))
         self.embed_tokens = nn.Embedding(
             self.config.vocab_size, self.config.context_hidden_size
         )
@@ -305,7 +300,7 @@ class EarTTSInputEmbedding(nn.Module):
 
         # embed previously predicted acoustic tokens
         audio_emb = depthsum_embedding(
-            audio_tokens, self.rvq_embeddings, self.codebook_size
+            audio_tokens, self.rvq_embs
         )  # T x dim
         audio_emb_proj = self.embed_code(audio_emb)  # T x dim
 
@@ -467,8 +462,8 @@ class MoGHead(nn.Module):
             logits = self.logits_processor(None, logits.view(-1, n)).view_as(logits)
 
         # Sample a mixture component using the Gumbel-Max trick
-        # mixture_indices = (nn.functional.log_softmax(logits, dim=-1) + gumbel_like(logits)).argmax(-1)
-        mixture_indices = (nn.functional.log_softmax(logits, dim=-1)).argmax(-1)
+        mixture_indices = (nn.functional.log_softmax(logits, dim=-1) + gumbel_like(logits)).argmax(-1)
+        #mixture_indices = (nn.functional.log_softmax(logits, dim=-1)).argmax(-1)
 
         # Select the mean corresponding to the sampled component
         mu = batch_matmul(
@@ -524,16 +519,8 @@ class EarTTSForCausalLM(nn.Module):
         self.num_to_sample = sampling_per_step_flat[first_nonzero:].tolist()
 
         # create layers used outside of backbone
-        # the `codebook_size` token is reserved for padding
         # Store as Parameters so they can be used as tensors directly
-        self.rvq_embeddings = nn.ParameterList(
-            [
-                nn.Parameter(
-                    torch.empty(self.codebook_size + 1, self.config.latent_size)
-                )
-                for _ in range(self.num_quantizers)
-            ]
-        )
+        self.rvq_embs = nn.Parameter(torch.empty(self.config.num_quantizers, self.config.codebook_size, self.config.latent_size))
         self.padding_idx = self.codebook_size
         self.embed_code = nn.Linear(
             self.config.latent_size, self.config.hidden_size, bias=False
@@ -567,6 +554,8 @@ class EarTTSForCausalLM(nn.Module):
         )
         codes = self._generate_step(hidden_states)  # quantizers x BT
         return codes.transpose(0, 1).to(inputs_embeds.dtype)
+        #return hidden_states
+        return codes
 
     def compute_logits(
         self,
@@ -583,7 +572,7 @@ class EarTTSForCausalLM(nn.Module):
         return loader.load_weights(weights)
 
     def _depthsum_embedding(self, code: torch.Tensor) -> torch.Tensor:
-        return depthsum_embedding(code, self.rvq_embeddings, self.padding_idx)
+        return depthsum_embedding(code, self.rvq_embs)
 
     def _depthsum_encoding_step_reshaped(
         self,
@@ -608,15 +597,15 @@ class EarTTSForCausalLM(nn.Module):
 
             # Compute distances: ||emb||² - 2⟨r, emb⟩
             idx_sel = (
-                self.rvq_embeddings[i].pow(2).sum(-1)  # [vocab_size]
-                - 2 * (r @ self.rvq_embeddings[i].T)  # [B*T, vocab_size]
+                self.rvq_embs[i].pow(2).sum(-1)  # [vocab_size]
+                - 2 * (r @ self.rvq_embs[i].T)  # [B*T, vocab_size]
             ).argmin(
                 -1
             )  # [B*T]
 
             # Update residual
             emb_i = nn.functional.embedding(
-                idx_sel, self.rvq_embeddings[i], padding_idx=self.padding_idx
+                idx_sel, self.rvq_embs[i], #padding_idx=self.padding_idx
             )  # [B*T, latent_size]
             r = r - emb_i
 
