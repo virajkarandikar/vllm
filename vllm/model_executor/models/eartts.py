@@ -547,13 +547,11 @@ class EarTTSForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        **kwargs,
+        total_embeddings: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.backbone(
-            input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
-        )
+        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, total_embeddings)
         codes = self._generate_step(hidden_states)  # quantizers x BT
-        return codes.transpose(0, 1)  # BT x quantizers
+        return hidden_states, codes.transpose(0, 1)  # BT x quantizers
 
     def compute_logits(
         self,
