@@ -38,4 +38,10 @@ class FastConformerCTCConfig(PretrainedConfig):
         self.frontend = frontend if frontend is not None else {}
         self.tokenizer = tokenizer if tokenizer is not None else {}
         self.notes = notes
+
+        # TODO: temporary flag for layer-specific correctness checks
+        self.attn_only = False
+        if "attn_only" in kwargs:
+            self.attn_only = kwargs["attn_only"]
+
         super().__init__(**kwargs)
