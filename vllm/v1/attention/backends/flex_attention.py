@@ -51,6 +51,8 @@ torch._dynamo.config.recompile_limit = 16
 #     create_block_mask, fullgraph=True, mode="reduce-overhead"
 # )
 # flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
+
+# TODO: figure out why torch.compile breaks on fastconformer
 create_block_mask_compiled = create_block_mask
 flex_attention_compiled = flex_attention
 

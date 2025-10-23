@@ -583,6 +583,12 @@ class FastConformerCTC(nn.Module):
         x = self.blocks[0].attn(x)
         x = self._add_ragged_format(x)
         return x
+    
+    def _forward_conv_only(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._remove_ragged_format(x, pre_subsample=False)
+        x = self.blocks[0].conv(x)
+        x = self._add_ragged_format(x)
+        return x
 
     def forward(
         self,
@@ -598,6 +604,8 @@ class FastConformerCTC(nn.Module):
         # used in tests
         if self.config.attn_only:
             return self._forward_attn_only(x)
+        if self.config.conv_only:
+            return self._forward_conv_only(x)
 
         T, F = x.shape
         assert F == 640, f"expected feature dim=80*8, got {F}"

@@ -39,9 +39,12 @@ class FastConformerCTCConfig(PretrainedConfig):
         self.tokenizer = tokenizer if tokenizer is not None else {}
         self.notes = notes
 
-        # TODO: temporary flag for layer-specific correctness checks
+        # TODO: temporary flags for layer-specific correctness checks
         self.attn_only = False
+        self.conv_only = False
         if "attn_only" in kwargs:
             self.attn_only = kwargs["attn_only"]
+        if "conv_only" in kwargs:
+            self.conv_only = kwargs["conv_only"]
 
         super().__init__(**kwargs)
