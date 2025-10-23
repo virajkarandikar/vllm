@@ -60,7 +60,8 @@ async def main():
         enable_prompt_embeds=True,
         enforce_eager=True,
         return_hidden_states=True,
-        skip_tokenizer_init=True
+        skip_tokenizer_init=True,
+        dtype="float32"
     )
     engine = AsyncLLM.from_engine_args(engine_args)
 

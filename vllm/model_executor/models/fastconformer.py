@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import math
+
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
 from vllm.attention.layer import Attention
@@ -19,23 +21,19 @@ from vllm.v1.attention.backends.fastconformer_attn import (
 from vllm.forward_context import get_forward_context
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend, FlexAttentionMetadata
-from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec, FastConformerConvSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
 
 from vllm.transformers_utils.configs.fastconformer import FastConformerCTCConfig
 import math
 
-def build_local_band_mask(T: int, window: int, device, dtype) -> torch.Tensor:
-    mask = torch.full((T, T), float("-inf"), device=device, dtype=dtype)
-    idx = torch.arange(T, device=device)
-    k = idx.view(1, T)
-    q = idx.view(T, 1)
-    allowed = (k <= q) & (k >= (q - (window - 1)))
-    mask = mask.masked_fill(allowed, 0.0)
-    return mask
+
+def _is_dummy_run() -> bool:
+    attn_metadata = get_forward_context().attn_metadata
+    return attn_metadata is None
+
 
 def _check(save_pth: str, x: torch.Tensor):
-    attn_metadata = get_forward_context().attn_metadata
-    if attn_metadata is None:
+    if _is_dummy_run():
         return
     print(f"[vllm_debug] checking {save_pth}...")
     ref_t = torch.load(save_pth)
@@ -48,132 +46,16 @@ def _check(save_pth: str, x: torch.Tensor):
     print(f"[vllm_debug] shape={tuple(a.shape)} | mean abs diff={diff.mean():.6f} | max abs diff={diff.max():.6f} | mean rel diff={rel.mean():.6f}")
 
 def _dbg_save(save_pth: str, x: torch.Tensor):
-    attn_metadata = get_forward_context().attn_metadata
-    if attn_metadata is None:
+    if _is_dummy_run():
         return
     print(f"[vllm_debug] saving {save_pth}...")
     torch.save(x, save_pth)
     print(f"[vllm_debug] saved {save_pth}")
 
-class CausalConv2D(nn.Conv2d):
-    """
-    A causal version of nn.Conv2d where each location in the 2D matrix would have no access to locations on its right or down
-    All arguments are the same as nn.Conv2d except padding which should be set as None
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        stride: int = 1,
-        padding: None = None,
-        dilation: int = 1,
-        groups: int = 1,
-        bias: bool = True,
-        padding_mode: str = 'zeros',
-        device=None,
-        dtype=None,
-    ) -> None:
-        self._left_padding = kernel_size - 1
-        self._right_padding = stride - 1
-
-        padding = 0
-        super(CausalConv2D, self).__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-            groups,
-            bias,
-            padding_mode,
-            device,
-            dtype,
-        )
-
-    def forward(
-        self, x,
-    ):
-        x = F.pad(x, pad=(self._left_padding, self._right_padding, self._left_padding, self._right_padding))
-        x = super().forward(x)
-        return x
-
-class ConvSubsamplingDWStridingCausalReference(nn.Module):
-    def __init__(self, feat_in: int = 80, feat_out: int = 512, conv_channels: int = 256):
-        super().__init__()
-        self.feat_in = feat_in
-        self.feat_out = feat_out
-        self.mid_ch = conv_channels
-
-        # Individual layers to match weight loader
-        self.conv0 = CausalConv2D(1, 256, kernel_size=3, stride=2, padding=None, bias=True)
-        self.act0 = nn.ReLU(inplace=True)
-
-        self.conv2 = CausalConv2D(256, 256, kernel_size=3, stride=2, padding=None, groups=256, bias=True)
-        self.conv3 = nn.Conv2d(256, 256, kernel_size=1, stride=1, padding=0, bias=True)
-        self.act3 = nn.ReLU(inplace=True)
-
-        self.conv5 = CausalConv2D(256, 256, kernel_size=3, stride=2, padding=None, groups=256, bias=True)
-        self.conv6 = nn.Conv2d(256, 256, kernel_size=1, stride=1, padding=0, bias=True)
-        self.act6 = nn.ReLU(inplace=True)
-
-        # Output projection, hardcode sequence length per NeMo for feat_in=80
-        L = torch.tensor(float(self.feat_in))
-        for _ in range(3):
-            L = torch.floor((L + 3 - 3) / 2.0) + 1.0
-        out_length = int(L.item())
-        self.out = nn.Linear(256 * out_length, self.feat_out, bias=True)
-
-    @torch.no_grad()
-    def _mask(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        # NeMo-style time mask on [B, C, T, F]
-        B, _, T, _ = x.shape
-        mask = torch.arange(T, device=x.device).view(1, 1, T, 1) < lengths.view(B, 1, 1, 1)
-        return x * mask
-
-    @torch.no_grad()
-    def _update_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
-        # floor((L + (left+right) - K)/S) + 1 (with Nemo param: left+right=3, K=3, S=2)
-        return torch.floor_divide(lengths, 2) + 1
-
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:
-        B, T, F = x.shape
-        assert F == self.feat_in
-        if lengths is None:
-            lengths = torch.full((B,), T, device=x.device, dtype=torch.long)
-
-        y = x.unsqueeze(1)  # [B, 1, T, F]
-
-        # Stage 0: causal 3x3, stride 2, "full" conv, + ReLU
-        y = self._mask(y, lengths)
-        y = self.conv0(y)
-        lengths = self._update_lengths(lengths)
-        y = self.act0(y)
-
-        # Stage 1: causal 3x3, stride 2, depthwise, then 1x1 pointwise + ReLU
-        y = self._mask(y, lengths)
-        y = self.conv2(y)
-        lengths = self._update_lengths(lengths)
-        y = self._mask(y, lengths)
-        y = self.conv3(y)
-        y = self.act3(y)
-
-        # Stage 2: causal 3x3, stride 2, depthwise, then 1x1 pointwise + ReLU
-        y = self._mask(y, lengths)
-        y = self.conv5(y)
-        lengths = self._update_lengths(lengths)
-        y = self._mask(y, lengths)
-        y = self.conv6(y)
-        y = self.act6(y)
-
-        # Flatten and output projection
-        B, C, T_, F_ = y.shape
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T_, C * F_)
-        y = self.out(y)
-        return y
-
+# TODO: This module needs to be cleaned up. It is designed to replicate the NeMo subsampler
+# in a lighter weight manner, but it is currently unclear which configuration of the subsampler
+# is appropriate for inference (i.e. which matches the training configuration). For the time being,
+# the main FastConformerCTC modelling class imports the NeMo subsampler and uses it directly.
 class NemoSubsample8x2D(nn.Module):
     def __init__(self, d_out: int, mid_ch: int, mels: int):
         super().__init__()
@@ -239,9 +121,11 @@ class FastConformerConvCache(torch.nn.Module, AttentionLayerBase):
         self.d_model = int(d_model)
         self.k = int(k)
         self.left_ctx = self.k - 1  # L
-        # TODO: this is a hack to get the page size to match attn page size
-        # we should try to get smth more durable to work
+
+        # The conv cache page size must match the attn page size by vLLM requirements.
+        # TODO: is there a less hacky way to do this?
         self.left_shape = self.left_ctx * 32
+
         self.prefix = prefix
         self.cache_config = cache_config
         self.kv_cache = [torch.tensor([])]
@@ -253,10 +137,7 @@ class FastConformerConvCache(torch.nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
-            # TODO: i think this should just be block_size=1?
-            # need to re-check how the attn metadata is constructed
             block_size=self.cache_config.block_size,
-            # shape=(self.left_ctx, self.d_model),
             shape=(self.left_shape, self.d_model),
             dtype=self.dtype,
         )
@@ -278,24 +159,21 @@ class RelPosSelfAttention(nn.Module):
         self.window = int(window)
         self.prefix = prefix
 
-        # projections
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.o_proj = nn.Linear(d_model, d_model)
 
-        # relative-pos pieces
         self.linear_pos = nn.Linear(d_model, d_model, bias=False)
         self.pos_bias_u = nn.Parameter(torch.zeros(self.h, self.dh))
         self.pos_bias_v = nn.Parameter(torch.zeros(self.h, self.dh))
 
-        # vLLM attention wrapper (force Flex backend)
         self.attn = Attention(
             num_heads=self.h,
             head_size=self.dh,
             scale=self.dh ** -0.5,
             num_kv_heads=self.h,
-            cache_config=CacheConfig(           # values here are ignored by our overrides
+            cache_config=CacheConfig(
                 sliding_window=self.window,
                 cache_dtype="auto",
                 block_size=cache_config.block_size,
@@ -305,18 +183,20 @@ class RelPosSelfAttention(nn.Module):
             attn_backend=FlexAttentionBackend,
         )
 
-        # required by KV-cache ops signature
         self._k_scale = torch.tensor(1.0, dtype=torch.float32)
         self._v_scale = torch.tensor(1.0, dtype=torch.float32)
         self._q_scale = torch.tensor(1.0, dtype=torch.float32)
         self._prob_scale = torch.tensor(1.0, dtype=torch.float32)
 
+        # required by the FlexAttention backend
         if cache_config.block_size != 128:
             raise Exception(
                 f"attn cache block size must be 128, got {cache_config.block_size}"
             )
 
-    # ---------------- Reference path (for parity checks) ----------------
+        # cache for projected relative position embeddings per device/dtype/window
+        self._rel_cache: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+
     def _forward_ref(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         H, Dh = self.h, self.dh
@@ -325,9 +205,9 @@ class RelPosSelfAttention(nn.Module):
         q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
         k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
         v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
-        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q.pt", q)
-        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/k.pt", k)
-        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/v.pt", v)
+        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q.pt", q)
+        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/k.pt", k)
+        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/v.pt", v)
 
         device, idtype = x.device, x.dtype
         pos_idx = torch.arange(T - 1, -T, -1, device=device)[:T]
@@ -344,8 +224,8 @@ class RelPosSelfAttention(nn.Module):
 
         q_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
         q_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)
-        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q_u.pt", q_u)
-        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q_v.pt", q_v)
+        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q_u.pt", q_u)
+        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q_v.pt", q_v)
 
         scores_ac = torch.matmul(q_u, k.transpose(-2, -1))  # [B,H,T,T]
 
@@ -354,17 +234,6 @@ class RelPosSelfAttention(nn.Module):
         bd = F.pad(raw_bd, (1, 0))
         bd = bd.view(b, h, pos_len + 1, qlen)[:, :, 1:].view(b, h, qlen, pos_len)
         scores_bd = bd
-
-        # debugging...
-        W = int(self.window)
-        scores_bd_scaled = scores_bd * (Dh ** -0.5)
-        idx = torch.arange(T, device=q.device)
-        q_idx = idx.view(1,1,T,1)
-        kv_idx = idx.view(1,1,1,T)
-        allowed = (kv_idx <= q_idx) & ((q_idx - kv_idx) <= W)
-        scores_bd_scaled = scores_bd_scaled.masked_fill(~allowed,0)
-        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/scores_bd.pt", scores_bd_scaled)
-        # debugging...
 
         scores = (scores_ac + scores_bd) * (Dh ** -0.5)
 
@@ -386,13 +255,16 @@ class RelPosSelfAttention(nn.Module):
         ctx = torch.matmul(probs, v).transpose(1, 2).contiguous().view(B, T, D)
         return self.o_proj(ctx)
 
-    # ---------------- Shaw band for score_mod ----------------
-    def _build_shaw_band_bias(self, q: torch.Tensor, W: int) -> torch.Tensor:
-        B, H, T, Dh = q.shape
-        D = H * Dh
-        device, dtype = q.device, q.dtype
+    def _get_rel_proj(self, device: torch.device, dtype: torch.dtype, W: int) -> torch.Tensor:
+        key = (device, dtype, W)
+        cached = self._rel_cache.get(key)
+        if cached is not None:
+            return cached
 
-        deltas = torch.arange(-W, W + 1, device=device)[:, None].to(torch.float32)  # [2W+1,1]
+        H, Dh = self.h, self.dh
+        D = H * Dh
+
+        deltas = torch.arange(-W, W + 1, device=device)[:, None].to(torch.float32)
         div = torch.exp(torch.arange(0, D, 2, device=device, dtype=torch.float32)
                         * (-math.log(10000.0) / D))
         sin = torch.sin(deltas * div)
@@ -401,8 +273,15 @@ class RelPosSelfAttention(nn.Module):
         rel[:, 0::2] = sin
         rel[:, 1::2] = cos
 
-        rel = self.linear_pos(rel.to(dtype))                # [2W+1, D]
-        rel = rel.view(2 * W + 1, H, Dh).permute(1, 2, 0)   # [H, Dh, 2W+1]
+        rel = self.linear_pos(rel.to(dtype))              # [2W+1, D]
+        rel = rel.view(2 * W + 1, H, Dh).permute(1, 2, 0).contiguous()  # [H, Dh, 2W+1]
+        self._rel_cache[key] = rel
+        return rel
+
+    def _build_shaw_band_bias(self, q: torch.Tensor, W: int) -> torch.Tensor:
+        B, H, T, Dh = q.shape
+        device, dtype = q.device, q.dtype
+        rel = self._get_rel_proj(device, dtype, W)  # [H, Dh, 2W+1]
 
         q_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)   # [B,H,T,Dh]
         # _check("/home/scratch.jdaw_coreai/landrew/tmp/q_v.pt", q_v)
@@ -410,7 +289,7 @@ class RelPosSelfAttention(nn.Module):
         band_bias = band_bias * (Dh ** -0.5)
         return band_bias
 
-    def _make_shaw_score_mod_flat(self, band_bias: torch.Tensor, W: int):
+    def _make_shaw_score_mod_flat(self, band_bias: torch.Tensor, W: int, attn_meta: FlexAttentionMetadata):
         @torch.jit.script_if_tracing
         def score_mod(
             score: torch.Tensor,
@@ -422,17 +301,18 @@ class RelPosSelfAttention(nn.Module):
         ) -> torch.Tensor:
             rel = logical_q_idx - logical_kv_idx
             rel = torch.clamp(rel, -W, W) + W
-            return score + band_bias[b.long(), h.long(), logical_q_idx.long(), rel.long()]
+
+            doc_id = attn_meta.doc_ids[physical_q.long()] if physical_q is not None else b
+            local_q_idx = logical_q_idx - attn_meta.decode_offset[doc_id.long()]
+            return score + band_bias[doc_id.long(), h.long(), local_q_idx.long(), rel.long()]
         return score_mod
 
     def _install_exact_mask(self, attn_meta: FlexAttentionMetadata):
-        """
-        Replace any internal mask with our own logical_mask_mod (causal + inclusive window)
-        and rebuild the block mask using the generic path.
-        """
         W = int(self.window)
 
-        # exact logical mask in LOGICAL space (decoder path)
+        # exact logical mask in logical index space
+        # TODO: this logic exists in the FlexAttention backend
+        # we should be able to remove this method
         def logical_mask_mod(b: torch.Tensor,
                              h: torch.Tensor,
                              q_idx: torch.Tensor,
@@ -442,7 +322,7 @@ class RelPosSelfAttention(nn.Module):
         attn_meta.sliding_window = None
         attn_meta.logical_mask_mod = logical_mask_mod
 
-        attn_meta.direct_build = False
+        attn_meta.direct_build = True
         attn_meta.block_mask = attn_meta.build_block_mask()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -461,7 +341,6 @@ class RelPosSelfAttention(nn.Module):
         B, T, D = x.shape
         H, Dh = self.h, self.dh
 
-        # Projections
         q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
         k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
         v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
@@ -473,23 +352,7 @@ class RelPosSelfAttention(nn.Module):
 
         W = int(self.window)
         band_bias = self._build_shaw_band_bias(q, W)
-
-        # debugging.....
-        idx = torch.arange(T, device=q.device)
-        q_idx = idx.view(1, 1, T, 1)
-        kv_idx = idx.view(1, 1, 1, T)
-        rel = q_idx - kv_idx
-        rel = torch.clamp(rel, -W, W) + W  # [1,1,T,T]
-        scores_bd_band = band_bias.gather(-1, rel.expand(B, H, T, T))  # [B,H,T,T]
-        idx = torch.arange(T, device=q.device)
-        q_idx = idx.view(1,1,T,1)
-        kv_idx = idx.view(1,1,1,T)
-        allowed = (kv_idx <= q_idx) & ((q_idx - kv_idx) <= W)
-        scores_bd_band = scores_bd_band.masked_fill(~allowed,0)
-        # _check("/home/scratch.jdaw_coreai/landrew/tmp/scores_bd.pt", scores_bd_band)
-        # debugging.....
-
-        band_bias_flat = band_bias.view(-1, H, 2 * W + 1)
+        # band_bias_flat = band_bias.view(-1, H, 2 * W + 1)
 
         query = q_u.reshape(-1, H, Dh)
         key   = k.reshape(-1, H, Dh)
@@ -502,10 +365,15 @@ class RelPosSelfAttention(nn.Module):
             return self._forward_ref(x)
 
         attn_meta: FlexAttentionMetadata = attn_meta_all[self.prefix]
-
         self._install_exact_mask(attn_meta)
 
-        score_mod = self._make_shaw_score_mod_flat(band_bias, W)
+        # if getattr(attn_meta, "_vllm_score_mod_window", None) != W or getattr(attn_meta, "score_mod", None) is None:
+        #     score_mod = self._make_shaw_score_mod_flat(band_bias, W, attn_meta)
+        #     attn_meta.score_mod = score_mod
+        #     attn_meta.transformed_score_mod = attn_meta.get_transformed_score_mod()
+        #     setattr(attn_meta, "_vllm_score_mod_window", W)
+
+        score_mod = self._make_shaw_score_mod_flat(band_bias, W, attn_meta)
         attn_meta.score_mod = score_mod
         attn_meta.transformed_score_mod = attn_meta.get_transformed_score_mod()
 
@@ -630,55 +498,6 @@ class ConformerBlock(nn.Module):
         x = self.ln_out(x)
         return x
 
-def apply_channel_mask(tensor, mask):
-    """Apply mask to tensor with channel dimension."""
-    # tensor: (batch, channels, time, features)
-    # mask: (batch, time, features)
-    batch_size, channels, time, features = tensor.shape
-    expanded_mask = mask.unsqueeze(1).expand(batch_size, channels, time, features)
-    return tensor * expanded_mask
-
-
-def calculate_conv_output_size(input_size: torch.Tensor, kernel_size: int, stride: int, padding: tuple[int, int]):
-    """Calculate exact output size after convolution."""
-    return (input_size + padding[0] + padding[1] - kernel_size) // stride + 1
-
-
-class MaskedConvSequential(nn.Sequential):
-    def forward(self, x, lengths):
-        # Convert input (batch, time, features) to conv format
-        x = x.unsqueeze(1)  # (batch, 1, time, features)
-        current_lengths = lengths.clone().float()
-        mask = self._create_mask(x, current_lengths.long())
-
-        # Process through each layer with mask propagation
-        for i, layer in enumerate(self):
-            # Apply current mask before layer
-            x = apply_channel_mask(x, mask)
-
-            # Apply layer
-            x = layer(x)
-
-            # Update lengths for stride operations with proper padding
-            if hasattr(layer, 'stride') and layer.stride != (1, 1):
-                if hasattr(layer, "_left_padding"):
-                    padding = (layer._left_padding, layer._right_padding)  # CausalConv2D
-                else:
-                    padding = layer.padding
-                current_lengths = calculate_conv_output_size(
-                    current_lengths, layer.kernel_size[0], layer.stride[0], padding
-                )
-                mask = self._create_mask(x, current_lengths.long())
-
-        # Final masking
-        x = apply_channel_mask(x, mask)
-        return x, current_lengths.long()
-
-    def _create_mask(self, tensor, lengths):
-        """Create mask matching tensor dimensions."""
-        batch_size, channels, time, features = tensor.shape
-        time_mask = torch.arange(time, device=tensor.device).expand(batch_size, time) < lengths.unsqueeze(1)
-        return time_mask.unsqueeze(-1).expand(batch_size, time, features).to(tensor.dtype)
 
 class FastConformerCTC(nn.Module):
     """FastConformerCTC for vLLM."""
@@ -702,8 +521,9 @@ class FastConformerCTC(nn.Module):
         assert subs.get("factor", 8) == 8, "Only 8x subsampling is assumed"
         assert subs.get("channels", 256) == 256, "Only 256 channels are supported"
         mid_ch = subs.get("channels", 256)
+
+        # TODO: see comment above the NemoSubsample8x2D class
         # self.subsample = NemoSubsample8x2D(d_out=self.d_model, mid_ch=mid_ch, mels=80)
-        # self.subsample = ConvSubsamplingDWStridingCausalReference(feat_in=80, feat_out=self.d_model, conv_channels=mid_ch)
         from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling
         self.subsample = ConvSubsampling(
             subsampling="dw_striding",
@@ -732,18 +552,15 @@ class FastConformerCTC(nn.Module):
             for i in range(config.n_layers)
         ])
 
-        # self.attn = RelPosSelfAttention(d_model=self.d_model, num_heads=config.num_attention_heads, window=att_window, cache_config=vllm_config.cache_config, prefix=f"{prefix}.attn.0")
-
         self.proj = nn.Linear(self.d_model, self.vocab_size)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         raise Exception("not applicable for this model")
 
-    def _remove_ragged_format(self, x: torch.Tensor) -> torch.Tensor:
-        attn_metadata = get_forward_context().attn_metadata
-        if attn_metadata is None:
-            # attn_metadata is None during dummy runs
+    def _remove_ragged_format(self, x: torch.Tensor, pre_subsample: bool = True) -> torch.Tensor:
+        if _is_dummy_run():
             return x.unsqueeze(0)
+        attn_metadata = get_forward_context().attn_metadata
         ctx: FastConformerMetadata = list(attn_metadata.values())[0]
         num_seqs = ctx.num_reqs
         seq_lens = ctx.query_start_loc[1:] - ctx.query_start_loc[:-1]
@@ -754,10 +571,18 @@ class FastConformerCTC(nn.Module):
         batch_size = num_seqs
         time_dim = seq_lens[0].item()
         feature_dim = x.shape[-1]
-        return x.view(batch_size, time_dim * 8, feature_dim)
+        if pre_subsample:
+            time_dim = time_dim * 8
+        return x.view(batch_size, time_dim, feature_dim)
 
     def _add_ragged_format(self, x: torch.Tensor) -> torch.Tensor:
         return x.squeeze(0)
+
+    def _forward_attn_only(self, x: torch.Tensor) -> torch.Tensor:
+        x = self._remove_ragged_format(x, pre_subsample=False)
+        x = self.blocks[0].attn(x)
+        x = self._add_ragged_format(x)
+        return x
 
     def forward(
         self,
@@ -769,6 +594,10 @@ class FastConformerCTC(nn.Module):
         assert inputs_embeds is not None, "inputs_embeds must be provided as [T, F]"
         x = inputs_embeds
         assert x.dim() == 2, f"expected [T, F], got shape {tuple(x.shape)}"
+
+        # used in tests
+        if self.config.attn_only:
+            return self._forward_attn_only(x)
 
         T, F = x.shape
         assert F == 640, f"expected feature dim=80*8, got {F}"
@@ -784,26 +613,20 @@ class FastConformerCTC(nn.Module):
 
         x, _ = self.subsample(x, length)
         # _check("/home/scratch.jdaw_coreai/landrew/tmp/audio_signal.pt", x)
-        import math
         xscale = math.sqrt(self.d_model)
         x = (x * xscale)
-        # print(f"[vllm_debug] x.shape {x.shape} x.dtype {x.dtype}")
-        # print(f"[vllm_debug] self.d_model {self.d_model}")
         # _check("/home/scratch.jdaw_coreai/landrew/tmp/audio_signal_post.pt", x)
 
         # x = x[:,1:,:]
-        # print(f"[vllm_debug] after sli x.shape {x.shape} x.dtype {x.dtype}")
 
         for i, blk in enumerate(self.blocks):
             x = blk(x)                 # [T/8, D]
             # _check(f"/home/scratch.jdaw_coreai/landrew/tmp/audio_signal_post_{i}.pt", x)
         # x = self.attn(x)
 
-        # print(f"[vllm_debug] before _add_ragged_format x.shape {x.shape} x.dtype {x.dtype}")
         # slice last n frames
         x = x[:,1:,:]
         x = self._add_ragged_format(x)
-        # print(f"[vllm_debug] after _add_ragged_format x.shape {x.shape} x.dtype {x.dtype}")
         return x
 
     def compute_logits(
