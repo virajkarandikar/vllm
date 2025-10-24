@@ -41,13 +41,34 @@ def main():
     cfg.data.source_sample_rate = 22050
     cfg.data.target_sample_rate = 22050
     model = DuplexEARTTS(OmegaConf.to_container(cfg, resolve=True)).eval()
+    # get subword encoder vocabs and config
+    subword_id_to_char_ids = model.tts_model.embed_subword.subword_id_to_char_ids
+    char_vocab = model.tts_model.embed_subword.char_vocab
+    # create weights for the embedding layers that convert subword ids to char ids
+    vocab_size = model.embed_tokens.weight.shape[0]
+    max_char_len = max(len(char_ids) for char_ids in subword_id_to_char_ids.values())
 
     # load checkpoint
     weights = torch.load(args.ckpt)["state_dict"]
 
+    bos_emb = weights["tts_model.bos_emb"]
+    embed_subwords_weight = torch.zeros(
+        (vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device
+    )
+    embed_subwords_mask_weight = torch.zeros(
+        (vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device
+    )
+    for subword_id_str, char_ids_lst in subword_id_to_char_ids.items():
+        subword_id = int(subword_id_str)
+        char_ids = torch.tensor(
+            char_ids_lst, dtype=bos_emb.dtype, device=bos_emb.device
+        )
+        embed_subwords_weight[subword_id, : len(char_ids)] = char_ids
+        embed_subwords_mask_weight[subword_id, : len(char_ids)] = 1
+
     # create weights for the embedding model that runs outside of the eartts
     embedding_module_weights = {}
-    embedding_module_weights["bos_emb"] = weights["tts_model.bos_emb"]
+    embedding_module_weights["bos_emb"] = bos_emb
     embedding_module_weights["embed_code.weight"] = weights[
         "tts_model.embed_code.weight"
     ]
@@ -61,6 +82,12 @@ def main():
         if "tts_model.embed_subword" in key:
             key = key[len("tts_model.") :]
             embedding_module_weights[key] = weight
+    embedding_module_weights["embed_subword.embed_subwords.weight"] = (
+        embed_subwords_weight
+    )
+    embedding_module_weights["embed_subword.embed_subwords_mask.weight"] = (
+        embed_subwords_mask_weight
+    )
     # save to .ckpt file so that a torch module can load weights from it
     torch.save(
         embedding_module_weights,
@@ -85,7 +112,9 @@ def main():
     embedding_module_config["hidden_size"] = (
         cfg.model.tts_config.backbone_config.hidden_size
     )
-    embedding_module_config["vocab_size"] = model.embed_tokens.weight.shape[0]
+    embedding_module_config["vocab_size"] = vocab_size
+    embedding_module_config["char_vocab_size"] = len(char_vocab)
+    embedding_module_config["max_char_len"] = max_char_len
     with open(
         os.path.join(args.outdir, "eartts_input_embedding_config.yaml"), "w"
     ) as f:
@@ -147,18 +176,16 @@ def main():
     # forward mog head configs
     for key in ["num_layers", "low_rank", "num_predictions", "min_log_std", "eps"]:
         flat_config[f"mog_{key}"] = cfg.model.tts_config.mog_head_config[key]
+
+    # configuring custom inputs/outputs
+    flat_config["custom_input_specs"] = [
+        {"name": "total_embeddings", "dim": flat_config["hidden_size"]}
+    ]
+    flat_config["custom_outputs"] = ["acoustic_tokens"]
+
     with open(os.path.join(args.outdir, "config.json"), "w") as f:
         json.dump(flat_config, f, indent=2)
     print("Saved vllm config")
-
-    # save subword encoder vocabs and config
-    subword_id_to_char_ids = model.tts_model.embed_subword.subword_id_to_char_ids
-    char_vocab = model.tts_model.embed_subword.char_vocab
-    with open(os.path.join(args.outdir, "subword_id_to_char_ids.json"), "w") as f:
-        json.dump(subword_id_to_char_ids, f, indent=2)
-    with open(os.path.join(args.outdir, "char_vocab.json"), "w") as f:
-        json.dump(char_vocab, f, indent=2)
-    print("Saved vocabs for char encoding")
 
 
 if __name__ == "__main__":
