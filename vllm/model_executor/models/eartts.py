@@ -139,122 +139,95 @@ class CharAwareSubwordEncoder(nn.Module):
         """
         Performs the forward pass to get character-aware subword embeddings.
         Args:
-            subword_ids (Tensor): A tensor of subword IDs. Shape: `[batch, seq_len]`.
+            subword_ids (Tensor): A tensor of subword IDs. Shape: `[BT]`.
 
         Returns:
-            Tensor: The final subword embeddings. Shape: `[batch, seq_len, hidden_size]`.
+            Tensor: The final subword embeddings. Shape: `[BT, hidden_size]`.
         """
-        char_ids = self.embed_subwords(subword_ids).to(torch.int32)  # Batch x seq_len x 128
-        char_ids_mask = self.embed_subwords_mask(subword_ids)  # batch x seq_len x 128
-        b, t, _ = char_ids.size()
-        chars_ids = char_ids.view(-1, self.max_char_len)  #  bt x 128
-        char_ids_mask = char_ids_mask.view(-1, self.max_char_len)  #  bt x 128
-        char_embeds = self.embed_tokens(chars_ids)  # bt x 128 x hidden_size
+        char_ids = self.embed_subwords(subword_ids).to(torch.int32)  # BT x 128
+        char_ids_mask = self.embed_subwords_mask(subword_ids)  # BT x 128
+        char_embeds = self.embed_tokens(char_ids)  # bt x 128 x hidden_size
 
         char_hidden_states = self.backbone(
             inputs_embeds=char_embeds, attention_mask=char_ids_mask
-        ).last_hidden_state
+        ).last_hidden_state  # BT x 128 x hidden_size
         # 3. Aggregate character embeddings to form subword embeddings (mean pooling)
         # We mask the padding characters before summing to get a correct mean.
-        masked_sum = (char_hidden_states * char_ids_mask.unsqueeze(-1)).sum(dim=1)
+        masked_sum = (char_hidden_states * char_ids_mask.unsqueeze(-1)).sum(dim=1)  # BT x hidden_size
         # Avoid division by zero for empty sequences
         char_ids_lengths = char_ids_mask.sum(dim=1)  # (bt,)
-        mean_emb = masked_sum / (char_ids_lengths.unsqueeze(-1).clamp(min=1))
+        mean_emb = masked_sum / (char_ids_lengths.unsqueeze(-1).clamp(min=1))  # BT x hidden_size
         # 4. Scatter the aggregated embeddings back to the original subword sequence shape
         out_emb = self.proj_embedding(mean_emb)  # bt x hidden_size
-        return out_emb.view(b, t, -1)  # batch x t x hidden_size
-
-
-def depthsum_embedding(
-    code: torch.Tensor, rvq_embeddings: nn.ParameterList,
-) -> torch.Tensor:
-    """
-    Embedds all codes into a single embedding.
-    Args:
-        code: Tensor (num_quantizers x BT) Acoustic codes to embed and add
-        rvq_embeddings: Tensor (num_quantizers x codebook_size x latent_size) RVQ embeddings
-
-    Returns:
-        Tensor (BT x latent_size) - embedded codes
-    """
-    embs = nn.functional.pad(rvq_embeddings, [0, 0, 0, 1]) # num_quantizers x (codebook_size + 1) x latent_size
-    res = nn.functional.embedding(code[0], embs[0])
-    for i in range(1, len(embs)):
-        res = res + nn.functional.embedding(
-            code[i], embs[i]
-        )
-    return res
+        return out_emb
 
 
 # module that takes text tokens, audio tokens and prepares input embedding for EarTTS model
 class EarTTSInputEmbedding(nn.Module):
-    def __init__(self, config):
+    def __init__(
+        self,
+        hidden_size: int,
+        context_hidden_size: int,
+        vocab_size: int,
+        char_vocab_size: int,
+        max_char_len: int,
+        backbone_type: str,
+        backbone_config: dict,
+    ):
         super().__init__()
-        self.config = config
-
-        self.embed_code = nn.Linear(
-            self.config.latent_size, self.config.hidden_size, bias=False
-        )
-        self.codebook_size = self.config.codebook_size
-        self.rvq_embs = nn.Parameter(torch.empty(self.config.num_quantizers, self.config.codebook_size, self.config.latent_size))
         # >>> weights["embed_tokens.weight"].shape
         # torch.Size([151936, 1536])
         self.embed_tokens = nn.Embedding(
-            self.config.vocab_size, self.config.context_hidden_size
+            vocab_size, context_hidden_size
         )
         self.embed_context = nn.Linear(
-            self.config.context_hidden_size, self.config.hidden_size, bias=False
+            context_hidden_size, hidden_size, bias=False
         )
         self.embed_subword = CharAwareSubwordEncoder(
-            out_size=self.config.hidden_size,
-            vocab_size=self.config.vocab_size,
-            char_vocab_size=self.config.char_vocab_size,
-            max_char_len=self.config.max_char_len,
-            backbone_type=self.config.backbone_type,
-            backbone_config=OmegaConf.to_container(self.config.backbone_config),
+            out_size=hidden_size,
+            vocab_size=vocab_size,
+            char_vocab_size=char_vocab_size,
+            max_char_len=max_char_len,
+            backbone_type=backbone_type,
+            backbone_config=backbone_config,
         )
-        self.bos_emb = nn.Parameter(torch.empty(self.config.hidden_size))
+        self.bos_emb = nn.Parameter(torch.empty(hidden_size))
 
     def forward(
         self,
+        audio_emb: torch.Tensor,
         context_text_tokens: torch.Tensor,
-        audio_tokens: torch.Tensor,
-        text_tokens: Optional[torch.Tensor] = None,
+        text_tokens: torch.Tensor,
+        text_mask: torch.Tensor,
+        bos_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Works for context and generation phases to prepare the input embedding for vLLM engine.
-        At context phase:
-            context_text_tokens (T) or (128)
-            audio_tokens (num_quantizers x T) or (31 x 128)
-        At generation phase
-            context_text_tokens (1)
-            audio_tokens (num_quantizers x 1) or (31 x 1)
-            text_tokens (1)
-
+        Works for context and generation phases to prepare total input embeddings
+        for EarTTS model.
+        Inputs:
+            audio_emb: (BT x dim) - already embedded audio tokens
+            context_text_tokens: (BT) - context text tokens
+            text_tokens: (BT) - text token to embed
+            text_mask: (BT) - masks text embeddings for prefill
+            bos_mask: (BT) - specifies where BOS is applied (first frame of prefill)
         Returns:
-            embedding of shape (T x dim) or (1 x dim)
+            embedding of shape (BT x dim)
         """
 
-        # embed the context text token
-        context_emb = self.embed_tokens(context_text_tokens)  # T x dim
-        context_emb_proj = self.embed_context(context_emb)  # T x dim
+        # embed the context text tokens
+        context_emb = self.embed_tokens(context_text_tokens)  # BT x dim
+        context_emb_proj = self.embed_context(context_emb)  # BT x dim
 
-        # embed previously predicted acoustic tokens
-        audio_emb = depthsum_embedding(
-            audio_tokens, self.rvq_embs
-        )  # T x dim
-        audio_emb_proj = self.embed_code(audio_emb)  # T x dim
+        # prepare bos emb that is applied to audio embedding
+        bos_emb = bos_mask.unsqueeze(1) * self.bos_emb  # BT x dim
 
-        # for generation phase, also embed current text token using subword encoder,
-        # that encodes characters
-        if text_tokens is not None:
-            text_emb = self.embed_subword(text_tokens.unsqueeze(0)).squeeze(
-                0
-            )  # T x dim
-            return context_emb_proj + audio_emb_proj + text_emb  # T x dim
-        else:
-            audio_emb_proj[0] += self.bos_emb  # 1 x dim
-            return context_emb_proj + audio_emb_proj  # 1 x DIM
+        # embed text tokens by expanding them to chars and passing through transformer
+        # apply the mask that turns this embedding to zeros for prefill tokens
+        text_emb = self.embed_subword(text_tokens) * text_mask.unsqueeze(1)  #  BT x dim
+
+        # prepare total embedding by adding all components
+        total_emb = context_emb_proj + audio_emb + text_emb + bos_emb  # BT x dim
+        return total_emb
 
 
 def gumbel_like(tensor: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -437,6 +410,15 @@ class EarTTSForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
+        self.total_emb = EarTTSInputEmbedding(
+            hidden_size=self.config.hidden_size,
+            context_hidden_size=self.config.context_hidden_size,
+            vocab_size=self.config.emb_vocab_size,
+            char_vocab_size=self.config.emb_char_vocab_size,
+            max_char_len=self.config.max_char_len,
+            backbone_type=self.config.emb_backbone_type,
+            backbone_config=self.config.emb_backbone_config,
+        )
         self.backbone = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
 
         # easy access of cruicial config params
@@ -488,9 +470,29 @@ class EarTTSForCausalLM(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        total_embeddings: Optional[torch.Tensor] = None,
+        # input used to prepare hidden states for backbone
+        acoustic_tokens: Optional[torch.Tensor] = None,
+        context_text_tokens: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        # text tokens are not used for prompt
+        text_mask: Optional[torch.Tensor] = None,
+        # bos is applied only to the first frame of audio embedding in prefill 
+        bos_mask: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, total_embeddings)
+        """
+        input_ids, positions, intermediate_tensors, inputs_embeds - not used,
+        they are here for compatability with the way vllm model executed.
+        """
+        audio_emb = self._depthsum_embedding(acoustic_tokens.transpose(0, 1))  # BT x latent_size
+        audio_emb = self.embed_code(audio_emb)  # BT x hidden_size
+        total_emb = self.total_emb(
+            audio_emb=audio_emb,
+            context_text_tokens=context_text_tokens,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            bos_mask=bos_mask,
+        )
+        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, total_emb)
         codes = self._generate_step(hidden_states)  # quantizers x BT
         return hidden_states, codes.transpose(0, 1)  # BT x quantizers
 
@@ -509,7 +511,22 @@ class EarTTSForCausalLM(nn.Module):
         return loader.load_weights(weights)
 
     def _depthsum_embedding(self, code: torch.Tensor) -> torch.Tensor:
-        return depthsum_embedding(code, self.rvq_embs)
+        """
+        Embedds all codes into a single embedding.
+        Args:
+            code: Tensor (num_quantizers x BT) Acoustic codes to embed and add
+            rvq_embeddings: Tensor (num_quantizers x codebook_size x latent_size) RVQ embeddings
+
+        Returns:
+            Tensor (BT x latent_size) - embedded codes
+        """
+        embs = nn.functional.pad(self.rvq_embs, [0, 0, 0, 1]) # num_quantizers x (codebook_size + 1) x latent_size
+        res = nn.functional.embedding(code[0], embs[0])
+        for i in range(1, len(embs)):
+            res = res + nn.functional.embedding(
+                code[i], embs[i]
+            )
+        return res
 
     def _depthsum_encoding_step_reshaped(
         self,
