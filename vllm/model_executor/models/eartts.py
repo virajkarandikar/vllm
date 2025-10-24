@@ -81,35 +81,6 @@ class MLPLayer(nn.Module):
         return x
 
 
-def sequence_mask(
-    lengths: torch.Tensor, max_length: torch.Tensor | int | None = None
-) -> torch.Tensor:
-    """
-    Creates a boolean mask from a 1D tensor of sequence lengths.
-
-    This function is useful for masking out padding in sequences. Given a tensor
-    of lengths, it produces a 2D boolean tensor where `mask[i, j]` is `True` if
-    `j < lengths[i]` and `False` otherwise.
-
-    Args:
-        lengths (Long Tensor): A 1D tensor of integer lengths. Shape: `[batch_size]`.
-        max_length (Long Tensor | int | None, optional): The maximum length of the mask. If None,
-                                           it is inferred from the maximum value
-                                           in `lengths`. Defaults to None.
-
-    Returns:
-        Tensor: The boolean mask. Shape: `[batch_size, max_length]`.
-    """
-    if max_length is None:
-        max_length = lengths.max()
-
-    # Create a range tensor from 0 to max_length - 1
-    x = torch.arange(max_length, dtype=lengths.dtype, device=lengths.device)  # type: ignore[arg-type]
-
-    # Compare each length with the range tensor to create the mask via broadcasting
-    return x.unsqueeze(0) < lengths.unsqueeze(1)
-
-
 class CharAwareSubwordEncoder(nn.Module):
     """
     An encoder that creates subword embeddings from character-level embeddings.
@@ -121,7 +92,9 @@ class CharAwareSubwordEncoder(nn.Module):
 
     Args:
         out_size (int): The dimensionality of the output embedding vectors.
-        pretrained_tokenizer_name (str): The name of the base Hugging Face tokenizer.
+        vocab_size (int): Number of subword tokens in vocabulary
+        char_vocab_size (int): Number of characters in vocabulary
+        max_char_len (int): Maximum number of characters in a subword
         backbone_type (str | None): The type of backbone model from Hugging Face (e.g., "t5gemma").
         backbone_model_class (str | None): The class name of the backbone model if not using AutoModel.
         backbone_config_class (str | None): The class name of the backbone config.
@@ -131,72 +104,36 @@ class CharAwareSubwordEncoder(nn.Module):
     def __init__(
         self,
         out_size: int,
-        pretrained_tokenizer_name: str,
-        model_dir: str,
+        vocab_size: int,
+        char_vocab_size: int,
+        max_char_len: int,
         backbone_type: str,
         backbone_config: dict,
     ):
         super().__init__()
-        # load dictionaries from the model directory
-        with open(os.path.join(model_dir, "subword_id_to_char_ids.json"), "r") as fp:
-            self.subword_id_to_char_ids = {int(k): v for k, v in json.load(fp).items()}
-        with open(os.path.join(model_dir, "char_vocab.json"), "r") as fp:
-            self.char_vocab = json.load(fp)
-        self.char_padding_idx = len(self.char_vocab)
-        # 2. Initialize the backbone model
+        self.max_char_len = max_char_len
+        # 1. Initialize the backbone model for encoding characters
         config = AutoConfig.for_model(backbone_type, **backbone_config)
         self.backbone = AutoModelForTextEncoding.from_config(config)
         self.hidden_size = self.backbone.get_input_embeddings().weight.size(-1)
         delattr(self.backbone.encoder, "embed_tokens")
+        # 2. Initialize embedding layer to embed characters
         self.embed_tokens = nn.Embedding(
-            len(self.char_vocab) + 1,
+            char_vocab_size + 1,
             self.hidden_size,
-            padding_idx=self.char_padding_idx,
+            padding_idx=char_vocab_size,
+        )
+        # 3. Initialize embedding layer to convert subword ids to char ids.
+        # Also requires a layer which creates a mask for the backbone transformer
+        self.embed_subwords = nn.Embedding(
+            vocab_size,
+            max_char_len,
+        )
+        self.embed_subwords_mask = nn.Embedding(
+            vocab_size,
+            max_char_len,
         )
         self.proj_embedding = nn.Linear(self.hidden_size, out_size, bias=False)
-
-    def prepare_inputs(
-        self, subword_ids: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Converts a batch of subword IDs into a padded batch of character IDs.
-
-        Args:
-            subword_ids (Tensor): A tensor of subword IDs. Shape: `[batch, seq_len]`.
-
-        Returns:
-            tuple[Tensor, Tensor]: A tuple containing:
-                - Padded character IDs. Shape: `[num_valid_subwords, max_char_len]`.
-                - Lengths of each character sequence. Shape: `[num_valid_subwords]`.
-        """
-        device = subword_ids.device
-        assert (
-            subword_ids.size(1) == 1
-        ), "Supporting one subword per sequence during generation"
-        subword_ids = subword_ids.squeeze(1)
-        # Select only the valid subword IDs
-        subword_id_list = subword_ids.cpu().tolist()
-        # Map each subword ID to its sequence of character IDs
-        char_id_list = [
-            list(self.subword_id_to_char_ids.get(x, ())) for x in subword_id_list
-        ]
-        char_lengths = torch.tensor(
-            [len(x) for x in char_id_list], dtype=torch.long, device=device
-        )
-        batch_size = char_lengths.size(0)
-        max_len = int(char_lengths.max().item()) if batch_size > 0 else 0
-        # Create a padded tensor for the character IDs
-        char_ids = torch.full(
-            (batch_size, max_len),
-            self.char_padding_idx,
-            dtype=torch.long,
-            device=device,
-        )
-        for i, char_seq in enumerate(char_id_list):
-            char_ids[i, : len(char_seq)] = torch.tensor(
-                char_seq, dtype=torch.long, device=device
-            )
-        return char_ids, char_lengths
 
     def forward(self, subword_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -207,24 +144,25 @@ class CharAwareSubwordEncoder(nn.Module):
         Returns:
             Tensor: The final subword embeddings. Shape: `[batch, seq_len, hidden_size]`.
         """
-        # 1. Convert subword IDs to character IDs
-        char_ids, char_lengths = self.prepare_inputs(subword_ids)
-        # char_mask = sequence_mask(char_lengths).float()
-        char_mask = sequence_mask(char_lengths)
-        # 2. Get character embeddings and pass them through the backbone
-        char_embeds = self.embed_tokens(char_ids)
-        # The backbone model should be able to accept `inputs_embeds`
+        char_ids = self.embed_subwords(subword_ids).to(torch.int32)  # Batch x seq_len x 128
+        char_ids_mask = self.embed_subwords_mask(subword_ids)  # batch x seq_len x 128
+        b, t, _ = char_ids.size()
+        chars_ids = char_ids.view(-1, self.max_char_len)  #  bt x 128
+        char_ids_mask = char_ids_mask.view(-1, self.max_char_len)  #  bt x 128
+        char_embeds = self.embed_tokens(chars_ids)  # bt x 128 x hidden_size
+
         char_hidden_states = self.backbone(
-            inputs_embeds=char_embeds, attention_mask=char_mask
+            inputs_embeds=char_embeds, attention_mask=char_ids_mask
         ).last_hidden_state
         # 3. Aggregate character embeddings to form subword embeddings (mean pooling)
         # We mask the padding characters before summing to get a correct mean.
-        masked_sum = (char_hidden_states * char_mask.unsqueeze(-1)).sum(dim=1)
+        masked_sum = (char_hidden_states * char_ids_mask.unsqueeze(-1)).sum(dim=1)
         # Avoid division by zero for empty sequences
-        mean_emb = masked_sum / (char_lengths.unsqueeze(-1).clamp(min=1))
+        char_ids_lengths = char_ids_mask.sum(dim=1)  # (bt,)
+        mean_emb = masked_sum / (char_ids_lengths.unsqueeze(-1).clamp(min=1))
         # 4. Scatter the aggregated embeddings back to the original subword sequence shape
-        out_emb = self.proj_embedding(mean_emb)
-        return out_emb
+        out_emb = self.proj_embedding(mean_emb)  # bt x hidden_size
+        return out_emb.view(b, t, -1)  # batch x t x hidden_size
 
 
 def depthsum_embedding(
@@ -259,6 +197,8 @@ class EarTTSInputEmbedding(nn.Module):
         )
         self.codebook_size = self.config.codebook_size
         self.rvq_embs = nn.Parameter(torch.empty(self.config.num_quantizers, self.config.codebook_size, self.config.latent_size))
+        # >>> weights["embed_tokens.weight"].shape
+        # torch.Size([151936, 1536])
         self.embed_tokens = nn.Embedding(
             self.config.vocab_size, self.config.context_hidden_size
         )
@@ -267,8 +207,9 @@ class EarTTSInputEmbedding(nn.Module):
         )
         self.embed_subword = CharAwareSubwordEncoder(
             out_size=self.config.hidden_size,
-            pretrained_tokenizer_name=self.config.pretrained_tokenizer_name,
-            model_dir=self.config.model_dir,
+            vocab_size=self.config.vocab_size,
+            char_vocab_size=self.config.char_vocab_size,
+            max_char_len=self.config.max_char_len,
             backbone_type=self.config.backbone_type,
             backbone_config=OmegaConf.to_container(self.config.backbone_config),
         )
