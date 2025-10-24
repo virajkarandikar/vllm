@@ -69,10 +69,6 @@ def main():
     # create weights for the embedding model that runs outside of the eartts
     embedding_module_weights = {}
     embedding_module_weights["bos_emb"] = bos_emb
-    embedding_module_weights["embed_code.weight"] = weights[
-        "tts_model.embed_code.weight"
-    ]
-    embedding_module_weights["rvq_embs"] = weights["tts_model.rvq_embs"]
     embedding_module_weights["embed_tokens.weight"] = model.embed_tokens.weight
     embedding_module_weights["embed_context.weight"] = weights[
         "tts_model.embed_context.weight"
@@ -88,38 +84,9 @@ def main():
     embedding_module_weights["embed_subword.embed_subwords_mask.weight"] = (
         embed_subwords_mask_weight
     )
-    # save to .ckpt file so that a torch module can load weights from it
-    torch.save(
-        embedding_module_weights,
-        os.path.join(args.outdir, "eartts_input_embedding.ckpt"),
-    )
-    print(f"Created ckpt for embedding module")
-
-    # create config for embedding module
-    embedding_module_config = {}
-    for key in [
-        "latent_size",
-        "codebook_size",
-        "num_quantizers",
-        "context_hidden_size",
-    ]:
-        embedding_module_config[key] = cfg.model.tts_config[key]
-    for key in ["pretrained_tokenizer_name", "backbone_type"]:
-        embedding_module_config[key] = cfg.model.tts_config.cas_config[key]
-    embedding_module_config["backbone_config"] = OmegaConf.to_container(
-        cfg.model.tts_config.cas_config.backbone_config, resolve=True
-    )
-    embedding_module_config["hidden_size"] = (
-        cfg.model.tts_config.backbone_config.hidden_size
-    )
-    embedding_module_config["vocab_size"] = vocab_size
-    embedding_module_config["char_vocab_size"] = len(char_vocab)
-    embedding_module_config["max_char_len"] = max_char_len
-    with open(
-        os.path.join(args.outdir, "eartts_input_embedding_config.yaml"), "w"
-    ) as f:
-        yaml.safe_dump(embedding_module_config, f, indent=2, default_flow_style=False)
-    print(f"Created config for embedding module")
+    embedding_module_weights = {
+        f"total_emb.{k}": v for k, v in embedding_module_weights.items()
+    }
 
     # drop unused weights
     unused_keys = ["bos_emb", "null_emb", "embed_subword", "embed_context"]
@@ -139,6 +106,7 @@ def main():
     weights["backbone.embed_tokens.weight"] = torch.randn(1, hidden_size).to(
         torch.float16
     )
+    weights.update(embedding_module_weights)
 
     # save weights
     safetensors_path = os.path.join(args.outdir, "model.safetensors")
@@ -177,9 +145,26 @@ def main():
     for key in ["num_layers", "low_rank", "num_predictions", "min_log_std", "eps"]:
         flat_config[f"mog_{key}"] = cfg.model.tts_config.mog_head_config[key]
 
+    # configuration of the embedding module
+    flat_config["emb_backbone_config"] = OmegaConf.to_container(
+        cfg.model.tts_config.cas_config.backbone_config, resolve=True
+    )
+    flat_config["emb_backbone_type"] = cfg.model.tts_config.cas_config.backbone_type
+    flat_config["emb_vocab_size"] = vocab_size
+    flat_config["emb_char_vocab_size"] = len(char_vocab)
+    flat_config["max_char_len"] = max_char_len
+
     # configuring custom inputs/outputs
     flat_config["custom_input_specs"] = [
-        {"name": "total_embeddings", "dim": flat_config["hidden_size"]}
+        {
+            "name": "acoustic_tokens",
+            "dim": flat_config["num_quantizers"],
+            "dtype": "int32",
+        },
+        {"name": "context_text_tokens", "dtype": "int32"},
+        {"name": "text_tokens", "dtype": "int32"},
+        {"name": "text_mask"},
+        {"name": "bos_mask"},
     ]
     flat_config["custom_outputs"] = ["acoustic_tokens"]
 

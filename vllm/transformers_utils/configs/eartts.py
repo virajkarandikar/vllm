@@ -12,6 +12,7 @@ class EarTTSConfig(PretrainedConfig):
         self,
         # gemma 3 config
         hidden_size: int = 1152,
+        context_hidden_size: int = 1536,
         intermediate_size: int = 4608,
         num_hidden_layers: int = 28,
         num_attention_heads: int = 16,
@@ -49,10 +50,18 @@ class EarTTSConfig(PretrainedConfig):
         attn_logits_soft_cap: Optional[float] = None,  # Attention logits softcapping
         use_bidirectional_attention: bool = False,  # Whether to use bidirectional attention (False for causal)
         is_causal: bool = True,  # Whether the model is causal
+
+        # subword encoding config
+        emb_backbone_config: dict = None,
+        emb_backbone_type: str = "t5gemma",
+        max_char_len: int = 128,
+        emb_char_vocab_size: int = 256,
+        emb_vocab_size: int = 151936,
         **kwargs,
     ):
         # gemma 3 config
         self.hidden_size = hidden_size
+        self.context_hidden_size = context_hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
@@ -91,6 +100,13 @@ class EarTTSConfig(PretrainedConfig):
         self.attn_logits_soft_cap = attn_logits_soft_cap
         self.use_bidirectional_attention = use_bidirectional_attention
         self.is_causal = is_causal
+
+        # subword encoding config
+        self.emb_backbone_config = emb_backbone_config
+        self.emb_backbone_type = emb_backbone_type
+        self.max_char_len = max_char_len
+        self.emb_char_vocab_size = emb_char_vocab_size
+        self.emb_vocab_size = emb_vocab_size
         
         super().__init__(**kwargs)
 
