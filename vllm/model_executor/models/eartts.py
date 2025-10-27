@@ -144,7 +144,7 @@ class CharAwareSubwordEncoder(nn.Module):
         Returns:
             Tensor: The final subword embeddings. Shape: `[BT, hidden_size]`.
         """
-        char_ids = self.embed_subwords(subword_ids).to(torch.int32)  # BT x 128
+        char_ids = torch.round(self.embed_subwords(subword_ids)).to(torch.int32)  # BT x 128
         char_ids_mask = self.embed_subwords_mask(subword_ids)  # BT x 128
         char_embeds = self.embed_tokens(char_ids)  # bt x 128 x hidden_size
 
@@ -492,7 +492,7 @@ class EarTTSForCausalLM(nn.Module):
             text_mask=text_mask,
             bos_mask=bos_mask,
         )
-        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, total_emb)
+        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, inputs_embeds=total_emb)
         codes = self._generate_step(hidden_states)  # quantizers x BT
         return hidden_states, codes.transpose(0, 1)  # BT x quantizers
 
