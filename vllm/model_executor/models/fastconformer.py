@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections.abc import Iterable
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -24,7 +24,6 @@ from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend, Flex
 from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
-    causal_conv1d_update,
 )
 
 from vllm.transformers_utils.configs.fastconformer import FastConformerCTCConfig
@@ -152,6 +151,49 @@ class FastConformerConvCache(torch.nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> AttentionBackend:
         return FastConformerBackend
 
+class _TransformedShawBias:
+    def __init__(self, W: int):
+        self.W = int(W)
+        self.band_bias = None           # [B,H,T,2W+1]
+        self.doc_ids = None             # [num_q]
+        self.decode_offset = None       # [num_reqs]
+        self.physical_to_logical = None # [num_reqs, total_blocks]
+        self.block_size = None          # int
+
+    def bind(self, attn_meta, band_bias: torch.Tensor):
+        self.band_bias = band_bias
+        self.doc_ids = attn_meta.doc_ids
+        self.decode_offset = attn_meta.decode_offset
+        self.physical_to_logical = attn_meta.physical_to_logical
+        self.block_size = int(attn_meta.block_size)
+
+    # @torch.jit.script_if_tracing
+    def __call__(
+        self,
+        score: torch.Tensor,
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        physical_kv_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        block_sz = self.block_size
+        physical_kv_block = torch.div(physical_kv_idx, block_sz, rounding_mode='floor')
+        physical_kv_offset = physical_kv_idx % block_sz
+
+        doc = self.doc_ids[q_idx.long()]
+        logical_block_idx = self.physical_to_logical[doc.long(), physical_kv_block.long()]
+        logical_kv_idx = logical_block_idx * block_sz + physical_kv_offset
+
+        live_block = logical_block_idx >= 0
+        within_lower = logical_kv_idx >= 0
+        is_valid = live_block & within_lower
+
+        logical_q_idx = q_idx + self.decode_offset[doc.long()]
+        rel = torch.clamp(logical_q_idx - logical_kv_idx, -self.W, self.W) + self.W
+        local_q = logical_q_idx - self.decode_offset[doc.long()]
+
+        bias = self.band_bias[doc.long(), h.long(), local_q.long(), rel.long()]
+        return torch.where(is_valid, score + bias, score)
 
 class RelPosSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, window: int,
@@ -192,13 +234,15 @@ class RelPosSelfAttention(nn.Module):
         self._q_scale = torch.tensor(1.0, dtype=torch.float32)
         self._prob_scale = torch.tensor(1.0, dtype=torch.float32)
 
-        # required by the FlexAttention backend
         if cache_config.block_size != 128:
             raise Exception(
                 f"attn cache block size must be 128, got {cache_config.block_size}"
             )
 
         self._rel_cache: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+
+        self._shaw_mod = _TransformedShawBias(self.window)
+        self._blockmask_cache: dict[tuple[int, int, int, int, int], object] = {}
 
         self.register_buffer(
             "qkv_weight",
@@ -215,9 +259,6 @@ class RelPosSelfAttention(nn.Module):
             qkv = F.linear(x, self.qkv_weight, self.qkv_bias)  # [B, T, 3D]
         else:
             raise Exception("this should not happen")
-            w_cat = torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0)
-            b_cat = torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias], dim=0)
-            qkv = F.linear(x, w_cat, b_cat)
         D = x.size(-1)
         q, k, v = qkv.split(D, dim=-1)
         return q, k, v
@@ -231,9 +272,6 @@ class RelPosSelfAttention(nn.Module):
         q = q.view(B, T, H, Dh).transpose(1, 2).contiguous()
         k = k.view(B, T, H, Dh).transpose(1, 2).contiguous()
         v = v.view(B, T, H, Dh).transpose(1, 2).contiguous()
-        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q.pt", q)
-        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/k.pt", k)
-        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/v.pt", v)
 
         device, idtype = x.device, x.dtype
         pos_idx = torch.arange(T - 1, -T, -1, device=device)[:T]
@@ -250,8 +288,6 @@ class RelPosSelfAttention(nn.Module):
 
         q_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
         q_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)
-        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q_u.pt", q_u)
-        # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q_v.pt", q_v)
 
         scores_ac = torch.matmul(q_u, k.transpose(-2, -1))  # [B,H,T,T]
 
@@ -310,35 +346,21 @@ class RelPosSelfAttention(nn.Module):
         rel = self._get_rel_proj(device, dtype, W)  # [H, Dh, 2W+1]
 
         q_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)   # [B,H,T,Dh]
-        # _check("/home/scratch.jdaw_coreai/landrew/tmp/q_v.pt", q_v)
         band_bias = torch.einsum("bhtd,hdm->bhtm", q_v, rel)  # [B,H,T,2W+1]
         band_bias = band_bias * (Dh ** -0.5)
         return band_bias
 
-    def _make_shaw_score_mod_flat(self, band_bias: torch.Tensor, W: int, attn_meta: FlexAttentionMetadata):
-        @torch.jit.script_if_tracing
-        def score_mod(
-            score: torch.Tensor,
-            b: torch.Tensor,
-            h: torch.Tensor,
-            logical_q_idx: torch.Tensor,
-            logical_kv_idx: torch.Tensor,
-            physical_q: torch.Tensor = None # physical_q_idx
-        ) -> torch.Tensor:
-            rel = logical_q_idx - logical_kv_idx
-            rel = torch.clamp(rel, -W, W) + W
+    def _mask_cache_key(self, meta: FlexAttentionMetadata) -> tuple[int, int, int, int]:
+        return (int(meta.block_table.data_ptr()),
+                int(meta.q_block_size),
+                int(meta.kv_block_size),
+                int(self.window))
 
-            doc_id = attn_meta.doc_ids[physical_q.long()] if physical_q is not None else b
-            local_q_idx = logical_q_idx - attn_meta.decode_offset[doc_id.long()]
-            return score + band_bias[doc_id.long(), h.long(), local_q_idx.long(), rel.long()]
-        return score_mod
+    def _install_exact_mask_cached(self, attn_meta: FlexAttentionMetadata):
+        if getattr(attn_meta, "_installed_exact_mask", False):
+            return
 
-    def _install_exact_mask(self, attn_meta: FlexAttentionMetadata):
         W = int(self.window)
-
-        # exact logical mask in logical index space
-        # TODO: this logic exists in the FlexAttention backend
-        # we should be able to remove this method
         def logical_mask_mod(b: torch.Tensor,
                              h: torch.Tensor,
                              q_idx: torch.Tensor,
@@ -347,45 +369,36 @@ class RelPosSelfAttention(nn.Module):
 
         attn_meta.sliding_window = None
         attn_meta.logical_mask_mod = logical_mask_mod
-
         attn_meta.direct_build = True
-        attn_meta.block_mask = attn_meta.build_block_mask()
+
+        key = self._mask_cache_key(attn_meta)
+        bm = self._blockmask_cache.get(key)
+        if bm is None:
+            attn_meta.mask_mod = attn_meta.get_mask_mod()
+            bm = attn_meta._build_block_mask_direct() if attn_meta.causal else attn_meta.build_block_mask()
+            self._blockmask_cache[key] = bm
+        attn_meta.block_mask = bm
+        attn_meta._installed_exact_mask = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # a = self._forward_ref(x)
-        # b = self._forward(x)
-        # attn_meta = get_forward_context().attn_metadata
-        # if attn_meta is not None:
-        #     print(f"[vllm_debug] a.shape {a.shape} b.shape {b.shape}")
-        #     abs_diff = (a - b).abs()
-        #     rel_diff = abs_diff / a.abs().clamp_min(1e-9)
-        #     print(f"[vllm_debug] max abs diff: {abs_diff.max()} max rel diff: {rel_diff.max()}")
-        # return b
-        # return self._forward_sdpa(x)
         return self._forward(x)
 
     def _forward_sdpa(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, D]
-
         B, T, D = x.shape
         H, Dh = self.h, self.dh
 
         q, k, v = self._fused_qkv_projection(x)
-        q = q.view(B, T, H, Dh)    # [B, T, H, Dh]
-        k = k.view(B, T, H, Dh)    # [B, T, H, Dh]
-        v = v.view(B, T, H, Dh)    # [B, T, H, Dh]
+        q = q.view(B, T, H, Dh)
+        k = k.view(B, T, H, Dh)
+        v = v.view(B, T, H, Dh)
 
-        # q = q + self.pos_bias_u.unsqueeze(0).unsqueeze(0)  # [1,1,H,Dh] broadcast
-
-        q = q.permute(0, 2, 1, 3).reshape(B * H, T, Dh)  # [B*H, T, Dh]
+        q = q.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
         k = k.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
         v = v.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v,
-            is_causal=True
-        )  # [B*H, T, Dh]
-
+            q, k, v, is_causal=True
+        )
         attn_output = attn_output.view(B, H, T, Dh).permute(0, 2, 1, 3).contiguous().view(B, T, D)
         out = self.o_proj(attn_output)
         return out
@@ -398,15 +411,11 @@ class RelPosSelfAttention(nn.Module):
         q = q.view(B, T, H, Dh).transpose(1, 2).contiguous()
         k = k.view(B, T, H, Dh).transpose(1, 2).contiguous()
         v = v.view(B, T, H, Dh).transpose(1, 2).contiguous()
-        # _check("/home/scratch.jdaw_coreai/landrew/tmp/q.pt", q)
-        # _check("/home/scratch.jdaw_coreai/landrew/tmp/k.pt", k)
-        # _check("/home/scratch.jdaw_coreai/landrew/tmp/v.pt", v)
+
         q_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
-        # _check("/home/scratch.jdaw_coreai/landrew/tmp/q_u.pt", q_u)
 
         W = int(self.window)
-        band_bias = self._build_shaw_band_bias(q, W)
-        # band_bias_flat = band_bias.view(-1, H, 2 * W + 1)
+        band_bias = self._build_shaw_band_bias(q, W)  # [B,H,T,2W+1]
 
         query = q_u.reshape(-1, H, Dh)
         key   = k.reshape(-1, H, Dh)
@@ -418,17 +427,13 @@ class RelPosSelfAttention(nn.Module):
             return self._forward_ref(x)
 
         attn_meta: FlexAttentionMetadata = attn_meta_all[self.prefix]
-        # self._install_exact_mask(attn_meta)
 
-        # if getattr(attn_meta, "_vllm_score_mod_window", None) != W or getattr(attn_meta, "score_mod", None) is None:
-        #     score_mod = self._make_shaw_score_mod_flat(band_bias, W, attn_meta)
-        #     attn_meta.score_mod = score_mod
-        #     attn_meta.transformed_score_mod = attn_meta.get_transformed_score_mod()
-        #     setattr(attn_meta, "_vllm_score_mod_window", W)
+        self._install_exact_mask_cached(attn_meta)
 
-        # score_mod = self._make_shaw_score_mod_flat(band_bias, W, attn_meta)
-        # attn_meta.score_mod = score_mod
-        # attn_meta.transformed_score_mod = attn_meta.get_transformed_score_mod()
+        self._shaw_mod.bind(attn_meta, band_bias)
+        if not getattr(attn_meta, "_installed_shaw_mod", False):
+            attn_meta.transformed_score_mod = self._shaw_mod
+            attn_meta._installed_shaw_mod = True
 
         self_kv_cache = self.attn.kv_cache[fctx.virtual_engine]
         out_buf = torch.empty_like(query)  # [num_tokens, H, Dh]

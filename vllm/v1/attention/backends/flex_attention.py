@@ -719,7 +719,6 @@ class FlexAttentionMetadata:
         return BlockMask.from_kv_blocks(**block_mask_kwargs)
 
     def build_block_mask(self) -> BlockMask:
-        print(f"[vllm_debug] this function is getting called which is kinda expensive")
         mask_mod = self.get_mask_mod()
         kv_len = (
             self.total_cache_tokens if self.uses_paged_kv else self.num_actual_tokens
@@ -747,9 +746,13 @@ class FlexAttentionMetadata:
         self.doc_ids = copy_to_persistent(self.persistent_doc_ids, self.doc_ids)
         self.num_blocks = self.total_cache_tokens // self.block_size
 
-        self.mask_mod = self.get_mask_mod()
-        self.transformed_score_mod = self.get_transformed_score_mod()
+        # self.mask_mod = self.get_mask_mod()
+        # self.transformed_score_mod = self.get_transformed_score_mod()
 
+        # if self.direct_build and self.causal:
+        #     self.block_mask = self._build_block_mask_direct()
+        # else:
+        #     self.block_mask = self.build_block_mask()
 
 class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
@@ -1198,6 +1201,7 @@ class FlexAttentionImpl(AttentionImpl):
             kernel_options["BLOCK_N"] = self.block_n
         if envs.VLLM_BATCH_INVARIANT:
             kernel_options["IS_DIVISIBLE"] = False
+
         out = flex_attention_compiled(
             query,
             key_tensor,
