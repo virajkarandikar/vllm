@@ -22,6 +22,10 @@ from vllm.forward_context import get_forward_context
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend, FlexAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
+from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+    causal_conv1d_fn,
+    causal_conv1d_update,
+)
 
 from vllm.transformers_utils.configs.fastconformer import FastConformerCTCConfig
 import math
@@ -335,7 +339,33 @@ class RelPosSelfAttention(nn.Module):
         #     rel_diff = abs_diff / a.abs().clamp_min(1e-9)
         #     print(f"[vllm_debug] max abs diff: {abs_diff.max()} max rel diff: {rel_diff.max()}")
         # return b
+        # return self._forward_sdpa(x)
         return self._forward(x)
+
+    def _forward_sdpa(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D]
+
+        B, T, D = x.shape
+        H, Dh = self.h, self.dh
+
+        q = self.q_proj(x).view(B, T, H, Dh)    # [B, T, H, Dh]
+        k = self.k_proj(x).view(B, T, H, Dh)    # [B, T, H, Dh]
+        v = self.v_proj(x).view(B, T, H, Dh)    # [B, T, H, Dh]
+
+        q = q + self.pos_bias_u.unsqueeze(0).unsqueeze(0)  # [1,1,H,Dh] broadcast
+
+        q = q.permute(0, 2, 1, 3).reshape(B * H, T, Dh)  # [B*H, T, Dh]
+        k = k.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
+        v = v.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
+
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True
+        )  # [B*H, T, Dh]
+
+        attn_output = attn_output.view(B, H, T, Dh).permute(0, 2, 1, 3).contiguous().view(B, T, D)
+        out = self.o_proj(attn_output)
+        return out
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -408,8 +438,11 @@ class ConformerConvModule(nn.Module):
         )
         self.d_model = d_model
 
-    def forward(self, x: torch.Tensor):
-        # x: [B, T, D]
+    def forward_ref(self, x: torch.Tensor) -> torch.Tensor:
+        is_2d = x.dim() == 2
+        if is_2d:
+            x = x.unsqueeze(0)
+
         B, T, D = x.shape
         assert D == self.d_model
 
@@ -420,16 +453,18 @@ class ConformerConvModule(nn.Module):
 
         fctx = get_forward_context()
         attn_meta_all = fctx.attn_metadata
-        if isinstance(attn_meta_all, dict):
-            attn_metadata: FastConformerMetadata = attn_meta_all[self.conv_cache.prefix]
-        else:
+        if not isinstance(attn_meta_all, dict):
             # dummy path: plain conv
             y_dw = self.dw(pre_dw)
             y_dw = self.bn(y_dw)
             y_dw = F.silu(y_dw)
             y = self.pw2(y_dw)
-            return y.transpose(1, 2)   # [B, T, D]
+            out = y.transpose(1, 2)   # [B, T, D]
+            if is_2d:
+                out = out.squeeze(0)
+            return out
 
+        attn_metadata: FastConformerMetadata = attn_meta_all[self.conv_cache.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
@@ -437,15 +472,21 @@ class ConformerConvModule(nn.Module):
         # because of an invariant that vLLM enforces where the page size must
         # be the same for both conv and attention layers.
         store = self.conv_cache.kv_cache[fctx.virtual_engine]  # [num_pages, L', D]
-        # we should only read/write the rightmost L elements for each page
         L = self.conv_cache.left_ctx
         hist_full = store[page_indices]                   # [B, L', D]
         hist = hist_full[:, -L:, :].transpose(1, 2).contiguous()   # [B, D, L]
 
         x_cat = torch.cat([hist, pre_dw], dim=-1)                 # [B, D, L+T]
 
-        y_dw = F.conv1d(x_cat, self.dw.weight, self.dw.bias,
-                        stride=1, padding=0, dilation=1, groups=D)[:, :, -T:]
+        y_dw = F.conv1d(
+            x_cat,
+            self.dw.weight,
+            self.dw.bias,
+            stride=1,
+            padding=0,
+            dilation=1,
+            groups=D,
+        )[:, :, -T:]
         y_dw = self.bn(y_dw)
         y_dw = F.silu(y_dw)
         y = self.pw2(y_dw).transpose(1, 2)                        # [B, T, D]
@@ -454,7 +495,64 @@ class ConformerConvModule(nn.Module):
         new_hist = x_cat[:, :, -L:]                       # [B, D, L]
         store[page_indices, -L:, :] = new_hist.transpose(1, 2)   # [B, L, D]
 
+        if is_2d:
+            y = y.squeeze(0)
         return y
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        assert x.dim() == 2, "forward_cuda expects a 2D tensor [T, D]"
+        T, D = x.shape
+        assert D == self.d_model
+
+        y = x.transpose(0, 1).unsqueeze(0)   # [1, D, T]
+        y = self.pw1(y)                      # [1, 2D, T]
+        a, b = y.chunk(2, dim=1)
+        pre_dw = a * torch.sigmoid(b)        # [1, D, T]
+
+        fctx = get_forward_context()
+        attn_meta_all = fctx.attn_metadata
+        if not isinstance(attn_meta_all, dict):
+            return self.forward_ref(x)
+
+        attn_metadata: FastConformerMetadata = attn_meta_all[self.conv_cache.prefix]
+        block_table = attn_metadata.block_table_tensor
+        page_indices = block_table[:, 0]
+
+        store = self.conv_cache.kv_cache[fctx.virtual_engine]      # [num_pages, L', D]
+        conv_state = store.contiguous().transpose(1, 2)            # [num_pages, D, L']
+
+        K = self.dw.weight.size(2)
+        conv_weights = self.dw.weight.view(D, K)
+        conv_bias = self.dw.bias
+
+        pre_dw_2d = pre_dw.squeeze(0)             # [D, T]
+        query_start_loc = attn_metadata.query_start_loc
+        has_initial_state = torch.ones(
+            page_indices.size(0), dtype=torch.bool, device=pre_dw_2d.device
+        )
+
+        y_dw_2d = causal_conv1d_fn(
+            pre_dw_2d,
+            conv_weights,
+            conv_bias,
+            conv_state,
+            query_start_loc,
+            cache_indices=page_indices,
+            has_initial_state=has_initial_state,
+            activation=None,
+        )  # [D, T]
+
+        y_bn = self.bn(y_dw_2d.unsqueeze(0))      # [1, D, T]
+        y_act = F.silu(y_bn)
+        y_out = self.pw2(y_act).squeeze(0).transpose(0, 1)  # [T, D]
+        return y_out
+
+    def forward(self, x: torch.Tensor):
+        fctx = get_forward_context()
+        attn_meta_all = fctx.attn_metadata
+        if isinstance(attn_meta_all, dict) and x.dim() == 2:
+            return self.forward_cuda(x)
+        return self.forward_ref(x)
 
 class ConformerBlock(nn.Module):
     def __init__(self,
@@ -585,9 +683,9 @@ class FastConformerCTC(nn.Module):
         return x
     
     def _forward_conv_only(self, x: torch.Tensor) -> torch.Tensor:
-        x = self._remove_ragged_format(x, pre_subsample=False)
+        # x = self._remove_ragged_format(x, pre_subsample=False)
         x = self.blocks[0].conv(x)
-        x = self._add_ragged_format(x)
+        # x = self._add_ragged_format(x)
         return x
 
     def forward(
