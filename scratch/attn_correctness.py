@@ -22,7 +22,16 @@ from safetensors.torch import load_file as load_safetensors
 BUNDLE_DIR = "/home/scratch.jdaw_coreai/landrew/fastconformer_hf/"
 TMP_DIR = "/home/scratch.jdaw_coreai/landrew/attn_correctness_tmp/"
 D_IN = 512
+DTYPE = torch.bfloat16
 
+def _get_dtype_str(dtype: torch.dtype) -> str:
+    match dtype:
+        case torch.float32:
+            return "float32"
+        case torch.bfloat16:
+            return "bfloat16"
+        case _:
+            raise ValueError(f"unsupported dtype: {dtype}")
 
 @contextmanager
 def use_tmp_bundle_dir(bundle_dir, tmp_dir):
@@ -77,7 +86,7 @@ async def main():
             enforce_eager=True,
             return_hidden_states=True,
             skip_tokenizer_init=True,
-            dtype="float32"
+            dtype=_get_dtype_str(DTYPE)
         )
         engine = AsyncLLM.from_engine_args(engine_args)
 
@@ -87,7 +96,7 @@ async def main():
         latency_measurements: list[float] = []
 
         torch.manual_seed(0)
-        seq_inputs = torch.randn(1, STEPS, D_IN)
+        seq_inputs = torch.randn(1, STEPS, D_IN, dtype=DTYPE)
         first_packet_len = 1
         first_packet = seq_inputs[0, :first_packet_len, :].contiguous()
 
@@ -127,7 +136,7 @@ async def main():
             use_bias=True,
             use_pytorch_sdpa=False,
         )
-        nemo_attn.eval()
+        nemo_attn.to(DTYPE).eval()
 
         with torch.no_grad():
             nemo_attn.linear_q.weight.copy_(sd[q_w_key])

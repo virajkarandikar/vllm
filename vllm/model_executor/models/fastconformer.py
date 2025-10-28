@@ -119,9 +119,8 @@ class ConformerFFN(nn.Module):
         return x
 
 class FastConformerConvCache(torch.nn.Module, AttentionLayerBase):
-    def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig):
+    def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig, dtype: torch.dtype):
         super().__init__()
-        self.dtype = torch.float32
         self.d_model = int(d_model)
         self.k = int(k)
         self.left_ctx = self.k - 1  # L
@@ -133,6 +132,7 @@ class FastConformerConvCache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.kv_cache = [torch.tensor([])]
+        self.dtype = dtype
 
         compilation = get_current_vllm_config().compilation_config
         if prefix in compilation.static_forward_context:
@@ -198,17 +198,39 @@ class RelPosSelfAttention(nn.Module):
                 f"attn cache block size must be 128, got {cache_config.block_size}"
             )
 
-        # cache for projected relative position embeddings per device/dtype/window
         self._rel_cache: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+
+        self.register_buffer(
+            "qkv_weight",
+            torch.empty(3 * d_model, d_model, dtype=self.q_proj.weight.dtype)
+        )
+        self.register_buffer(
+            "qkv_bias",
+            torch.empty(3 * d_model, dtype=self.q_proj.weight.dtype)
+        )
+        self._qkv_fused_ready: bool = False
+
+    def _fused_qkv_projection(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._qkv_fused_ready:
+            qkv = F.linear(x, self.qkv_weight, self.qkv_bias)  # [B, T, 3D]
+        else:
+            raise Exception("this should not happen")
+            w_cat = torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], dim=0)
+            b_cat = torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias], dim=0)
+            qkv = F.linear(x, w_cat, b_cat)
+        D = x.size(-1)
+        q, k, v = qkv.split(D, dim=-1)
+        return q, k, v
 
     def _forward_ref(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         H, Dh = self.h, self.dh
         assert D == H * Dh
 
-        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
-        k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
-        v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
+        q, k, v = self._fused_qkv_projection(x)
+        q = q.view(B, T, H, Dh).transpose(1, 2).contiguous()
+        k = k.view(B, T, H, Dh).transpose(1, 2).contiguous()
+        v = v.view(B, T, H, Dh).transpose(1, 2).contiguous()
         # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q.pt", q)
         # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/k.pt", k)
         # _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/v.pt", v)
@@ -348,11 +370,12 @@ class RelPosSelfAttention(nn.Module):
         B, T, D = x.shape
         H, Dh = self.h, self.dh
 
-        q = self.q_proj(x).view(B, T, H, Dh)    # [B, T, H, Dh]
-        k = self.k_proj(x).view(B, T, H, Dh)    # [B, T, H, Dh]
-        v = self.v_proj(x).view(B, T, H, Dh)    # [B, T, H, Dh]
+        q, k, v = self._fused_qkv_projection(x)
+        q = q.view(B, T, H, Dh)    # [B, T, H, Dh]
+        k = k.view(B, T, H, Dh)    # [B, T, H, Dh]
+        v = v.view(B, T, H, Dh)    # [B, T, H, Dh]
 
-        q = q + self.pos_bias_u.unsqueeze(0).unsqueeze(0)  # [1,1,H,Dh] broadcast
+        # q = q + self.pos_bias_u.unsqueeze(0).unsqueeze(0)  # [1,1,H,Dh] broadcast
 
         q = q.permute(0, 2, 1, 3).reshape(B * H, T, Dh)  # [B*H, T, Dh]
         k = k.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
@@ -371,9 +394,10 @@ class RelPosSelfAttention(nn.Module):
         B, T, D = x.shape
         H, Dh = self.h, self.dh
 
-        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
-        k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
-        v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
+        q, k, v = self._fused_qkv_projection(x)
+        q = q.view(B, T, H, Dh).transpose(1, 2).contiguous()
+        k = k.view(B, T, H, Dh).transpose(1, 2).contiguous()
+        v = v.view(B, T, H, Dh).transpose(1, 2).contiguous()
         # _check("/home/scratch.jdaw_coreai/landrew/tmp/q.pt", q)
         # _check("/home/scratch.jdaw_coreai/landrew/tmp/k.pt", k)
         # _check("/home/scratch.jdaw_coreai/landrew/tmp/v.pt", v)
@@ -391,11 +415,10 @@ class RelPosSelfAttention(nn.Module):
         fctx = get_forward_context()
         attn_meta_all = fctx.attn_metadata
         if not isinstance(attn_meta_all, dict):
-            # No metadata (profiling etc) -> fall back to reference
             return self._forward_ref(x)
 
         attn_meta: FlexAttentionMetadata = attn_meta_all[self.prefix]
-        self._install_exact_mask(attn_meta)
+        # self._install_exact_mask(attn_meta)
 
         # if getattr(attn_meta, "_vllm_score_mod_window", None) != W or getattr(attn_meta, "score_mod", None) is None:
         #     score_mod = self._make_shaw_score_mod_flat(band_bias, W, attn_meta)
@@ -403,9 +426,9 @@ class RelPosSelfAttention(nn.Module):
         #     attn_meta.transformed_score_mod = attn_meta.get_transformed_score_mod()
         #     setattr(attn_meta, "_vllm_score_mod_window", W)
 
-        score_mod = self._make_shaw_score_mod_flat(band_bias, W, attn_meta)
-        attn_meta.score_mod = score_mod
-        attn_meta.transformed_score_mod = attn_meta.get_transformed_score_mod()
+        # score_mod = self._make_shaw_score_mod_flat(band_bias, W, attn_meta)
+        # attn_meta.score_mod = score_mod
+        # attn_meta.transformed_score_mod = attn_meta.get_transformed_score_mod()
 
         self_kv_cache = self.attn.kv_cache[fctx.virtual_engine]
         out_buf = torch.empty_like(query)  # [num_tokens, H, Dh]
@@ -422,7 +445,7 @@ class RelPosSelfAttention(nn.Module):
         return self.o_proj(out)
 
 class ConformerConvModule(nn.Module):
-    def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig):
+    def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig, dtype: torch.dtype):
         super().__init__()
         assert k % 2 == 1
         self.prefix = prefix
@@ -435,6 +458,7 @@ class ConformerConvModule(nn.Module):
 
         self.conv_cache = FastConformerConvCache(
             d_model=d_model, k=k, prefix=f"{prefix}.conv_cache", cache_config=cache_config,
+            dtype=dtype,
         )
         self.d_model = d_model
 
@@ -562,6 +586,7 @@ class ConformerBlock(nn.Module):
         ff_mult: int,
         attn_window: int,
         cache_config: CacheConfig,
+        dtype: torch.dtype,
         prefix: str,
     ):
         super().__init__()
@@ -570,7 +595,7 @@ class ConformerBlock(nn.Module):
         self.ln_attn = nn.LayerNorm(d_model)
         self.attn = RelPosSelfAttention(d_model, n_heads, attn_window, cache_config, prefix=f"{prefix}.attn")
         self.ln_conv = nn.LayerNorm(d_model)
-        self.conv = ConformerConvModule(d_model, k_conv, prefix=f"{prefix}.conv", cache_config=cache_config)
+        self.conv = ConformerConvModule(d_model, k_conv, prefix=f"{prefix}.conv", cache_config=cache_config, dtype=dtype)
         self.ln_ff2 = nn.LayerNorm(d_model)
         self.ff2 = ConformerFFN(d_model, ff_mult)
         self.ln_out = nn.LayerNorm(d_model)
@@ -609,6 +634,7 @@ class FastConformerCTC(nn.Module):
         self.config = config
 
         self.d_model = config.d_model
+        self.dtype = vllm_config.model_config.dtype
 
         self.vocab_size = config.ctc.get("vocab_size")
         assert self.vocab_size is not None, "config missing vocab_size"
@@ -630,7 +656,7 @@ class FastConformerCTC(nn.Module):
             feat_out=self.d_model,
             conv_channels=mid_ch,
             is_causal=True,
-        ).to(torch.float32).eval()
+        ).to(self.dtype).eval()
 
         att_window = int(config.att_left_ctx + config.att_right_ctx)
         assert att_window > 0, "att_window must be positive"
@@ -645,6 +671,7 @@ class FastConformerCTC(nn.Module):
                 ff_mult=config.ff_mult,
                 attn_window=att_window,
                 cache_config=vllm_config.cache_config,
+                dtype=self.dtype,
                 prefix=f"{prefix}.blocks.{i}",
             )
             for i in range(config.n_layers)
@@ -873,6 +900,22 @@ class FastConformerCTC(nn.Module):
             for n_src, p_dst, n_dst in ffn2:
                 if n_src in nemo:
                     copy_(p_dst, nemo[n_src], n_dst, n_src)
+
+            with torch.no_grad():
+                attn_mod = blk.attn
+                w_cat = torch.cat([
+                    attn_mod.q_proj.weight,
+                    attn_mod.k_proj.weight,
+                    attn_mod.v_proj.weight,
+                ], dim=0)
+                b_cat = torch.cat([
+                    attn_mod.q_proj.bias,
+                    attn_mod.k_proj.bias,
+                    attn_mod.v_proj.bias,
+                ], dim=0)
+                attn_mod.qkv_weight.copy_(w_cat)
+                attn_mod.qkv_bias.copy_(b_cat)
+                attn_mod._qkv_fused_ready = True
 
         head_w = "ctc_decoder.decoder_layers.0.weight"
         head_b = "ctc_decoder.decoder_layers.0.bias"
