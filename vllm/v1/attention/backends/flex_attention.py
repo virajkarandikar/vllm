@@ -743,7 +743,8 @@ class FlexAttentionMetadata:
             self.num_actual_tokens,
             kv_len,
             device=self.block_table.device,
-            BLOCK_SIZE=(self.q_block_size, self.kv_block_size),
+            # BLOCK_SIZE=(self.q_block_size, self.kv_block_size),
+            BLOCK_SIZE=(16, 16),
         )
 
     def __post_init__(self):

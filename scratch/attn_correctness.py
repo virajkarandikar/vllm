@@ -61,6 +61,10 @@ def use_tmp_bundle_dir(bundle_dir, tmp_dir):
 
 
 async def main():
+    print("syncing cuda...")
+    torch.cuda.synchronize()
+    print("cuda synced")
+
     with use_tmp_bundle_dir(BUNDLE_DIR, TMP_DIR) as model_dir:
         STEPS = 100
 
@@ -250,6 +254,10 @@ async def main():
             print(f"max_abs mean:     {m.mean():.6e}")
             print(f"max_abs p50/p90:  {np.percentile(m,50):.6e} / {np.percentile(m,90):.6e}")
             print(f"max_abs min/max:  {m.min():.6e} / {m.max():.6e}")
+
+    print("syncing cuda...")
+    torch.cuda.synchronize()
+    print("cuda synced")
 
 if __name__ == "__main__":
     asyncio.run(main())
