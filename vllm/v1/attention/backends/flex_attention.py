@@ -719,6 +719,7 @@ class FlexAttentionMetadata:
         return BlockMask.from_kv_blocks(**block_mask_kwargs)
 
     def build_block_mask(self) -> BlockMask:
+        print(f"[vllm_debug] this function is getting called which is kinda expensive")
         mask_mod = self.get_mask_mod()
         kv_len = (
             self.total_cache_tokens if self.uses_paged_kv else self.num_actual_tokens
@@ -730,8 +731,7 @@ class FlexAttentionMetadata:
             self.num_actual_tokens,
             kv_len,
             device=self.block_table.device,
-            # BLOCK_SIZE=(self.q_block_size, self.kv_block_size),
-            BLOCK_SIZE=(16, 16),
+            BLOCK_SIZE=(self.q_block_size, self.kv_block_size),
         )
 
     def __post_init__(self):

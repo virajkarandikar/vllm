@@ -61,7 +61,7 @@ async def main():
         enforce_eager=True,
         return_hidden_states=True,
         skip_tokenizer_init=True,
-        dtype="float32"
+        dtype="bfloat16"
     )
     engine = AsyncLLM.from_engine_args(engine_args)
 
@@ -72,7 +72,7 @@ async def main():
 
     latency_measurements: list[float] = []
 
-    first_packet = torch.randn(1, D_IN)
+    first_packet = torch.randn(1, D_IN, dtype=torch.bfloat16)
     gen_iter = engine.generate(
         request_id=req_id,
         prompt=EmbedsPrompt(prompt_embeds=first_packet),
@@ -110,7 +110,7 @@ async def main():
         pass
 
     for i in range(1, STEPS):
-        pkt = torch.randn(1, D_IN)
+        pkt = torch.randn(1, D_IN, dtype=torch.bfloat16)
         await engine.append_request(request_id=req_id, input_embeds=pkt)
         try:
             t0 = time.perf_counter()

@@ -21,7 +21,16 @@ from safetensors.torch import load_file as load_safetensors
 BUNDLE_DIR = "/home/scratch.jdaw_coreai/landrew/fastconformer_hf/"
 TMP_DIR = "/home/scratch.jdaw_coreai/landrew/conv_correctness_tmp/"
 D_IN = 512
+DTYPE = torch.float32
 
+def _get_dtype_str(dtype: torch.dtype) -> str:
+    match dtype:
+        case torch.float32:
+            return "float32"
+        case torch.bfloat16:
+            return "bfloat16"
+        case _:
+            raise ValueError(f"unsupported dtype: {dtype}")
 
 @contextmanager
 def use_tmp_bundle_dir(bundle_dir, tmp_dir):
@@ -62,7 +71,7 @@ def use_tmp_bundle_dir(bundle_dir, tmp_dir):
 
 async def main():
     with use_tmp_bundle_dir(BUNDLE_DIR, TMP_DIR) as model_dir:
-        STEPS = 1000
+        STEPS = 100
 
         engine_args = AsyncEngineArgs(
             model=model_dir,
@@ -73,7 +82,7 @@ async def main():
             enforce_eager=True,
             return_hidden_states=True,
             skip_tokenizer_init=True,
-            dtype="float32"
+            dtype=_get_dtype_str(DTYPE)
         )
         engine = AsyncLLM.from_engine_args(engine_args)
 
@@ -83,14 +92,12 @@ async def main():
         latency_measurements: list[float] = []
 
         torch.manual_seed(0)
-        seq_inputs = torch.randn(1, STEPS, D_IN)
+        seq_inputs = torch.randn(1, STEPS, D_IN, dtype=DTYPE)
         first_packet_len = 1
         first_packet = seq_inputs[0, :first_packet_len, :].contiguous()
 
         cfg = json.load(open(os.path.join(model_dir, "config.json"), "r"))
         d_model = int(cfg.get("d_model", D_IN))
-        n_heads = int(cfg.get("n_heads", cfg.get("num_attention_heads", 8)))
-        dropout_rate = float(cfg.get("dropout_rate", 0.0))
 
         if d_model != D_IN:
             print(f"[warn] cfg d_model ({d_model}) != D_IN ({D_IN}); using d_model={d_model}")
@@ -106,7 +113,7 @@ async def main():
             conv_context_size=[k_conv - 1, 0],
             use_bias=True,
         ).to(seq_inputs.dtype)
-        nemo_conv.eval()
+        nemo_conv.to(DTYPE).eval()
 
         pw1_w_key = "encoder.layers.0.conv.pointwise_conv1.weight"
         pw1_b_key = "encoder.layers.0.conv.pointwise_conv1.bias"

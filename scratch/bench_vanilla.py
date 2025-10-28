@@ -26,7 +26,7 @@ async def main():
         gpu_memory_utilization=0.85,
         block_size=128,
         enable_prompt_embeds=True,
-        # enforce_eager=True,
+        enforce_eager=True,
         return_hidden_states=True,
         skip_tokenizer_init=True,
         dtype="bfloat16"
