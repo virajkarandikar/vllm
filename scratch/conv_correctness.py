@@ -62,7 +62,7 @@ def use_tmp_bundle_dir(bundle_dir, tmp_dir):
 
 async def main():
     with use_tmp_bundle_dir(BUNDLE_DIR, TMP_DIR) as model_dir:
-        STEPS = 100
+        STEPS = 1000
 
         engine_args = AsyncEngineArgs(
             model=model_dir,
