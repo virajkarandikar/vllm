@@ -682,32 +682,43 @@ class ConformerConvModule(nn.Module):
         T, D = x.shape
         assert D == self.d_model
 
-        y = x.transpose(0, 1).unsqueeze(0)   # [1, D, T]
-        y = self.pw1(y)                      # [1, 2D, T]
-        a, b = y.chunk(2, dim=1)
-        pre_dw = a * torch.sigmoid(b)        # [1, D, T]
+        w1 = self.pw1.weight.squeeze(-1)   # [2D, D]
+        b1 = self.pw1.bias                 # [2D]
+        y_pw1 = F.linear(x, w1, b1)        # [T, 2D]
+        a, b = y_pw1.chunk(2, dim=-1)      # [T, D], [T, D]
+        pre_dw = a * torch.sigmoid(b)      # GLU -> [T, D]
 
         fctx = get_forward_context()
         attn_meta_all = fctx.attn_metadata
         if not isinstance(attn_meta_all, dict):
-            return self.forward_ref(x)
+            # fallback path during dummy run
+            y = x.transpose(0, 1).unsqueeze(0)  # [1, D, T]
+            y = self.pw1(y)
+            a, b = y.chunk(2, dim=1)
+            pre_dw_ref = a * torch.sigmoid(b)
+            y_dw = self.dw(pre_dw_ref)
+            y_bn = self.bn(y_dw)
+            y_act = F.silu(y_bn)
+            y_out = self.pw2(y_act).squeeze(0).transpose(0, 1)  # [T, D]
+            return y_out
 
         attn_metadata: FastConformerMetadata = attn_meta_all[self.conv_cache.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
-        store = self.conv_cache.kv_cache[fctx.virtual_engine]      # [num_pages, L', D]
-        conv_state = store.contiguous().transpose(1, 2)            # [num_pages, D, L']
+        store = self.conv_cache.kv_cache[fctx.virtual_engine]
+        conv_state = store.contiguous().transpose(1, 2)
 
         K = self.dw.weight.size(2)
         conv_weights = self.dw.weight.view(D, K)
         conv_bias = self.dw.bias
 
-        pre_dw_2d = pre_dw.squeeze(0)             # [D, T]
+        pre_dw_2d = pre_dw.transpose(0, 1)
+
         query_start_loc = attn_metadata.query_start_loc
-        has_initial_state = torch.ones(
-            page_indices.size(0), dtype=torch.bool, device=pre_dw_2d.device
-        )
+        has_initial_state = torch.ones(page_indices.size(0),
+                                    dtype=torch.bool,
+                                    device=pre_dw_2d.device)
 
         y_dw_2d = causal_conv1d_fn(
             pre_dw_2d,
@@ -718,11 +729,12 @@ class ConformerConvModule(nn.Module):
             cache_indices=page_indices,
             has_initial_state=has_initial_state,
             activation=None,
-        )  # [D, T]
-
-        y_bn = self.bn(y_dw_2d.unsqueeze(0))      # [1, D, T]
+        )
+        y_bn = self.bn(y_dw_2d.unsqueeze(0)).squeeze(0)
         y_act = F.silu(y_bn)
-        y_out = self.pw2(y_act).squeeze(0).transpose(0, 1)  # [T, D]
+        w2 = self.pw2.weight.squeeze(-1)
+        b2 = self.pw2.bias
+        y_out = F.linear(y_act.transpose(0, 1), w2, b2)
         return y_out
 
     def forward(self, x: torch.Tensor):
@@ -890,30 +902,22 @@ class FastConformerCTC(nn.Module):
         assert F == 640, f"expected feature dim=80*8, got {F}"
         x = x.view(T, 8, 80).reshape(T * 8, 80)
 
-        x = self._remove_ragged_format(x)
+        # x = self._remove_ragged_format(x)
 
-        # _check("/home/scratch.jdaw_coreai/landrew/tmp/audio_signal_pre.pt", x)
 
-        length = x.new_full(
-                (x.size(0),), x.size(1), dtype=torch.int64, device=x.device
-            )
+        # TODO: dummy sampler replacement, since the real sampler does not support BT input
+        x = torch.randn(T, 512, dtype=x.dtype, device=x.device)
+        # length = x.new_full(
+        #         (x.size(0),), x.size(1), dtype=torch.int64, device=x.device
+        #     )
+        # x, _ = self.subsample(x, length, dummy=True)
 
-        x, _ = self.subsample(x, length)
-        # _check("/home/scratch.jdaw_coreai/landrew/tmp/audio_signal.pt", x)
         xscale = math.sqrt(self.d_model)
         x = (x * xscale)
-        # _check("/home/scratch.jdaw_coreai/landrew/tmp/audio_signal_post.pt", x)
 
-        # x = x[:,1:,:]
-
-        for i, blk in enumerate(self.blocks):
-            x = blk(x)                 # [T/8, D]
-            # _check(f"/home/scratch.jdaw_coreai/landrew/tmp/audio_signal_post_{i}.pt", x)
-        # x = self.attn(x)
-
-        # slice last n frames
-        x = x[:,1:,:]
-        x = self._add_ragged_format(x)
+        for _, blk in enumerate(self.blocks):
+            x = blk(x)
+        # x = self._add_ragged_format(x)
         return x
 
     def compute_logits(
