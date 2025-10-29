@@ -183,7 +183,7 @@ async def main():
             pass
 
         for i in range(first_packet_len, STEPS):
-            pkt = seq_inputs[:, i, :].contiguous()
+            pkt = seq_inputs[0, i:i+1, :].contiguous()
             await engine.append_request(request_id=req_id, input_embeds=pkt)
             try:
                 t0 = time.perf_counter()
