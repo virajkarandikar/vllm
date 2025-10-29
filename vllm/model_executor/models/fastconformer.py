@@ -176,24 +176,25 @@ class _TransformedShawBias:
         q_idx: torch.Tensor,
         physical_kv_idx: torch.Tensor,
     ) -> torch.Tensor:
-        block_sz = self.block_size
-        physical_kv_block = torch.div(physical_kv_idx, block_sz, rounding_mode='floor')
-        physical_kv_offset = physical_kv_idx % block_sz
+        # block_sz = self.block_size
+        # physical_kv_block = torch.div(physical_kv_idx, block_sz, rounding_mode='floor')
+        # physical_kv_offset = physical_kv_idx % block_sz
 
-        doc = self.doc_ids[q_idx.long()]
-        logical_block_idx = self.physical_to_logical[doc.long(), physical_kv_block.long()]
-        logical_kv_idx = logical_block_idx * block_sz + physical_kv_offset
+        # doc = self.doc_ids[q_idx.long()]
+        # logical_block_idx = self.physical_to_logical[doc.long(), physical_kv_block.long()]
+        # logical_kv_idx = logical_block_idx * block_sz + physical_kv_offset
 
-        live_block = logical_block_idx >= 0
-        within_lower = logical_kv_idx >= 0
-        is_valid = live_block & within_lower
+        # live_block = logical_block_idx >= 0
+        # within_lower = logical_kv_idx >= 0
+        # is_valid = live_block & within_lower
 
-        logical_q_idx = q_idx + self.decode_offset[doc.long()]
-        rel = torch.clamp(logical_q_idx - logical_kv_idx, -self.W, self.W) + self.W
-        local_q = logical_q_idx - self.decode_offset[doc.long()]
+        # logical_q_idx = q_idx + self.decode_offset[doc.long()]
+        # rel = torch.clamp(logical_q_idx - logical_kv_idx, -self.W, self.W) + self.W
+        # local_q = logical_q_idx - self.decode_offset[doc.long()]
 
-        bias = self.band_bias[doc.long(), h.long(), local_q.long(), rel.long()]
-        return torch.where(is_valid, score + bias, score)
+        # bias = self.band_bias[doc.long(), h.long(), local_q.long(), rel.long()]
+        # return torch.where(is_valid, score + bias, score)
+        return score
 
 class RelPosSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, window: int,
@@ -373,15 +374,16 @@ class RelPosSelfAttention(nn.Module):
 
         key = self._mask_cache_key(attn_meta)
         bm = self._blockmask_cache.get(key)
+        print(f"[vllm_debug] id(bm): {id(bm)}")
         if bm is None:
             attn_meta.mask_mod = attn_meta.get_mask_mod()
-            bm = attn_meta._build_block_mask_direct() if attn_meta.causal else attn_meta.build_block_mask()
+            bm = attn_meta.build_block_mask()
             self._blockmask_cache[key] = bm
         attn_meta.block_mask = bm
         attn_meta._installed_exact_mask = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self._forward(x)
+        return self._forward_sdpa_2(x)
 
     def _forward_sdpa(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -396,12 +398,149 @@ class RelPosSelfAttention(nn.Module):
         k = k.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
         v = v.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
 
+        import time
+        print(f"[vllm_debug] q.shape: {q.shape}")
+        print(f"[vllm_debug] k.shape: {k.shape}")
+        print(f"[vllm_debug] v.shape: {v.shape}")
+        t0 = time.perf_counter()
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, is_causal=True
         )
+        t1 = time.perf_counter()
+        print(f"[vllm_debug] sdpa kernel execution time: {(t1 - t0) * 1000} ms")
         attn_output = attn_output.view(B, H, T, Dh).permute(0, 2, 1, 3).contiguous().view(B, T, D)
         out = self.o_proj(attn_output)
         return out
+
+    def _forward_sdpa_2(self, x: torch.Tensor) -> torch.Tensor:
+        import time
+        B, T, D = x.shape
+        H, Dh = self.h, self.dh
+        W = int(self.window)
+
+        q_lin, k_lin, v_lin = self._fused_qkv_projection(x)
+        q = q_lin.view(B, T, H, Dh)
+        k = k_lin.view(B, T, H, Dh)
+        v = v_lin.view(B, T, H, Dh)
+
+        q_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(0)       # [B,T,H,Dh]
+        q_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(0)       # [B,T,H,Dh]
+
+        # TODO: verify that this is necessary
+        query = q_u.transpose(1, 2).contiguous().view(-1, H, Dh)  # [num_tokens, H, Dh]
+        q_for_bias = q_v.transpose(1, 2).contiguous().view(-1, H, Dh)  # [num_tokens,H,Dh]
+        key   = k.transpose(1, 2).contiguous().view(-1, H, Dh)    # [num_tokens, H, Dh]
+        value = v.transpose(1, 2).contiguous().view(-1, H, Dh)    # [num_tokens, H, Dh]
+
+        fctx = get_forward_context()
+        attn_meta_all = fctx.attn_metadata
+        if not isinstance(attn_meta_all, dict):
+            return self._forward_ref(x)
+
+        attn_meta: FlexAttentionMetadata = attn_meta_all[self.prefix]
+
+        block_size = int(attn_meta.block_size)
+        assert W < block_size, f"window ({W}) must be < cache block_size ({block_size})"
+
+        num_tokens = query.shape[0]
+        N = int(attn_meta.num_actual_tokens)
+        assert N <= num_tokens, "num_actual_tokens exceeds flattened token count"
+
+        self_kv_cache = self.attn.kv_cache[fctx.virtual_engine]   # [2, num_blocks, block_size, H, Dh]
+        t0 = time.perf_counter()
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            key, value,
+            self_kv_cache[0], self_kv_cache[1],
+            attn_meta.slot_mapping,
+            self.attn.impl.kv_cache_dtype,
+            self._k_scale, self._v_scale,
+        )
+        t1 = time.perf_counter()
+        print(f"[vllm_debug] reshape_and_cache_flash time (sdpa): {(t1 - t0) * 1000:.3f} ms")
+
+        key_cache, value_cache = self_kv_cache.unbind(0)  # each: [num_blocks, block_size, H, Dh]
+
+        device, idtype = x.device, x.dtype
+        K_cap = W + 1
+
+        rel = self._get_rel_proj(device, idtype, W)  # [H, Dh, 2W+1]
+
+        # NOTE: sdpa does not natively support packed varlen inputs, so we need to pad inputs to a fixed length
+        # K_pad/V_pad: [N, K_cap, H, Dh];  attn_bias: [N, H, 1, K_cap]
+        K_pad = torch.zeros((N, K_cap, H, Dh), device=device, dtype=idtype)
+        V_pad = torch.zeros((N, K_cap, H, Dh), device=device, dtype=idtype)
+        attn_bias = torch.full((N, H, 1, K_cap), float("-inf"), device=device, dtype=idtype)
+
+        query_start_loc = attn_meta.query_start_loc       # [num_reqs]
+        decode_offset   = attn_meta.decode_offset         # [num_reqs]
+        block_table     = attn_meta.block_table           # [max_reqs, max_logical_blocks]
+        doc_ids         = attn_meta.doc_ids               # [N_total_flat]
+
+        for i in range(N):
+            req = int(doc_ids[i].item())
+            local_q_idx = i - int(query_start_loc[req].item())
+            logical_q   = local_q_idx + int(decode_offset[req].item())
+
+            start = max(0, logical_q - W)
+            L = logical_q - start + 1
+            pad = K_cap - L
+
+            start_block = start // block_size
+            end_block   = logical_q // block_size
+            start_off   = start %  block_size
+            end_off     = logical_q % block_size
+
+            phys_start_block = int(block_table[req, start_block].item())
+            phys_end_block   = int(block_table[req, end_block].item())
+            assert phys_start_block >= 0 and phys_end_block >= 0, "Invalid physical block index in block_table"
+
+            # NOTE: assumption is that window size is less than or equal to block size
+            # block_size = 128 and window_size = 71 in the default fastconformer config
+            if start_block == end_block:
+                ks = key_cache[phys_end_block, start_off:end_off + 1, :, :]   # [L, H, Dh]
+                vs = value_cache[phys_end_block, start_off:end_off + 1, :, :] # [L, H, Dh]
+            else:
+                ks_part1 = key_cache[phys_start_block, start_off:block_size, :, :]  # [block_size-start_off, H, Dh]
+                ks_part2 = key_cache[phys_end_block, 0:end_off + 1, :, :]           # [end_off+1, H, Dh]
+                ks = torch.cat([ks_part1, ks_part2], dim=0)                          # [L, H, Dh]
+
+                vs_part1 = value_cache[phys_start_block, start_off:block_size, :, :]
+                vs_part2 = value_cache[phys_end_block, 0:end_off + 1, :, :]
+                vs = torch.cat([vs_part1, vs_part2], dim=0)
+
+            K_pad[i, pad:pad + L, :, :] = ks
+            V_pad[i, pad:pad + L, :, :] = vs
+
+            # q_for_bias[i]: [H, Dh]; rel: [H, Dh, 2W+1] -> band_i: [H, 2W+1]
+            band_i = torch.einsum("h d, h d m -> h m", q_for_bias[i], rel) * (Dh ** -0.5)
+
+            bias_slice = band_i[:, W:W + L].flip(-1)     # [H, L]
+            attn_bias[i, :, 0, pad:pad + L] = bias_slice
+
+        # q_sdpa: [N*H, 1, Dh];  k_sdpa: [N*H, K_cap, Dh];  v_sdpa: [N*H, K_cap, Dh]
+        q_sdpa = query[:N].reshape(N * H, 1, Dh)
+        k_sdpa = K_pad.permute(0, 2, 1, 3).contiguous().view(N * H, K_cap, Dh)
+        v_sdpa = V_pad.permute(0, 2, 1, 3).contiguous().view(N * H, K_cap, Dh)
+        attn_bias_sdpa = attn_bias.reshape(N * H, 1, K_cap)
+
+        t2 = time.perf_counter()
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=attn_bias_sdpa,
+            dropout_p=0.0,
+            is_causal=False,
+        )
+        t3 = time.perf_counter()
+        print(f"[vllm_debug] sdpa kernel execution time (with cache+bias): {(t3 - t2) * 1000:.3f} ms")
+
+        # y: [N*H, 1, Dh] -> [N, H, Dh]
+        y = y.view(N, H, 1, Dh).squeeze(2)
+
+        out_buf = torch.zeros_like(query)  # [num_tokens, H, Dh]
+        out_buf[:N, :, :] = y
+
+        attn_output = out_buf.view(B, T, H, Dh).permute(0, 2, 1, 3).contiguous().view(B, T, D)
+        return self.o_proj(attn_output)
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -415,7 +554,7 @@ class RelPosSelfAttention(nn.Module):
         q_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
 
         W = int(self.window)
-        band_bias = self._build_shaw_band_bias(q, W)  # [B,H,T,2W+1]
+        # band_bias = self._build_shaw_band_bias(q, W)  # [B,H,T,2W+1]
 
         query = q_u.reshape(-1, H, Dh)
         key   = k.reshape(-1, H, Dh)
@@ -430,13 +569,16 @@ class RelPosSelfAttention(nn.Module):
 
         self._install_exact_mask_cached(attn_meta)
 
-        self._shaw_mod.bind(attn_meta, band_bias)
+        # self._shaw_mod.bind(attn_meta, band_bias)
         if not getattr(attn_meta, "_installed_shaw_mod", False):
-            attn_meta.transformed_score_mod = self._shaw_mod
+            # attn_meta.transformed_score_mod = self._shaw_mod
+            attn_meta.transformed_score_mod = None
             attn_meta._installed_shaw_mod = True
 
         self_kv_cache = self.attn.kv_cache[fctx.virtual_engine]
         out_buf = torch.empty_like(query)  # [num_tokens, H, Dh]
+        import time
+        t0 = time.perf_counter()
         out = self.attn.impl.forward(
             layer=self,
             query=query,
@@ -446,6 +588,8 @@ class RelPosSelfAttention(nn.Module):
             attn_metadata=attn_meta,
             output=out_buf,
         )
+        t1 = time.perf_counter()
+        print(f"[vllm_debug] forward attention kernel execution time: {(t1 - t0) * 1000} ms")
         out = out.view(B, T, H, Dh).transpose(1, 2).contiguous().view(B, T, D)
         return self.o_proj(out)
 
