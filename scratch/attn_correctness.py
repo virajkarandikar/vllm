@@ -22,7 +22,7 @@ from safetensors.torch import load_file as load_safetensors
 BUNDLE_DIR = "/home/scratch.jdaw_coreai/landrew/fastconformer_hf/"
 TMP_DIR = "/home/scratch.jdaw_coreai/landrew/attn_correctness_tmp/"
 D_IN = 512
-DTYPE = torch.bfloat16
+DTYPE = torch.float32
 
 def _get_dtype_str(dtype: torch.dtype) -> str:
     match dtype:
@@ -96,9 +96,9 @@ async def main():
         latency_measurements: list[float] = []
 
         torch.manual_seed(0)
-        seq_inputs = torch.randn(1, STEPS, D_IN, dtype=DTYPE)
+        seq_inputs = torch.randn(STEPS, D_IN, dtype=DTYPE)
         first_packet_len = 1
-        first_packet = seq_inputs[0, :first_packet_len, :].contiguous()
+        first_packet = seq_inputs[:first_packet_len, :].contiguous()
 
         cfg = json.load(open(os.path.join(model_dir, "config.json"), "r"))
         d_model = int(cfg.get("d_model", D_IN))
@@ -169,7 +169,7 @@ async def main():
                 mask = mask | (~allowed)
             mask = mask.unsqueeze(0)  # [1, T, T]
 
-            x_in, pos_emb = pos_enc(seq_inputs)
+            x_in, pos_emb = pos_enc(seq_inputs.unsqueeze(0))
             nemo_prefill_out = nemo_attn(
                 query=x_in,
                 key=x_in,
@@ -219,7 +219,7 @@ async def main():
             pass
 
         for i in range(first_packet_len, STEPS):
-            pkt = seq_inputs[:, i, :].contiguous()
+            pkt = seq_inputs[i:i+1, :].contiguous()
             await engine.append_request(request_id=req_id, input_embeds=pkt)
             try:
                 t0 = time.perf_counter()
