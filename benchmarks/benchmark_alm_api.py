@@ -5,6 +5,7 @@ import uuid
 import logging
 from typing import Dict, List, Any
 import numpy as np
+import torch
 
 # Suppress verbose vLLM logging
 logging.getLogger("vllm").setLevel(logging.WARNING)
@@ -28,8 +29,8 @@ async def run_request(
     """
     Sends a single request to the vLLM engine and records metrics.
     """
-    prompt_token_ids = np.random.randint(0, 10000, input_num_tokens).tolist()
-    inputs = {"prompt_token_ids": prompt_token_ids}
+    prompt_token_ids = torch.randint(0, 10000, (input_num_tokens,), dtype=torch.int32)
+    inputs = {"prompt_token_ids": [0] * input_num_tokens, "custom_inputs": {"custom_tokens": prompt_token_ids}}
     request_start_time = time.perf_counter()
     last_token_time = None
     token_count = 0
@@ -43,6 +44,7 @@ async def run_request(
             
             # Get the new number of generated tokens
             new_token_count = len(output.outputs[0].token_ids)
+            new_token = output.outputs[0].token_ids[-1]
             
             # Check if this step produced a new token
             if new_token_count > token_count:
@@ -62,6 +64,11 @@ async def run_request(
             # With dummy weights, this will trigger at sampling_params.max_tokens
             if output.finished:
                 break
+            else:
+                await engine.append_request(
+                    request_id=request_id,
+                    custom_inputs={"custom_tokens": torch.tensor([new_token], dtype=torch.int32)}
+                )
         
         # After the loop finishes (sequence is done)
         request_end_time = time.perf_counter()
