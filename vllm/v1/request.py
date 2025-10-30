@@ -130,7 +130,8 @@ class Request:
         # Custom inputs support
         self.custom_inputs: dict[str, torch.Tensor] | None = custom_inputs
         # for a running request, scheduler will wait for the flag to be set
-        self._custom_inputs_ready = custom_inputs is not None
+        self.custom_inputs_ready = custom_inputs is not None
+        self.custom_inputs_num_consumed = 0
         # Cache per-block prompt-embed hashes to avoid rehashing the same
         # tensor slices when generating extra keys.
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
@@ -318,16 +319,47 @@ class Request:
     def set_custom_inputs(self, custom_inputs: dict[str, torch.Tensor]) -> None:
         """Set custom inputs for the request."""
         self.custom_inputs = custom_inputs
-        self._custom_inputs_ready = True
+        self.custom_inputs_ready = True
+        self.custom_inputs_num_consumed = 0
 
-    def read_custom_inputs(self) -> dict[str, torch.Tensor] | None:
-        """Read and clear custom inputs."""
-        self._custom_inputs_ready = False
-        return self.custom_inputs
+    def read_custom_inputs(
+        self,
+        num_scheduled_tokens: int
+    ) -> Optional[dict[str, torch.Tensor]]:
+        """Read custom inputs for the scheduled tokens.
+
+        For chunked prefill, this slices only the portion of custom_inputs
+        that corresponds to the tokens being scheduled in this iteration.
+        The _custom_inputs_ready flag is only cleared once all tokens have
+        been read.
+
+        Args:
+            num_scheduled_tokens: Number of tokens being scheduled in this iteration
+
+        Returns:
+            Sliced custom_inputs dict, or None if no custom inputs
+        """
+        assert self.custom_inputs
+
+        # Slice custom_inputs for only the scheduled tokens
+        start_idx = self.custom_inputs_num_consumed
+        end_idx = start_idx + num_scheduled_tokens
+
+        sliced_custom_inputs = {}
+        for input_name, input_tensor in self.custom_inputs.items():
+            sliced_custom_inputs[input_name] = input_tensor[start_idx:end_idx]
+            if end_idx > input_tensor.shape[0]:
+                raise ValueError(f"Custom input {input_name} has only {input_tensor.shape[0]} tokens, tried to read [{start_idx}:{end_idx}]")
+            if end_idx == input_tensor.shape[0]:
+                # All custom inputs have been consumed, need to wait for new ones
+                self.custom_inputs_ready = False
+
+        self.custom_inputs_num_consumed += num_scheduled_tokens
+        return sliced_custom_inputs
 
     def has_custom_inputs(self) -> bool:
         """Check if custom inputs are ready."""
-        return self._custom_inputs_ready
+        return self.custom_inputs_ready
 
     def __lt__(self, other: "Request") -> bool:
         """

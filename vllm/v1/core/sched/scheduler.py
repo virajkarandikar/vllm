@@ -1032,14 +1032,17 @@ class Scheduler(SchedulerInterface):
                 NewRequestData.from_request(
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
-                    req._all_token_ids,
+                    num_scheduled_tokens[req.request_id],
+                    prefill_token_ids=req._all_token_ids,
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    num_scheduled_tokens[req.request_id],
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1283,7 +1286,12 @@ class Scheduler(SchedulerInterface):
                 req.num_output_tokens + req.num_output_placeholders
             )
             # TODO: in `schedule` add a check that custom inputs are set
-            new_custom_inputs.append(req.read_custom_inputs())
+            # for resumed_reqs
+            # Read only the scheduled portion of custom_inputs (for chunked prefill)
+            scheduled_tokens = num_scheduled_tokens[req_id]
+            new_custom_inputs.append(
+                req.read_custom_inputs(scheduled_tokens)
+            )
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -2016,6 +2024,18 @@ class Scheduler(SchedulerInterface):
         """
         request = self.requests.get(request_id)
         if request is None:
+            # The request might have finished between when the client queued this
+            # call and when it's processed. This is a race condition that can occur
+            # when a request finishes (e.g., reaches max_tokens) while the client
+            # is still processing previous outputs and hasn't received the finished
+            # notification yet.
+            if request_id in self.finished_req_ids:
+                # Request was just finished, silently ignore this call
+                logger.debug(
+                    "Ignoring set_custom_inputs for recently finished request %s",
+                    request_id
+                )
+                return
             raise ValueError(f"Request {request_id} not found")
         if not self.await_inputs:
             raise ValueError(f"Engine is not awaiting inputs, can't set custom inputs")

@@ -1430,6 +1430,9 @@ class GPUModelRunner(
                 continue
 
             # Update the persistent batch.
+            if req_state.custom_inputs:
+                # custom inputs should be forwarded for the cached requests too
+                self.input_batch.req_custom_inputs[req_index] = req_state.custom_inputs
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
@@ -2049,7 +2052,7 @@ class GPUModelRunner(
                     if custom_input.shape[0] != num_sched:
                         raise RuntimeError(
                             f"Expected {num_sched} tokens for custom input {input_name} "
-                            f"for request {req_idx}, but got {custom_input.shape[0]}"
+                            f"for request {self.input_batch.req_ids[req_idx]}, but got {custom_input.shape[0]}"
                         )
                     self.custom_inputs[input_name].cpu[
                         output_idx : output_idx + num_sched
