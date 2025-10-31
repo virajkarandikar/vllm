@@ -13,18 +13,15 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
     TopKLogitsWarper,
 )
-from transformers import (
-    AutoConfig,
-    AutoModelForTextEncoding,
-)
+from transformers import AutoConfig
 
 from vllm.model_executor.models.gemma3 import Gemma3Model
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
+from vllm.compilation.decorators import support_torch_compile
 
-from .utils import (
-    AutoWeightsLoader,
-)
+from .utils import AutoWeightsLoader
+from .optimized_t5gemma import OptimizedT5GemmaEncoderModel
 
 
 class RMSNorm(nn.Module):
@@ -114,7 +111,8 @@ class CharAwareSubwordEncoder(nn.Module):
         self.max_char_len = max_char_len
         # 1. Initialize the backbone model for encoding characters
         config = AutoConfig.for_model(backbone_type, **backbone_config)
-        self.backbone = AutoModelForTextEncoding.from_config(config)
+        self.backbone = OptimizedT5GemmaEncoderModel(config)
+        self.backbone.eval()
         self.hidden_size = self.backbone.get_input_embeddings().weight.size(-1)
         delattr(self.backbone.encoder, "embed_tokens")
         # 2. Initialize embedding layer to embed characters
@@ -164,17 +162,25 @@ class CharAwareSubwordEncoder(nn.Module):
 
 # module that takes text tokens, audio tokens and prepares input embedding for EarTTS model
 class EarTTSInputEmbedding(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        context_hidden_size: int,
-        vocab_size: int,
-        char_vocab_size: int,
-        max_char_len: int,
-        backbone_type: str,
-        backbone_config: dict,
-    ):
+    def __init__(self, config):
         super().__init__()
+
+        hidden_size = config.hidden_size
+        context_hidden_size = config.context_hidden_size
+        vocab_size = config.emb_vocab_size
+        char_vocab_size = config.emb_char_vocab_size
+        max_char_len = config.max_char_len
+        backbone_type = config.emb_backbone_type
+        backbone_config = config.emb_backbone_config
+
+
+        # allows to embed acoustic tokens into a single embeddings
+        self.rvq_embs = nn.ModuleList([
+            nn.Embedding(config.codebook_size + 1, config.latent_size)
+            for _ in range(config.num_quantizers)
+        ])
+        self.embed_code = nn.Linear(config.latent_size, hidden_size, bias=False)
+
         # >>> weights["embed_tokens.weight"].shape
         # torch.Size([151936, 1536])
         self.embed_tokens = nn.Embedding(
@@ -195,7 +201,7 @@ class EarTTSInputEmbedding(nn.Module):
 
     def forward(
         self,
-        audio_emb: torch.Tensor,
+        acoustic_tokens: torch.Tensor,
         context_text_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
@@ -205,7 +211,7 @@ class EarTTSInputEmbedding(nn.Module):
         Works for context and generation phases to prepare total input embeddings
         for EarTTS model.
         Inputs:
-            audio_emb: (BT x dim) - already embedded audio tokens
+            acoustic_tokens: (BT x 31) - audio tokens
             context_text_tokens: (BT) - context text tokens
             text_tokens: (BT) - text token to embed
             text_mask: (BT) - masks text embeddings for prefill
@@ -213,6 +219,10 @@ class EarTTSInputEmbedding(nn.Module):
         Returns:
             embedding of shape (BT x dim)
         """
+
+        acoustic_tokens = acoustic_tokens.transpose(0, 1)  # 31 x BT
+        audio_emb = sum(emb(acoustic_tokens[i]) for i, emb in enumerate(self.rvq_embs))  # BT x latent_size
+        audio_emb = self.embed_code(audio_emb)  # BT x hidden_size
 
         # embed the context text tokens
         context_emb = self.embed_tokens(context_text_tokens)  # BT x dim
@@ -406,21 +416,56 @@ class MoGHead(nn.Module):
         return mu * torch.exp(logs) + mu_res, logs
 
 
+@support_torch_compile
+class EarTTSEmbeddingAndBackbone(nn.Module):
+    """
+    Wrapper module that combines the embedding preparation and backbone transformer.
+    This is separated from EarTTSForCausalLM to allow compilation of the transformer
+    parts while keeping the iterative generation step (_generate_step) uncompiled.
+    
+    Note: rvq_embs and embed_code are shared with parent EarTTSForCausalLM.
+    """
+    def __init__(
+        self, 
+        *, 
+        vllm_config: VllmConfig, 
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.total_emb = EarTTSInputEmbedding(vllm_config.model_config.hf_config)
+        self.backbone = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
+    
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors],
+        acoustic_tokens: torch.Tensor,
+        context_text_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_mask: torch.Tensor,
+        bos_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass through embeddings and backbone transformer.
+        Returns hidden states to be used by the generation step.
+        """
+        total_emb = self.total_emb(
+            acoustic_tokens=acoustic_tokens,
+            context_text_tokens=context_text_tokens,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            bos_mask=bos_mask,
+        )
+        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, inputs_embeds=total_emb)
+        return hidden_states
+
+
 class EarTTSForCausalLM(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        self.total_emb = EarTTSInputEmbedding(
-            hidden_size=self.config.hidden_size,
-            context_hidden_size=self.config.context_hidden_size,
-            vocab_size=self.config.emb_vocab_size,
-            char_vocab_size=self.config.emb_char_vocab_size,
-            max_char_len=self.config.max_char_len,
-            backbone_type=self.config.emb_backbone_type,
-            backbone_config=self.config.emb_backbone_config,
-        )
-        self.backbone = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
-
+        
         # easy access of cruicial config params
         self.num_quantizers = self.config.num_quantizers
         self.codebook_size = self.config.codebook_size
@@ -441,13 +486,21 @@ class EarTTSForCausalLM(nn.Module):
         first_nonzero = np.argmax(sampling_per_step_flat != 0)
         self.num_to_sample = sampling_per_step_flat[first_nonzero:].tolist()
 
-        # create layers used outside of backbone
-        # Store as Parameters so they can be used as tensors directly
+        # create layers used for embedding and generation
+        # These are shared between the compiled wrapper and uncompiled _generate_step
         self.rvq_embs = nn.Parameter(torch.empty(self.config.num_quantizers, self.config.codebook_size, self.config.latent_size))
         self.padding_idx = self.codebook_size
         self.embed_code = nn.Linear(
             self.config.latent_size, self.config.hidden_size, bias=False
         )
+        
+        # Create the compiled wrapper for embeddings and backbone
+        self.emb_and_backbone = EarTTSEmbeddingAndBackbone(
+            vllm_config=vllm_config,
+            prefix=prefix,
+        )
+        
+        # MoG head for generation (uncompiled part)
         self.mog_head = MoGHead(
             hidden_size=self.config.hidden_size,
             intermediate_size=self.config.intermediate_size,
@@ -462,7 +515,7 @@ class EarTTSForCausalLM(nn.Module):
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         # this is for compatability, it is not supposed to be used
-        return self.backbone.get_input_embeddings(input_ids)
+        return self.emb_and_backbone.backbone.get_input_embeddings(input_ids)
 
     def forward(
         self,
@@ -483,16 +536,18 @@ class EarTTSForCausalLM(nn.Module):
         input_ids, positions, intermediate_tensors, inputs_embeds - not used,
         they are here for compatability with the way vllm model executed.
         """
-        audio_emb = self._depthsum_embedding(acoustic_tokens.transpose(0, 1))  # BT x latent_size
-        audio_emb = self.embed_code(audio_emb)  # BT x hidden_size
-        total_emb = self.total_emb(
-            audio_emb=audio_emb,
+        # Run the compiled embedding + backbone path
+        hidden_states = self.emb_and_backbone(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            acoustic_tokens=acoustic_tokens,
             context_text_tokens=context_text_tokens,
             text_tokens=text_tokens,
             text_mask=text_mask,
             bos_mask=bos_mask,
         )
-        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, inputs_embeds=total_emb)
+        # Run the uncompiled generation step
         codes = self._generate_step(hidden_states)  # quantizers x BT
         return hidden_states, codes.transpose(0, 1)  # BT x quantizers
 
