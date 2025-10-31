@@ -1307,7 +1307,8 @@ class GPUModelRunner(
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
-            req_state.custom_inputs = req_data.new_custom_inputs[i]
+            if req_data.new_custom_inputs:
+                req_state.custom_inputs = req_data.new_custom_inputs[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
             if req_state.prev_num_draft_len and self.use_async_scheduling:
