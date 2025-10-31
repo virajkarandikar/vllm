@@ -47,10 +47,18 @@ def main():
     # create weights for the embedding layers that convert subword ids to char ids
     vocab_size = model.embed_tokens.weight.shape[0]
     max_char_len = max(len(char_ids) for char_ids in subword_id_to_char_ids.values())
+    hidden_size = cfg.model.tts_config.backbone_config.hidden_size
 
     # load checkpoint
     weights = torch.load(args.ckpt)["state_dict"]
 
+    # duplicate weights for rvq embeddings and embed code
+    rvq_embs_weight = weights["tts_model.rvq_embs"].clone()  # 31 x codebook_size x latent_size
+    rvq_embs_weight_pad = torch.nn.functional.pad(rvq_embs_weight, [0, 0, 0, 1])  # 31 x (codebook_size + 1) x latent_size
+    embed_code_weight = weights["tts_model.embed_code.weight"].clone()  # latent_size x hidden_size
+
+    # ======================
+    # embedding module weights
     bos_emb = weights["tts_model.bos_emb"]
     embed_subwords_weight = torch.zeros(
         (vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device
@@ -84,29 +92,33 @@ def main():
     embedding_module_weights["embed_subword.embed_subwords_mask.weight"] = (
         embed_subwords_mask_weight
     )
+    for i in range(rvq_embs_weight_pad.shape[0]):
+        embedding_module_weights[f"rvq_embs.{i}.weight"] = rvq_embs_weight_pad[i]
+    embedding_module_weights["embed_code.weight"] = embed_code_weight
     embedding_module_weights = {
         f"total_emb.{k}": v for k, v in embedding_module_weights.items()
     }
 
-    # drop unused weights
-    unused_keys = ["bos_emb", "null_emb", "embed_subword", "embed_context"]
-    unused_keys = [f"tts_model.{k}" for k in unused_keys]
-    weights = {
-        k: v
-        for k, v in weights.items()
-        if all(not k.startswith(uk) for uk in unused_keys)
-    }
-    # filter weights for vLLM model
-    weights = {
-        k.replace("tts_model.", ""): v for k, v in weights.items() if "tts_model." in k
-    }
-    # create minimal dummy weights for embedding layer inside gemma3 backbone
-    # it is not getting used so size and type do not matter
-    hidden_size = cfg.model.tts_config.backbone_config.hidden_size
-    weights["backbone.embed_tokens.weight"] = torch.randn(1, hidden_size).to(
-        torch.float16
-    )
-    weights.update(embedding_module_weights)
+    # ======================
+    # gemma backbone weights
+    backbone_module_weights = {k[len("tts_model."):]: v for k, v in weights.items() if k.startswith("tts_model.backbone.")}
+    backbone_module_weights["backbone.embed_tokens.weight"] = torch.randn(1, hidden_size, dtype=bos_emb.dtype, device=bos_emb.device)
+
+
+    # combine embedding module and backbone module weights
+    combined_module_weights = {**embedding_module_weights, **backbone_module_weights}
+    combined_module_weights = {"emb_and_backbone." + k: v for k, v in combined_module_weights.items()}
+
+
+    # ======================
+    # extract from weights rest of weights that are needed
+    used_keys = ["rvq_embs", "embed_code", "mog_head"]
+    remaining_weights = {k[len("tts_model."):]: v for k, v in weights.items() if any(k.startswith(f"tts_model.{key}") for key in used_keys)}
+
+
+    # ======================
+    # compose final weights
+    weights = {**combined_module_weights, **remaining_weights}
 
     # save weights
     safetensors_path = os.path.join(args.outdir, "model.safetensors")
