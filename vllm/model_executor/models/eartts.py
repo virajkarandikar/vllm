@@ -416,56 +416,10 @@ class MoGHead(nn.Module):
         return mu * torch.exp(logs) + mu_res, logs
 
 
-@support_torch_compile
-class EarTTSEmbeddingAndBackbone(nn.Module):
-    """
-    Wrapper module that combines the embedding preparation and backbone transformer.
-    This is separated from EarTTSForCausalLM to allow compilation of the transformer
-    parts while keeping the iterative generation step (_generate_step) uncompiled.
-    
-    Note: rvq_embs and embed_code are shared with parent EarTTSForCausalLM.
-    """
-    def __init__(
-        self, 
-        *, 
-        vllm_config: VllmConfig, 
-        prefix: str = "",
-    ):
+class MaskGITSampler(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.total_emb = EarTTSInputEmbedding(vllm_config.model_config.hf_config)
-        self.backbone = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
-    
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors],
-        acoustic_tokens: torch.Tensor,
-        context_text_tokens: torch.Tensor,
-        text_tokens: torch.Tensor,
-        text_mask: torch.Tensor,
-        bos_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Forward pass through embeddings and backbone transformer.
-        Returns hidden states to be used by the generation step.
-        """
-        total_emb = self.total_emb(
-            acoustic_tokens=acoustic_tokens,
-            context_text_tokens=context_text_tokens,
-            text_tokens=text_tokens,
-            text_mask=text_mask,
-            bos_mask=bos_mask,
-        )
-        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, inputs_embeds=total_emb)
-        return hidden_states
-
-
-class EarTTSForCausalLM(nn.Module):
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        self.config = vllm_config.model_config.hf_config
-        
+        self.config = config
         # easy access of cruicial config params
         self.num_quantizers = self.config.num_quantizers
         self.codebook_size = self.config.codebook_size
@@ -486,20 +440,15 @@ class EarTTSForCausalLM(nn.Module):
         first_nonzero = np.argmax(sampling_per_step_flat != 0)
         self.num_to_sample = sampling_per_step_flat[first_nonzero:].tolist()
 
-        # create layers used for embedding and generation
-        # These are shared between the compiled wrapper and uncompiled _generate_step
-        self.rvq_embs = nn.Parameter(torch.empty(self.config.num_quantizers, self.config.codebook_size, self.config.latent_size))
-        self.padding_idx = self.codebook_size
+        # create layers used for acoustic tokens embedding
+        self.rvq_embs = nn.Parameter(torch.empty(
+            self.config.num_quantizers,
+            self.config.codebook_size,
+            self.config.latent_size
+        ))
         self.embed_code = nn.Linear(
             self.config.latent_size, self.config.hidden_size, bias=False
         )
-        
-        # Create the compiled wrapper for embeddings and backbone
-        self.emb_and_backbone = EarTTSEmbeddingAndBackbone(
-            vllm_config=vllm_config,
-            prefix=prefix,
-        )
-        
         # MoG head for generation (uncompiled part)
         self.mog_head = MoGHead(
             hidden_size=self.config.hidden_size,
@@ -512,58 +461,6 @@ class EarTTSForCausalLM(nn.Module):
             min_log_std=self.config.mog_min_log_std,
             eps=self.config.mog_eps,
         )
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        # this is for compatability, it is not supposed to be used
-        return self.emb_and_backbone.backbone.get_input_embeddings(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        # input used to prepare hidden states for backbone
-        acoustic_tokens: Optional[torch.Tensor] = None,
-        context_text_tokens: Optional[torch.Tensor] = None,
-        text_tokens: Optional[torch.Tensor] = None,
-        # text tokens are not used for prompt
-        text_mask: Optional[torch.Tensor] = None,
-        # bos is applied only to the first frame of audio embedding in prefill 
-        bos_mask: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        """
-        input_ids, positions, intermediate_tensors, inputs_embeds - not used,
-        they are here for compatability with the way vllm model executed.
-        """
-        # Run the compiled embedding + backbone path
-        hidden_states = self.emb_and_backbone(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            acoustic_tokens=acoustic_tokens,
-            context_text_tokens=context_text_tokens,
-            text_tokens=text_tokens,
-            text_mask=text_mask,
-            bos_mask=bos_mask,
-        )
-        # Run the uncompiled generation step
-        codes = self._generate_step(hidden_states)  # quantizers x BT
-        return hidden_states, codes.transpose(0, 1)  # BT x quantizers
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        return hidden_states
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # TODO: skip prefixes for embeddings, we dont use them
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
-        return loader.load_weights(weights)
 
     def _depthsum_embedding(self, code: torch.Tensor) -> torch.Tensor:
         """
@@ -622,8 +519,8 @@ class EarTTSForCausalLM(nn.Module):
             code[i] = idx_sel
 
         return code
-
-    def _generate_step(
+    
+    def forward(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
@@ -636,7 +533,7 @@ class EarTTSForCausalLM(nn.Module):
             hidden_states: Tensor (BT x hidden_size) - The hidden states from the backbone
 
         Returns:
-            Tensor (num_quantizers x BT) - The generated codes
+            Tensor (BT x num_quantizers) - The generated codes
         """
 
         device = hidden_states.device
@@ -667,4 +564,107 @@ class EarTTSForCausalLM(nn.Module):
             )
             code = self._depthsum_encoding_step_reshaped(z, code, cnt, k)
             cnt += k
-        return code
+        return code.transpose(0, 1)  # BT x num_quantizers
+
+
+@support_torch_compile
+class EarTTSModel(nn.Module):
+    """
+    Wrapper module that combines the embedding preparation, backbone transformer and sampler.
+    All components supports torch compile.
+    """
+    def __init__(
+        self, 
+        *, 
+        vllm_config: VllmConfig, 
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.total_emb = EarTTSInputEmbedding(vllm_config.model_config.hf_config)
+        self.backbone = Gemma3Model(vllm_config=vllm_config, prefix=prefix)
+        self.sampler = MaskGITSampler(vllm_config.model_config.hf_config)
+    
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors],
+        acoustic_tokens: torch.Tensor,
+        context_text_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_mask: torch.Tensor,
+        bos_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass through embeddings and backbone transformer.
+        Returns hidden states to be used by the generation step.
+        """
+        total_emb = self.total_emb(
+            acoustic_tokens=acoustic_tokens,
+            context_text_tokens=context_text_tokens,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            bos_mask=bos_mask,
+        )
+        hidden_states = self.backbone(input_ids, positions, intermediate_tensors, inputs_embeds=total_emb)
+        codes = self.sampler(hidden_states)
+        return hidden_states, codes
+
+
+class EarTTSForCausalLM(nn.Module):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()        
+        self.config = vllm_config.model_config.hf_config
+        self.model = EarTTSModel(
+            vllm_config=vllm_config,
+            prefix=prefix,
+        )
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # this is for compatability, it is not supposed to be used
+        return self.model.backbone.get_input_embeddings(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        # input used to prepare hidden states for backbone
+        acoustic_tokens: Optional[torch.Tensor] = None,
+        context_text_tokens: Optional[torch.Tensor] = None,
+        text_tokens: Optional[torch.Tensor] = None,
+        # text tokens are not used for prompt
+        text_mask: Optional[torch.Tensor] = None,
+        # bos is applied only to the first frame of audio embedding in prefill 
+        bos_mask: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        """
+        input_ids, positions, intermediate_tensors, inputs_embeds - not used,
+        they are here for compatability with the way vllm model executed.
+        """
+        hidden_states, codes = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            acoustic_tokens=acoustic_tokens,
+            context_text_tokens=context_text_tokens,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            bos_mask=bos_mask,
+        )
+        return hidden_states, codes
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # TODO: skip prefixes for embeddings, we dont use them
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+        )
+        return loader.load_weights(weights)
