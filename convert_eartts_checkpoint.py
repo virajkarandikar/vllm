@@ -104,21 +104,15 @@ def main():
     backbone_module_weights = {k[len("tts_model."):]: v for k, v in weights.items() if k.startswith("tts_model.backbone.")}
     backbone_module_weights["backbone.embed_tokens.weight"] = torch.randn(1, hidden_size, dtype=bos_emb.dtype, device=bos_emb.device)
 
+    # ======================
+    # sampler weights
+    used_keys = ["rvq_embs", "embed_code", "mog_head"]
+    sampler_weights = {k[len("tts_model."):]: v for k, v in weights.items() if any(k.startswith(f"tts_model.{key}") for key in used_keys)}
+    sampler_weights = {"sampler." + k: v for k, v in sampler_weights.items()}
 
     # combine embedding module and backbone module weights
-    combined_module_weights = {**embedding_module_weights, **backbone_module_weights}
-    combined_module_weights = {"emb_and_backbone." + k: v for k, v in combined_module_weights.items()}
-
-
-    # ======================
-    # extract from weights rest of weights that are needed
-    used_keys = ["rvq_embs", "embed_code", "mog_head"]
-    remaining_weights = {k[len("tts_model."):]: v for k, v in weights.items() if any(k.startswith(f"tts_model.{key}") for key in used_keys)}
-
-
-    # ======================
-    # compose final weights
-    weights = {**combined_module_weights, **remaining_weights}
+    weights = {**embedding_module_weights, **backbone_module_weights, **sampler_weights}
+    weights = {"model." + k: v for k, v in weights.items()}
 
     # save weights
     safetensors_path = os.path.join(args.outdir, "model.safetensors")
