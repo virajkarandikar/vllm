@@ -9,7 +9,9 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    compute_causal_conv1d_metadata,
 )
+from typing import Optional
 
 logger = init_logger(__name__)
 
@@ -46,6 +48,11 @@ class FastConformerMetadata:
     query_start_loc: torch.Tensor # [num_seqs+1]
     slot_mapping: torch.Tensor # [num_seqs]
     block_table_tensor: torch.Tensor # [num_seqs, num_blocks]
+    
+    # these attributes are for triton implementation of causal_conv1d
+    nums_dict: Optional[dict] = None
+    batch_ptr: Optional[torch.Tensor] = None
+    token_chunk_offset_ptr: Optional[torch.Tensor] = None
 
 
 class FastConformerMetadataBuilder(AttentionMetadataBuilder):
@@ -60,11 +67,17 @@ class FastConformerMetadataBuilder(AttentionMetadataBuilder):
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FastConformerMetadata:
-        # NOTE: this is redundant for now, but will have useful information
-        # when we add the conv caches
+        # for causal_conv1d
+        nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+            common_attn_metadata.query_start_loc
+        )
+
         return FastConformerMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table_tensor=common_attn_metadata.block_table_tensor,
+            nums_dict=nums_dict,
+            batch_ptr=batch_ptr,
+            token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
