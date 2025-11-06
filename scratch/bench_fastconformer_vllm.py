@@ -16,6 +16,7 @@ async def main():
     parser.add_argument("--steps", type=int, default=100, help="Number of decode steps")
     parser.add_argument("--warmup_steps", type=int, default=10,
                         help="Number of warmup decode steps (not measured)")
+    parser.add_argument("--profile", action="store_true", help="Enable PyTorch Profiler")
     args = parser.parse_args()
 
     # not used. asynchronous engine only supports batch size 1
@@ -41,11 +42,15 @@ async def main():
     )
     engine = AsyncLLM.from_engine_args(engine_args)
 
+    if args.profile:
+        await engine.start_profile()
+
     req_id = "latency-bench"
     latency_measurements: list[float] = []
 
     torch.manual_seed(0)
     D_IN = engine.model_config.get_hidden_size()
+    print(f"D_IN: {D_IN}")
     seq_inputs = torch.randn(1, TOTAL_STEPS, D_IN)
     # shape: [1, TOTAL_STEPS, D_IN]
     first_packet = seq_inputs[:, :1, :].contiguous()
@@ -88,6 +93,9 @@ async def main():
         except StopAsyncIteration as e:
             print(f"StopAsyncIteration: {e}")
             break
+
+    if args.profile:
+        await engine.stop_profile()
 
     if latency_measurements:
         import numpy as np

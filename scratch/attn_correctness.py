@@ -70,6 +70,14 @@ def use_tmp_bundle_dir(bundle_dir, tmp_dir):
 
 
 async def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--eager", action="store_true")
+    args = parser.parse_args()
+
+    eager = args.eager
+    print(f"eager: {eager}")
+
     print("syncing cuda...")
     torch.cuda.synchronize()
     print("cuda synced")
@@ -83,10 +91,11 @@ async def main():
             gpu_memory_utilization=0.85,
             block_size=128,
             enable_prompt_embeds=True,
-            enforce_eager=True,
+            enforce_eager=eager,
             return_hidden_states=True,
             skip_tokenizer_init=True,
-            dtype=_get_dtype_str(DTYPE)
+            dtype=_get_dtype_str(DTYPE),
+            compilation_config={"level": 1}
         )
         engine = AsyncLLM.from_engine_args(engine_args)
 
