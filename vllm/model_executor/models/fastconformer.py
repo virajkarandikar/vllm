@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import math
 
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
+from vllm.config import VllmConfig, CacheConfig, SchedulerConfig, get_current_vllm_config
 from vllm.attention.layer import Attention
 from vllm.sequence import IntermediateTensors
 from vllm.compilation.decorators import support_torch_compile
@@ -204,14 +204,15 @@ class _TransformedShawBias:
 
 class RelPosSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, window: int,
-                 cache_config: CacheConfig, prefix: str):
+                 cache_config: CacheConfig, scheduler_config: SchedulerConfig, prefix: str):
         super().__init__()
         assert d_model % num_heads == 0
         self.h = num_heads
         self.dh = d_model // num_heads
         self.window = int(window)
         self.prefix = prefix
-
+        self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -262,10 +263,8 @@ class RelPosSelfAttention(nn.Module):
         self._qkv_fused_ready: bool = False
 
     def _fused_qkv_projection(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self._qkv_fused_ready:
-            qkv = F.linear(x, self.qkv_weight, self.qkv_bias)  # [B, T, 3D]
-        else:
-            raise Exception("this should not happen")
+        assert self._qkv_fused_ready
+        qkv = F.linear(x, self.qkv_weight, self.qkv_bias)  # [B, T, 3D]
         D = x.size(-1)
         q, k, v = qkv.split(D, dim=-1)
         return q, k, v
@@ -420,38 +419,24 @@ class RelPosSelfAttention(nn.Module):
 
         q_lin, k_lin, v_lin = self._fused_qkv_projection(x)
 
-        if x.ndim == 3:
-            B, T, D = x.shape
-            assert D == D_model
-            N_tokens = B * T
-            q = q_lin.view(B, T, H, Dh).transpose(1, 2).reshape(N_tokens, H, Dh)
-            k = k_lin.view(B, T, H, Dh).transpose(1, 2).reshape(N_tokens, H, Dh)
-            v = v_lin.view(B, T, H, Dh).transpose(1, 2).reshape(N_tokens, H, Dh)
-            reshape_kind = "bt"
-            reshape_info = (B, T)
-        elif x.ndim == 2:
-            N_tokens, D = x.shape
-            assert D == D_model
-            q = q_lin.view(N_tokens, H, Dh)
-            k = k_lin.view(N_tokens, H, Dh)
-            v = v_lin.view(N_tokens, H, Dh)
-            reshape_kind = "packed"
-            reshape_info = None
-        else:
-            raise ValueError("x must be of shape [B, T, D] or [N, D].")
+        N_tokens, D = x.shape
+        assert D == D_model
+        q = q_lin.view(N_tokens, H, Dh)
+        k = k_lin.view(N_tokens, H, Dh)
+        v = v_lin.view(N_tokens, H, Dh)
 
         # u/v position biases
         q_u = q + self.pos_bias_u.unsqueeze(0)  # [N, H, Dh]
         q_v = q + self.pos_bias_v.unsqueeze(0)  # [N, H, Dh]
 
+        out_buf = torch.zeros_like(q_u)          # [N_tokens, H, Dh]
+
         fctx = get_forward_context()
         attn_meta_all = fctx.attn_metadata
         if not isinstance(attn_meta_all, dict):
-            # fallback path during dummy run
-            if x.ndim == 2:
-                x_bt = x.view(1, N_tokens, D_model)
-                return self._forward_ref(x_bt).view(N_tokens, D_model)
-            return self._forward_ref(x)
+            # during dummy runs / cudagraph capture
+            attn_output = out_buf.reshape(-1, D_model)
+            return self.o_proj(attn_output) 
 
         attn_meta: FlexAttentionMetadata = attn_meta_all[self.prefix]
         block_size = int(attn_meta.block_size)
@@ -542,15 +527,11 @@ class RelPosSelfAttention(nn.Module):
         )  # [N*H, 1, Dh]
         y = y.view(N_live, H, Dh)
 
-        out_buf = torch.zeros_like(q_u)          # [N_tokens, H, Dh]
         out_buf[:N_live] = y
-        if reshape_kind == "bt":
-            B, T = reshape_info
-            attn_output = out_buf.view(B, T, H, Dh).permute(0, 2, 1, 3).reshape(B, T, D_model)
-        else:
-            attn_output = out_buf.reshape(-1, D_model)
+        attn_output = out_buf.reshape(-1, D_model)
 
         return self.o_proj(attn_output)
+
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
@@ -742,6 +723,7 @@ class ConformerBlock(nn.Module):
         ff_mult: int,
         attn_window: int,
         cache_config: CacheConfig,
+        scheduler_config: SchedulerConfig,
         dtype: torch.dtype,
         prefix: str,
     ):
@@ -749,7 +731,7 @@ class ConformerBlock(nn.Module):
         self.ln_ff1 = nn.LayerNorm(d_model)
         self.ff1 = ConformerFFN(d_model, ff_mult)
         self.ln_attn = nn.LayerNorm(d_model)
-        self.attn = RelPosSelfAttention(d_model, n_heads, attn_window, cache_config, prefix=f"{prefix}.attn")
+        self.attn = RelPosSelfAttention(d_model, n_heads, attn_window, cache_config, scheduler_config, prefix=f"{prefix}.attn")
         self.ln_conv = nn.LayerNorm(d_model)
         self.conv = ConformerConvModule(d_model, k_conv, prefix=f"{prefix}.conv", cache_config=cache_config, dtype=dtype)
         self.ln_ff2 = nn.LayerNorm(d_model)
@@ -762,10 +744,9 @@ class ConformerBlock(nn.Module):
         y = self.ff1(y)
         x = x + y * self.fc_factor
 
-        # TODO: temporarily disabling attention layers
-        # y = self.ln_attn(x)
-        # y = self.attn(y)
-        # x = x + y
+        y = self.ln_attn(x)
+        y = self.attn(y)
+        x = x + y
 
         y = self.ln_conv(x)
         y = self.conv(y)
@@ -828,6 +809,7 @@ class FastConformerCTC(nn.Module):
                 ff_mult=config.ff_mult,
                 attn_window=att_window,
                 cache_config=vllm_config.cache_config,
+                scheduler_config=vllm_config.scheduler_config,
                 dtype=self.dtype,
                 prefix=f"{prefix}.blocks.{i}",
             )

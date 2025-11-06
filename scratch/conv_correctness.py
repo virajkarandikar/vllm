@@ -79,10 +79,11 @@ async def main():
             gpu_memory_utilization=0.85,
             block_size=128,
             enable_prompt_embeds=True,
-            enforce_eager=True,
+            enforce_eager=False,
             return_hidden_states=True,
             skip_tokenizer_init=True,
-            dtype=_get_dtype_str(DTYPE)
+            dtype=_get_dtype_str(DTYPE),
+            compilation_config={"level": 1}
         )
         engine = AsyncLLM.from_engine_args(engine_args)
 
