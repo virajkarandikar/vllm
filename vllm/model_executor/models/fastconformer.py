@@ -22,6 +22,7 @@ from vllm.v1.attention.backends.fastconformer_attn import (
 from vllm.forward_context import get_forward_context
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend, FlexAttentionMetadata
+from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -222,6 +223,8 @@ class RelPosSelfAttention(nn.Module):
         self.pos_bias_u = nn.Parameter(torch.zeros(self.h, self.dh))
         self.pos_bias_v = nn.Parameter(torch.zeros(self.h, self.dh))
 
+        # 1. config for flex-attention
+        # use in `_forward`, `_forward_sdpa_2`
         self.attn = Attention(
             num_heads=self.h,
             head_size=self.dh,
@@ -236,6 +239,23 @@ class RelPosSelfAttention(nn.Module):
             prefix=self.prefix,
             attn_backend=FlexAttentionBackend,
         )
+
+        # 2. config for flash-attention
+        # use in `_forward_flash_window` and produces incorrect logits
+        # self.attn = Attention(
+        #     num_heads=self.h,
+        #     head_size=self.dh,
+        #     scale=self.dh ** -0.5,
+        #     num_kv_heads=self.h,
+        #     cache_config=CacheConfig(
+        #         sliding_window=self.window,
+        #         cache_dtype="auto",
+        #         block_size=cache_config.block_size,
+        #         calculate_kv_scales=False,
+        #     ),
+        #     prefix=self.prefix,
+        #     attn_backend=FlashAttentionBackend,
+        # )
 
         self._k_scale = torch.tensor(1.0, dtype=torch.float32)
         self._v_scale = torch.tensor(1.0, dtype=torch.float32)
@@ -388,7 +408,28 @@ class RelPosSelfAttention(nn.Module):
         attn_meta._installed_exact_mask = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # NOTE: this is the current state of the possible attention implementations we have for fastconformer.
+        # feel free to delete this comment and unused implementations once we decide on the preferred implementation.
+        # 1. `_forward_sdpa`: use sdpa attention with no kv-cache
+        # - produces incorrect logits, used for benchmarking purposes
+        # 2. `_forward_sdpa_2`: use sdpa attention with custom windowed kv-cache
+        # - produces correct prefill and decode logits but does not work with torch.dynamo
+        # - this is an ideal case that we would like to use once getting torch.dynamo with cudagraph
+        # capture working, for both performance and correctness reasons.
+        # - see here: https://github.com/vklimkov-nvidia/vllm/commit/01d48fc3546043bffd9009bf4367e0f6fced5e95
+        # 3. `_forward_flash_window`: use flash attention with windowed kv-cache
+        # - produces incorrect logits, used for benchmarking purposes
+        # - **important**: only supports bf16/fp16, not float32. other attn implementations support float32.
+        # 4. `_forward_ref`: a reference implementation to help with debugging of flex-attention
+        # - produces correct prefill logits and incorrect decode logits
+        # 5. `_forward`: full flex-attention implementation
+        # - produces correct prefill and decode logits but the kernel itself is slow compared to the other implementations.
         return self._forward_sdpa_2(x)
+
+    def _forward_flash_window(self, x: torch.Tensor) -> torch.Tensor:
+        q, k, v = self._fused_qkv_projection(x)
+        attn_output = self.attn(q, k, v)
+        return self.o_proj(attn_output)
 
     def _forward_sdpa(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
