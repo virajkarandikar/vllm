@@ -282,6 +282,14 @@ class RelPosSelfAttention(nn.Module):
         )
         self._qkv_fused_ready: bool = False
 
+        # populate rel_cache
+        devices = [torch.device("cuda")]
+        dtypes = [torch.float32]
+        for device in devices:
+            for dtype in dtypes:
+                self._get_rel_proj(device, dtype, self.window)
+
+
     def _fused_qkv_projection(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         assert self._qkv_fused_ready
         qkv = F.linear(x, self.qkv_weight, self.qkv_bias)  # [B, T, 3D]
@@ -539,17 +547,24 @@ class RelPosSelfAttention(nn.Module):
 
         ks = key_cache[kv_block, kv_off]
         vs = value_cache[kv_block, kv_off]
-        if not valid.all():
-            mask4 = valid.unsqueeze(2).unsqueeze(3)
-            ks = torch.where(mask4, ks, torch.zeros(1, dtype=ks.dtype, device=ks.device)).contiguous()
-            vs = torch.where(mask4, vs, torch.zeros(1, dtype=vs.dtype, device=vs.device)).contiguous()
+        # if not valid.all():
+        #     mask4 = valid.unsqueeze(2).unsqueeze(3)
+        #     ks = torch.where(mask4, ks, torch.zeros(1, dtype=ks.dtype, device=ks.device)).contiguous()
+        #     vs = torch.where(mask4, vs, torch.zeros(1, dtype=vs.dtype, device=vs.device)).contiguous()
+
+        mask4 = valid.unsqueeze(2).unsqueeze(3)
+        ks = ks * mask4.to(ks.dtype)
+        vs = vs * mask4.to(vs.dtype)
 
         rel = self._get_rel_proj(device, idtype, W)                              # [H, Dh, 2W+1]
         band = torch.einsum("n h d, h d m -> n h m", q_v[:N_live], rel) * (Dh ** -0.5)  # [N, H, 2W+1]
         band_idx = (W + (L.unsqueeze(1) - 1) - relpos).clamp(0, 2 * W)           # [N, K_cap]
         bias_g = band.gather(2, band_idx.unsqueeze(1).expand(-1, H, -1))
-        neg_inf = torch.tensor(float("-inf"), dtype=idtype, device=device)
-        bias_g = torch.where(valid.unsqueeze(1), bias_g, neg_inf)
+        # neg_inf = torch.tensor(float("-inf"), dtype=idtype, device=device)
+        # bias_g = torch.where(valid.unsqueeze(1), bias_g, neg_inf)
+
+        mask = ~valid.unsqueeze(1)
+        bias_g = bias_g.masked_fill(mask, float("-inf"))
 
         attn_bias_sdpa = bias_g.reshape(N_live * H, 1, K_cap).contiguous()
 
