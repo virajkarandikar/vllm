@@ -73,7 +73,7 @@ from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
 )
-from vllm.model_executor.models.fastconformer import FastConformerConvCache
+from vllm.model_executor.models.fastconformer import ConformerConvModule
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -7648,7 +7648,7 @@ class GPUModelRunner(
                 kv_cache_spec[layer_name] = spec
 
         fastconformer_conv_layers = get_layers_from_vllm_config(
-            self.vllm_config, FastConformerConvCache
+            self.vllm_config, ConformerConvModule
         )
         for layer_name, fastconformer_conv_module in fastconformer_conv_layers.items():
             kv_cache_spec[layer_name] = fastconformer_conv_module.get_kv_cache_spec()

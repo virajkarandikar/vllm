@@ -6,9 +6,6 @@ import time
 from contextlib import contextmanager
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -83,8 +80,7 @@ async def main():
             return_hidden_states=True,
             skip_tokenizer_init=True,
             dtype=_get_dtype_str(DTYPE),
-            compilation_config={"level": 0, "cudagraph_mode": "FULL"}
-            # compilation_config={"level": 2}
+            compilation_config={"cudagraph_mode": "FULL"}
         )
         engine = AsyncLLM.from_engine_args(engine_args)
 
