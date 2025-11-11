@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable
 from typing import Optional
+import weakref
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ import math
 
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.config import VllmConfig, CacheConfig, SchedulerConfig, get_current_vllm_config
+from vllm.model_executor.custom_op import CustomOp
 from vllm.attention.layer import Attention
 from vllm.sequence import IntermediateTensors
 from vllm.compilation.decorators import support_torch_compile
@@ -29,45 +31,14 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
 )
-
+from vllm.utils import direct_register_custom_op
 from vllm.transformers_utils.configs.fastconformer import FastConformerCTCConfig
 import math
 
-try:
-    from torch.nn.functional import scaled_dot_product_attention as torch_sdpa
-    # torch_sdpa = torch.compile(torch_sdpa, fullgraph=True)
-except ImportError:
-    torch_sdpa = None
 
-def _is_dummy_run() -> bool:
-    attn_metadata = get_forward_context().attn_metadata
-    return attn_metadata is None
-
-
-def _check(save_pth: str, x: torch.Tensor):
-    if _is_dummy_run():
-        return
-    print(f"[vllm_debug] checking {save_pth}...")
-    ref_t = torch.load(save_pth)
-    ref_t = ref_t[:,:,:]
-    print(f"[vllm_debug] x.shape {x.shape} ref_t.shape {ref_t.shape} x.dtype {x.dtype} ref_t.dtype {ref_t.dtype}")
-    a = x.detach().float().cpu()
-    b = ref_t.detach().float().cpu()
-    diff = (a-b).abs()
-    rel = diff / (b.abs() + 1e-6)
-    print(f"[vllm_debug] shape={tuple(a.shape)} | mean abs diff={diff.mean():.6f} | max abs diff={diff.max():.6f} | mean rel diff={rel.mean():.6f}")
-
-def _dbg_save(save_pth: str, x: torch.Tensor):
-    if _is_dummy_run():
-        return
-    print(f"[vllm_debug] saving {save_pth}...")
-    torch.save(x, save_pth)
-    print(f"[vllm_debug] saved {save_pth}")
-
-# TODO: This module needs to be cleaned up. It is designed to replicate the NeMo subsampler
-# in a lighter weight manner, but it is currently unclear which configuration of the subsampler
-# is appropriate for inference (i.e. which matches the training configuration). For the time being,
-# the main FastConformerCTC modelling class imports the NeMo subsampler and uses it directly.
+# TODO: This module is incomplete. It was originally designed to replicate the NeMo subsampler
+# but we've temporarily decided to run the subsampler outside of vLLM to avoid needing to implement
+# custom BT-dim input support, among other issues, e.g. https://nvidia.slack.com/archives/C09F9RY43R6/p1762350015386069
 class NemoSubsample8x2D(nn.Module):
     def __init__(self, d_out: int, mid_ch: int, mels: int):
         super().__init__()
@@ -126,84 +97,6 @@ class ConformerFFN(nn.Module):
         x = self.linear2(x)
         return x
 
-class FastConformerConvCache(torch.nn.Module, AttentionLayerBase):
-    def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig, dtype: torch.dtype):
-        super().__init__()
-        self.d_model = int(d_model)
-        self.k = int(k)
-        self.left_ctx = self.k - 1  # L
-
-        # The conv cache page size must match the attn page size by vLLM requirements.
-        # TODO: is there a less hacky way to do this?
-        self.left_shape = self.left_ctx * 32
-
-        self.prefix = prefix
-        self.cache_config = cache_config
-        self.kv_cache = [torch.tensor([])]
-        self.dtype = dtype
-
-        compilation = get_current_vllm_config().compilation_config
-        if prefix in compilation.static_forward_context:
-            raise ValueError(f"duplicate layer name: {prefix}")
-        compilation.static_forward_context[prefix] = self
-
-    def get_kv_cache_spec(self) -> KVCacheSpec:
-        return FastConformerConvSpec(
-            block_size=self.cache_config.block_size,
-            shape=(self.left_shape, self.d_model),
-            dtype=self.dtype,
-        )
-
-    def forward(self):
-        pass
-
-    def get_attn_backend(self) -> AttentionBackend:
-        return FastConformerBackend
-
-class _TransformedShawBias:
-    def __init__(self, W: int):
-        self.W = int(W)
-        self.band_bias = None           # [B,H,T,2W+1]
-        self.doc_ids = None             # [num_q]
-        self.decode_offset = None       # [num_reqs]
-        self.physical_to_logical = None # [num_reqs, total_blocks]
-        self.block_size = None          # int
-
-    def bind(self, attn_meta, band_bias: torch.Tensor):
-        self.band_bias = band_bias
-        self.doc_ids = attn_meta.doc_ids
-        self.decode_offset = attn_meta.decode_offset
-        self.physical_to_logical = attn_meta.physical_to_logical
-        self.block_size = int(attn_meta.block_size)
-
-    # @torch.jit.script_if_tracing
-    def __call__(
-        self,
-        score: torch.Tensor,
-        b: torch.Tensor,
-        h: torch.Tensor,
-        q_idx: torch.Tensor,
-        physical_kv_idx: torch.Tensor,
-    ) -> torch.Tensor:
-        # block_sz = self.block_size
-        # physical_kv_block = torch.div(physical_kv_idx, block_sz, rounding_mode='floor')
-        # physical_kv_offset = physical_kv_idx % block_sz
-
-        # doc = self.doc_ids[q_idx.long()]
-        # logical_block_idx = self.physical_to_logical[doc.long(), physical_kv_block.long()]
-        # logical_kv_idx = logical_block_idx * block_sz + physical_kv_offset
-
-        # live_block = logical_block_idx >= 0
-        # within_lower = logical_kv_idx >= 0
-        # is_valid = live_block & within_lower
-
-        # logical_q_idx = q_idx + self.decode_offset[doc.long()]
-        # rel = torch.clamp(logical_q_idx - logical_kv_idx, -self.W, self.W) + self.W
-        # local_q = logical_q_idx - self.decode_offset[doc.long()]
-
-        # bias = self.band_bias[doc.long(), h.long(), local_q.long(), rel.long()]
-        # return torch.where(is_valid, score + bias, score)
-        return score
 
 class RelPosSelfAttention(nn.Module):
     def __init__(self, d_model: int, num_heads: int, window: int,
@@ -226,6 +119,7 @@ class RelPosSelfAttention(nn.Module):
         self.pos_bias_v = nn.Parameter(torch.zeros(self.h, self.dh))
 
         # 1. config for FastConformerRPEBackend
+        # used in `_forward_sdpa_2`
         self.attn = Attention(
             num_heads=self.h,
             head_size=self.dh,
@@ -245,7 +139,7 @@ class RelPosSelfAttention(nn.Module):
         )
 
         # 2. config for flash-attention
-        # use in `_forward_flash_window` and produces incorrect logits
+        # used in `_forward_flash_window`
         # self.attn = Attention(
         #     num_heads=self.h,
         #     head_size=self.dh,
@@ -270,11 +164,6 @@ class RelPosSelfAttention(nn.Module):
             raise Exception(
                 f"attn cache block size must be 128, got {cache_config.block_size}"
             )
-
-        self._rel_cache: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
-
-        self._shaw_mod = _TransformedShawBias(self.window)
-        self._blockmask_cache: dict[tuple[int, int, int, int, int], object] = {}
 
         self.register_buffer(
             "qkv_weight",
@@ -348,87 +237,18 @@ class RelPosSelfAttention(nn.Module):
         ctx = torch.matmul(probs, v).transpose(1, 2).contiguous().view(B, T, D)
         return self.o_proj(ctx)
 
-    def _get_rel_proj(self, device: torch.device, dtype: torch.dtype, W: int) -> torch.Tensor:
-        key = (device, dtype, W)
-        cached = self._rel_cache.get(key)
-        if cached is not None:
-            return cached
-
-        H, Dh = self.h, self.dh
-        D = H * Dh
-
-        deltas = torch.arange(-W, W + 1, device=device)[:, None].to(torch.float32)
-        div = torch.exp(torch.arange(0, D, 2, device=device, dtype=torch.float32)
-                        * (-math.log(10000.0) / D))
-        sin = torch.sin(deltas * div)
-        cos = torch.cos(deltas * div)
-        rel = torch.zeros((2 * W + 1, D), device=device, dtype=torch.float32)
-        rel[:, 0::2] = sin
-        rel[:, 1::2] = cos
-
-        rel = self.linear_pos(rel.to(dtype))              # [2W+1, D]
-        rel = rel.view(2 * W + 1, H, Dh).permute(1, 2, 0).contiguous()  # [H, Dh, 2W+1]
-        self._rel_cache[key] = rel
-        return rel
-
-    def _build_shaw_band_bias(self, q: torch.Tensor, W: int) -> torch.Tensor:
-        B, H, T, Dh = q.shape
-        device, dtype = q.device, q.dtype
-        rel = self._get_rel_proj(device, dtype, W)  # [H, Dh, 2W+1]
-
-        q_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)   # [B,H,T,Dh]
-        band_bias = torch.einsum("bhtd,hdm->bhtm", q_v, rel)  # [B,H,T,2W+1]
-        band_bias = band_bias * (Dh ** -0.5)
-        return band_bias
-
-    def _mask_cache_key(self, meta) -> tuple[int, int, int, int]:
-        return (int(meta.block_table.data_ptr()),
-                int(meta.q_block_size),
-                int(meta.kv_block_size),
-                int(self.window))
-
-    def _install_exact_mask_cached(self, attn_meta):
-        if getattr(attn_meta, "_installed_exact_mask", False):
-            return
-
-        W = int(self.window)
-        def logical_mask_mod(b: torch.Tensor,
-                             h: torch.Tensor,
-                             q_idx: torch.Tensor,
-                             kv_idx: torch.Tensor) -> torch.Tensor:
-            return (kv_idx <= q_idx) & ((q_idx - kv_idx) <= W)
-
-        attn_meta.sliding_window = None
-        attn_meta.logical_mask_mod = logical_mask_mod
-        attn_meta.direct_build = True
-
-        key = self._mask_cache_key(attn_meta)
-        bm = self._blockmask_cache.get(key)
-        print(f"[vllm_debug] id(bm): {id(bm)}")
-        if bm is None:
-            attn_meta.mask_mod = attn_meta.get_mask_mod()
-            bm = attn_meta.build_block_mask()
-            self._blockmask_cache[key] = bm
-        attn_meta.block_mask = bm
-        attn_meta._installed_exact_mask = True
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # NOTE: this is the current state of the possible attention implementations we have for fastconformer.
         # feel free to delete this comment and unused implementations once we decide on the preferred implementation.
         # 1. `_forward_sdpa`: use sdpa attention with no kv-cache
         # - produces incorrect logits, used for benchmarking purposes
         # 2. `_forward_sdpa_2`: use sdpa attention with custom windowed kv-cache
-        # - produces correct prefill and decode logits but does not work with torch.dynamo
-        # - this is an ideal case that we would like to use once getting torch.dynamo with cudagraph
-        # capture working, for both performance and correctness reasons.
-        # - see here: https://github.com/vklimkov-nvidia/vllm/commit/01d48fc3546043bffd9009bf4367e0f6fced5e95
+        # - produces correct logits and marginally slower than flash-attention implementation
         # 3. `_forward_flash_window`: use flash attention with windowed kv-cache
-        # - produces incorrect logits, used for benchmarking purposes
+        # - produces incorrect logits used for benchmarking purposes
         # - **important**: only supports bf16/fp16, not float32. other attn implementations support float32.
-        # 4. `_forward_ref`: a reference implementation to help with debugging of flex-attention
-        # - produces correct prefill logits and incorrect decode logits
-        # 5. `_forward`: full flex-attention implementation
-        # - produces correct prefill and decode logits but the kernel itself is slow compared to the other implementations.
+        # 4. `_forward_ref`: a reference implementation to help with debugging
+        # - produces correct prefill logits but incorrect decode logits
         return self._forward_sdpa_2(x)
 
     def _forward_flash_window(self, x: torch.Tensor) -> torch.Tensor:
@@ -461,54 +281,8 @@ class RelPosSelfAttention(nn.Module):
         attn_output = self.attn(q, k, v)
         return self.o_proj(attn_output)
 
-    def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        H, Dh = self.h, self.dh
-
-        q, k, v = self._fused_qkv_projection(x)
-        q = q.view(B, T, H, Dh).transpose(1, 2).contiguous()
-        k = k.view(B, T, H, Dh).transpose(1, 2).contiguous()
-        v = v.view(B, T, H, Dh).transpose(1, 2).contiguous()
-
-        q_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
-
-        W = int(self.window)
-        # band_bias = self._build_shaw_band_bias(q, W)  # [B,H,T,2W+1]
-
-        query = q_u.reshape(-1, H, Dh)
-        key   = k.reshape(-1, H, Dh)
-        value = v.reshape(-1, H, Dh)
-
-        fctx = get_forward_context()
-        attn_meta_all = fctx.attn_metadata
-        if not isinstance(attn_meta_all, dict):
-            return self._forward_ref(x)
-
-        attn_meta: FlexAttentionMetadata = attn_meta_all[self.prefix]
-
-        self._install_exact_mask_cached(attn_meta)
-
-        # self._shaw_mod.bind(attn_meta, band_bias)
-        if not getattr(attn_meta, "_installed_shaw_mod", False):
-            # attn_meta.transformed_score_mod = self._shaw_mod
-            attn_meta.transformed_score_mod = None
-            attn_meta._installed_shaw_mod = True
-
-        self_kv_cache = self.attn.kv_cache[fctx.virtual_engine]
-        out_buf = torch.empty_like(query)  # [num_tokens, H, Dh]
-        out = self.attn.impl.forward(
-            layer=self,
-            query=query,
-            key=key,
-            value=value,
-            kv_cache=self_kv_cache,
-            attn_metadata=attn_meta,
-            output=out_buf,
-        )
-        out = out.view(B, T, H, Dh).transpose(1, 2).contiguous().view(B, T, D)
-        return self.o_proj(out)
-
-class ConformerConvModule(nn.Module):
+@CustomOp.register("fastconformer_conv_module")
+class ConformerConvModule(CustomOp, AttentionLayerBase):
     def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig, dtype: torch.dtype):
         super().__init__()
         assert k % 2 == 1
@@ -520,21 +294,39 @@ class ConformerConvModule(nn.Module):
         self.activation = nn.SiLU()
         self.pw2 = nn.Conv1d(d_model, d_model, 1)
 
-        self.conv_cache = FastConformerConvCache(
-            d_model=d_model, k=k, prefix=f"{prefix}.conv_cache", cache_config=cache_config,
-            dtype=dtype,
-        )
         self.d_model = d_model
+        self.k = int(k)
+        self.left_ctx = self.k - 1  # L
 
-    def forward_ref(self, x: torch.Tensor) -> torch.Tensor:
-        is_2d = x.dim() == 2
+        # The conv cache page size must match the attn page size by vLLM requirements.
+        # TODO: is there a less hacky way to do this?
+        self.left_shape = self.left_ctx * 32
+
+        self.prefix = prefix
+        self.cache_config = cache_config
+        self.kv_cache = [torch.tensor([])]
+        self.dtype = dtype
+
+        compilation = get_current_vllm_config().compilation_config
+        if prefix in compilation.static_forward_context:
+            raise ValueError(f"duplicate layer name: {prefix}")
+        compilation.static_forward_context[prefix] = self
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.ops.vllm.fastconformer_conv_module(
+            hidden_states,
+            self.prefix,
+        )
+
+    def forward_native(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        is_2d = hidden_states.dim() == 2
         if is_2d:
-            x = x.unsqueeze(0)
+            hidden_states = hidden_states.unsqueeze(0)
 
-        B, T, D = x.shape
+        B, T, D = hidden_states.shape
         assert D == self.d_model
 
-        y = x.transpose(1, 2)         # [B, D, T]
+        y = hidden_states.transpose(1, 2)         # [B, D, T]
         y = self.pw1(y)               # [B, 2D, T]
         a, b = y.chunk(2, dim=1)
         pre_dw = a * torch.sigmoid(b)  # GLU
@@ -552,15 +344,15 @@ class ConformerConvModule(nn.Module):
                 out = out.squeeze(0)
             return out
 
-        attn_metadata: FastConformerMetadata = attn_meta_all[self.conv_cache.prefix]
+        attn_metadata: FastConformerMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
         # the length of the cache is not exactly equal to the left context length
         # because of an invariant that vLLM enforces where the page size must
         # be the same for both conv and attention layers.
-        store = self.conv_cache.kv_cache[fctx.virtual_engine]  # [num_pages, L', D]
-        L = self.conv_cache.left_ctx
+        store = self.kv_cache[fctx.virtual_engine]  # [num_pages, L', D]
+        L = self.left_ctx
         hist_full = store[page_indices]                   # [B, L', D]
         hist = hist_full[:, -L:, :].transpose(1, 2).contiguous()   # [B, D, L]
 
@@ -587,30 +379,33 @@ class ConformerConvModule(nn.Module):
             y = y.squeeze(0)
         return y
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.dim() == 2, "forward_cuda expects a 2D tensor [T, D]"
-        T, D = x.shape
+    def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert hidden_states.dim() == 2, "forward_cuda expects a 2D tensor [T, D]"
+        T, D = hidden_states.shape
         assert D == self.d_model
 
         w1 = self.pw1.weight.squeeze(-1)   # [2D, D]
         b1 = self.pw1.bias                 # [2D]
-        y_pw1 = F.linear(x, w1, b1)        # [T, 2D]
+        y_pw1 = F.linear(hidden_states, w1, b1)        # [T, 2D]
         a, b = y_pw1.chunk(2, dim=-1)      # [T, D], [T, D]
         pre_dw = a * torch.sigmoid(b)      # GLU -> [T, D]
 
         fctx = get_forward_context()
         attn_meta_all = fctx.attn_metadata
 
+        if attn_meta_all is None:
+            return torch.zeros_like(hidden_states)
+
         K = self.dw.weight.size(2)
         conv_weights = self.dw.weight.view(D, K)
         conv_bias = self.dw.bias
         pre_dw_2d = pre_dw.transpose(0, 1)
 
-        attn_metadata: FastConformerMetadata = attn_meta_all[self.conv_cache.prefix]
+        attn_metadata: FastConformerMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
-        store = self.conv_cache.kv_cache[fctx.virtual_engine]
+        store = self.kv_cache[fctx.virtual_engine]
         conv_state = store.contiguous().transpose(1, 2)
 
         query_start_loc = attn_metadata.query_start_loc
@@ -636,12 +431,40 @@ class ConformerConvModule(nn.Module):
         y_out = F.linear(y_act.transpose(0, 1), w2, b2)
         return y_out
 
-    def forward(self, x: torch.Tensor):
-        fctx = get_forward_context()
-        attn_metadata_all = fctx.attn_metadata
-        if attn_metadata_all is not None and torch.cuda.is_available() and x.dim() == 2:
-            return self.forward_cuda(x)
-        return self.forward_ref(x)
+    def get_attn_backend(self) -> AttentionBackend:
+        return FastConformerBackend
+
+    def get_kv_cache_spec(self) -> KVCacheSpec:
+        return FastConformerConvSpec(
+            block_size=self.cache_config.block_size,
+            shape=(self.left_shape, self.d_model),
+            dtype=self.dtype,
+        )
+
+
+
+def fastconformer_conv_fwd(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    return self.forward_cuda(hidden_states=hidden_states)
+
+
+def fastconformer_conv_fwd_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.zeros_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="fastconformer_conv_module",
+    op_func=fastconformer_conv_fwd,
+    fake_impl=fastconformer_conv_fwd_fake,
+)
+
 
 class ConformerBlock(nn.Module):
     def __init__(self,
@@ -749,37 +572,12 @@ class FastConformerCTC(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         raise Exception("not applicable for this model")
 
-    def _remove_ragged_format(self, x: torch.Tensor, pre_subsample: bool = True) -> torch.Tensor:
-        if _is_dummy_run():
-            return x.unsqueeze(0)
-        attn_metadata = get_forward_context().attn_metadata
-        ctx: FastConformerMetadata = list(attn_metadata.values())[0]
-        num_seqs = ctx.num_reqs
-        seq_lens = ctx.query_start_loc[1:] - ctx.query_start_loc[:-1]
-        if not torch.all(seq_lens == seq_lens[0]):
-            raise NotImplementedError(
-                "Ragged batch processing for variable sequence lengths is not supported"
-            )
-        batch_size = num_seqs
-        time_dim = seq_lens[0].item()
-        feature_dim = x.shape[-1]
-        if pre_subsample:
-            time_dim = time_dim * 8
-        return x.view(batch_size, time_dim, feature_dim)
-
-    def _add_ragged_format(self, x: torch.Tensor) -> torch.Tensor:
-        return x.squeeze(0)
-
     def _forward_attn_only(self, x: torch.Tensor) -> torch.Tensor:
-        # x = self._remove_ragged_format(x, pre_subsample=False)
         x = self.blocks[0].attn(x)
-        # x = self._add_ragged_format(x)
         return x
     
     def _forward_conv_only(self, x: torch.Tensor) -> torch.Tensor:
-        # x = self._remove_ragged_format(x, pre_subsample=False)
         x = self.blocks[0].conv(x)
-        # x = self._add_ragged_format(x)
         return x
 
     def forward(
@@ -799,13 +597,6 @@ class FastConformerCTC(nn.Module):
         if self.config.conv_only:
             return self._forward_conv_only(x)
 
-        T, F = x.shape
-        # assert F == 640, f"expected feature dim=80*8, got {F}"
-        # x = x.view(T, 8, 80).reshape(T * 8, 80)
-
-        # x = self._remove_ragged_format(x)
-
-
         # TODO: dummy sampler replacement, since the real sampler does not support BT input
         # x = torch.randn(T, 512, dtype=x.dtype, device=x.device)
         # length = x.new_full(
@@ -818,7 +609,6 @@ class FastConformerCTC(nn.Module):
 
         for _, blk in enumerate(self.blocks):
             x = blk(x)
-        # x = self._add_ragged_format(x)
         return x
 
     def compute_logits(
@@ -852,6 +642,7 @@ class FastConformerCTC(nn.Module):
             loaded_pairs.append((src_name, dst_name))
             loaded_param_names.add(dst_name)
 
+        # TODO: original sub_map used in the incomplete NemoSubsample8x2D class
         # sub_map = [
         #     ("encoder.pre_encode.conv.0.weight", self.subsample.conv0.weight, "subsample.conv0.weight"),
         #     ("encoder.pre_encode.conv.0.bias",   self.subsample.conv0.bias,   "subsample.conv0.bias"),

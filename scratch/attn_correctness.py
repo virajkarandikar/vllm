@@ -95,8 +95,7 @@ async def main():
             return_hidden_states=True,
             skip_tokenizer_init=True,
             dtype=_get_dtype_str(DTYPE),
-            compilation_config={"level": 0, "cudagraph_mode": "FULL"}
-            # compilation_config={"level": 0}
+            compilation_config={"cudagraph_mode": "FULL"}
         )
         engine = AsyncLLM.from_engine_args(engine_args)
 
