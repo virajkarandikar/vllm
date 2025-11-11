@@ -95,7 +95,8 @@ async def main():
             return_hidden_states=True,
             skip_tokenizer_init=True,
             dtype=_get_dtype_str(DTYPE),
-            compilation_config={"level": 1}
+            compilation_config={"level": 0, "cudagraph_mode": "FULL"}
+            # compilation_config={"level": 0}
         )
         engine = AsyncLLM.from_engine_args(engine_args)
 
@@ -215,11 +216,14 @@ async def main():
             await handle(first_out, first_packet_len - 1, latency=None)
             with torch.no_grad():
                 hs = first_out.outputs[0].hidden_states[-1]
+                # print(f"hs: {hs}")
                 if hs.dim() == 2:
                     hs = hs[-1:, :]
                 ref = nemo_prefill_out[:, first_packet_len - 1, :]
                 l2 = torch.norm(hs - ref).item()
                 max_abs = torch.max(torch.abs(hs - ref)).item()
+                # l2 = torch.norm(hs).item()
+                # max_abs = torch.max(torch.abs(hs)).item()
                 diffs.append(l2)
                 max_abs_diffs.append(max_abs)
                 print(f"[compare step {first_packet_len-1}] l2={l2:.6e} | max_abs={max_abs:.6e}")
@@ -241,8 +245,11 @@ async def main():
                 with torch.no_grad():
                     hs = out.outputs[0].hidden_states[-1]
                     ref = nemo_prefill_out[:, i, :]
+                    # print(f"hs: {hs}")
                     l2 = torch.norm(hs - ref).item()
                     max_abs = torch.max(torch.abs(hs - ref)).item()
+                    # l2 = torch.norm(hs).item()
+                    # max_abs = torch.max(torch.abs(hs)).item()
                     diffs.append(l2)
                     max_abs_diffs.append(max_abs)
                     print(f"[compare step {i}] l2={l2:.6e} | max_abs={max_abs:.6e}")

@@ -69,7 +69,8 @@ class FastConformerMetadataBuilder(AttentionMetadataBuilder):
     ) -> FastConformerMetadata:
         # for causal_conv1d
         nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
-            common_attn_metadata.query_start_loc
+            common_attn_metadata.query_start_loc_cpu,
+            query_start_loc_cpu=True
         )
 
         return FastConformerMetadata(

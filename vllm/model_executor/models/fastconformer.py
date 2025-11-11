@@ -21,8 +21,10 @@ from vllm.v1.attention.backends.fastconformer_attn import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.attention.backends.abstract import AttentionBackend
-from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend, FlexAttentionMetadata
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.attention.backends.fastconformer_rpe_attention import (
+    FastConformerRPEBackend,
+)
 from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
@@ -33,7 +35,7 @@ import math
 
 try:
     from torch.nn.functional import scaled_dot_product_attention as torch_sdpa
-    torch_sdpa = torch.compile(torch_sdpa, fullgraph=True)
+    # torch_sdpa = torch.compile(torch_sdpa, fullgraph=True)
 except ImportError:
     torch_sdpa = None
 
@@ -223,8 +225,7 @@ class RelPosSelfAttention(nn.Module):
         self.pos_bias_u = nn.Parameter(torch.zeros(self.h, self.dh))
         self.pos_bias_v = nn.Parameter(torch.zeros(self.h, self.dh))
 
-        # 1. config for flex-attention
-        # use in `_forward`, `_forward_sdpa_2`
+        # 1. config for FastConformerRPEBackend
         self.attn = Attention(
             num_heads=self.h,
             head_size=self.dh,
@@ -237,7 +238,10 @@ class RelPosSelfAttention(nn.Module):
                 calculate_kv_scales=False,
             ),
             prefix=self.prefix,
-            attn_backend=FlexAttentionBackend,
+            pos_bias_u=self.pos_bias_u,
+            pos_bias_v=self.pos_bias_v,
+            linear_pos=self.linear_pos,
+            attn_backend=FastConformerRPEBackend,
         )
 
         # 2. config for flash-attention
@@ -281,13 +285,6 @@ class RelPosSelfAttention(nn.Module):
             torch.empty(3 * d_model, dtype=self.q_proj.weight.dtype)
         )
         self._qkv_fused_ready: bool = False
-
-        # populate rel_cache
-        devices = [torch.device("cuda")]
-        dtypes = [torch.float32]
-        for device in devices:
-            for dtype in dtypes:
-                self._get_rel_proj(device, dtype, self.window)
 
 
     def _fused_qkv_projection(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -384,13 +381,13 @@ class RelPosSelfAttention(nn.Module):
         band_bias = band_bias * (Dh ** -0.5)
         return band_bias
 
-    def _mask_cache_key(self, meta: FlexAttentionMetadata) -> tuple[int, int, int, int]:
+    def _mask_cache_key(self, meta) -> tuple[int, int, int, int]:
         return (int(meta.block_table.data_ptr()),
                 int(meta.q_block_size),
                 int(meta.kv_block_size),
                 int(self.window))
 
-    def _install_exact_mask_cached(self, attn_meta: FlexAttentionMetadata):
+    def _install_exact_mask_cached(self, attn_meta):
         if getattr(attn_meta, "_installed_exact_mask", False):
             return
 
@@ -460,134 +457,9 @@ class RelPosSelfAttention(nn.Module):
         return out
 
     def _forward_sdpa_2(self, x: torch.Tensor) -> torch.Tensor:
-        device, idtype = x.device, x.dtype
-        H, Dh = self.h, self.dh
-        W = int(self.window)
-        K_cap = W + 1
-        D_model = H * Dh
-
-        q_lin, k_lin, v_lin = self._fused_qkv_projection(x)
-
-        N_tokens, D = x.shape
-        assert D == D_model
-        q = q_lin.view(N_tokens, H, Dh)
-        k = k_lin.view(N_tokens, H, Dh)
-        v = v_lin.view(N_tokens, H, Dh)
-
-        # u/v position biases
-        q_u = q + self.pos_bias_u.unsqueeze(0)  # [N, H, Dh]
-        q_v = q + self.pos_bias_v.unsqueeze(0)  # [N, H, Dh]
-
-        out_buf = torch.zeros_like(q_u)          # [N_tokens, H, Dh]
-
-        fctx = get_forward_context()
-        attn_meta_all = fctx.attn_metadata
-        if not isinstance(attn_meta_all, dict):
-            # during dummy runs / cudagraph capture
-            attn_output = out_buf.reshape(-1, D_model)
-            return self.o_proj(attn_output) 
-
-        attn_meta: FlexAttentionMetadata = attn_meta_all[self.prefix]
-        block_size = int(attn_meta.block_size)
-        assert W < block_size, f"window ({W}) must be < cache block_size ({block_size})"
-
-        N_live = int(attn_meta.num_actual_tokens)
-        assert N_live <= q_u.shape[0]
-
-        self_kv_cache = self.attn.kv_cache[fctx.virtual_engine]  # [2, num_blocks, block_size, H, Dh]
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            k, v,
-            self_kv_cache[0], self_kv_cache[1],
-            attn_meta.slot_mapping,
-            self.attn.impl.kv_cache_dtype,
-            self._k_scale, self._v_scale,
-        )
-        key_cache, value_cache = self_kv_cache.unbind(0)  # [num_blocks, block_size, H, Dh]
-
-        req_ids = attn_meta.doc_ids[:N_live].to(torch.long)
-        q_start = attn_meta.query_start_loc.index_select(0, req_ids)
-        dec_off = attn_meta.decode_offset.index_select(0, req_ids)
-
-        idx = torch.arange(N_live, device=device, dtype=torch.long)
-        local_q = idx - q_start
-        logical_q = local_q + dec_off
-
-        start = torch.clamp(logical_q - W, min=0)
-        L = logical_q - start + 1
-        pad = K_cap - L
-
-        start_block = torch.div(start, block_size, rounding_mode='floor')
-        end_block   = torch.div(logical_q, block_size, rounding_mode='floor')
-        start_off   = start - start_block * block_size
-        end_off     = logical_q - end_block * block_size
-
-        phys_start = attn_meta.block_table.index_select(0, req_ids).gather(1, start_block.unsqueeze(1)).squeeze(1)
-        phys_end   = attn_meta.block_table.index_select(0, req_ids).gather(1, end_block.unsqueeze(1)).squeeze(1)
-
-        two_block = (start_block != end_block)
-
-        slot = torch.arange(K_cap, device=device, dtype=torch.long).unsqueeze(0).expand(N_live, K_cap)
-        valid = slot >= pad.unsqueeze(1)
-        relpos = slot - pad.unsqueeze(1)
-
-        thresh = (block_size - start_off).unsqueeze(1)
-
-        kv_block_start = phys_start.unsqueeze(1).expand_as(slot)
-        kv_off_start   = start_off.unsqueeze(1) + relpos
-
-        kv_block_end = phys_end.unsqueeze(1).expand_as(slot)
-        kv_off_end   = relpos - thresh
-
-        use_end = two_block.unsqueeze(1) & (relpos >= thresh)
-        kv_block = torch.where(use_end, kv_block_end, kv_block_start)
-        kv_off   = torch.where(use_end, kv_off_end,   kv_off_start)
-
-        kv_block = kv_block.clamp_min(0)
-        kv_off   = kv_off.clamp(min=0, max=block_size - 1)
-
-        ks = key_cache[kv_block, kv_off]
-        vs = value_cache[kv_block, kv_off]
-        # if not valid.all():
-        #     mask4 = valid.unsqueeze(2).unsqueeze(3)
-        #     ks = torch.where(mask4, ks, torch.zeros(1, dtype=ks.dtype, device=ks.device)).contiguous()
-        #     vs = torch.where(mask4, vs, torch.zeros(1, dtype=vs.dtype, device=vs.device)).contiguous()
-
-        mask4 = valid.unsqueeze(2).unsqueeze(3)
-        ks = ks * mask4.to(ks.dtype)
-        vs = vs * mask4.to(vs.dtype)
-
-        rel = self._get_rel_proj(device, idtype, W)                              # [H, Dh, 2W+1]
-        band = torch.einsum("n h d, h d m -> n h m", q_v[:N_live], rel) * (Dh ** -0.5)  # [N, H, 2W+1]
-        band_idx = (W + (L.unsqueeze(1) - 1) - relpos).clamp(0, 2 * W)           # [N, K_cap]
-        bias_g = band.gather(2, band_idx.unsqueeze(1).expand(-1, H, -1))
-        # neg_inf = torch.tensor(float("-inf"), dtype=idtype, device=device)
-        # bias_g = torch.where(valid.unsqueeze(1), bias_g, neg_inf)
-
-        mask = ~valid.unsqueeze(1)
-        bias_g = bias_g.masked_fill(mask, float("-inf"))
-
-        attn_bias_sdpa = bias_g.reshape(N_live * H, 1, K_cap).contiguous()
-
-        q_sdpa = q_u[:N_live].reshape(N_live * H, 1, Dh)
-        # ks/vs: [N, K, H, Dh] -> [N*H, K, Dh]
-        k_sdpa = ks.permute(0, 2, 1, 3).reshape(N_live * H, K_cap, Dh)
-        v_sdpa = vs.permute(0, 2, 1, 3).reshape(N_live * H, K_cap, Dh)
-
-        assert torch_sdpa is not None
-
-        y = torch_sdpa(
-            q_sdpa, k_sdpa, v_sdpa,
-            attn_mask=attn_bias_sdpa,
-            dropout_p=0.0,
-            is_causal=False,
-        )  # [N*H, 1, Dh]
-        y = y.view(N_live, H, Dh)
-
-        out_buf[:N_live] = y
-        attn_output = out_buf.reshape(-1, D_model)
-
+        q, k, v = self._fused_qkv_projection(x)
+        attn_output = self.attn(q, k, v)
         return self.o_proj(attn_output)
-
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape

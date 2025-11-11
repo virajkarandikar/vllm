@@ -198,6 +198,7 @@ async def main():
         dtype=args.dtype,
         block_size=128,
         disable_log_stats=True,
+        compilation_config={"level": 0, "cudagraph_mode": "FULL"}
     )
 
     engine = AsyncLLM.from_engine_args(engine_args)
