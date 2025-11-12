@@ -181,7 +181,15 @@ async def main():
         "--dtype", type=str, default="bfloat16",
         help="Model dtype (e.g., bfloat16, float16)"
     )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="Enable PyTorch Profiler"
+    )
     args = parser.parse_args()
+
+    print("syncing cuda...")
+    torch.cuda.synchronize()
+    print("cuda synced")
 
     print("Starting vLLM FastConformer embeddings benchmark...")
     print(f"Model: {args.model}, Concurrency: {args.concurrency}, Num Requests: {args.num_requests}")
@@ -202,6 +210,9 @@ async def main():
     )
 
     engine = AsyncLLM.from_engine_args(engine_args)
+
+    if args.profile:
+        await engine.start_profile()
 
     sampling_params = SamplingParams(
         max_tokens=args.steps,
@@ -241,6 +252,9 @@ async def main():
     end_time = time.perf_counter()
 
     total_time = end_time - start_time
+
+    if args.profile:
+        await engine.stop_profile()
     
     print(f"\nBenchmark finished. Total time: {total_time:.2f}s")
 
