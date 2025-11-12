@@ -2,12 +2,11 @@
 
 import os
 import json
-import yaml
 import argparse
 
 import torch
-from omegaconf import OmegaConf
-from safetensors.torch import save_file
+from omegaconf import OmegaConf, DictConfig
+from safetensors.torch import save_file, load_file
 
 from nemo.collections.speechlm2.models.duplex_ear_tts import DuplexEARTTS
 
@@ -15,7 +14,7 @@ from nemo.collections.speechlm2.models.duplex_ear_tts import DuplexEARTTS
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
-    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--outdir", type=str, required=True)
     return parser.parse_args()
 
@@ -25,8 +24,9 @@ def main():
     os.makedirs(args.outdir, exist_ok=True)
 
     # load config
-    cfg = OmegaConf.load(args.config)
-    OmegaConf.resolve(cfg)
+    with open(args.config, "r") as f:
+        config_dict = json.load(f)["model"]["speech_generation"]
+    cfg = DictConfig(config_dict)
     # config modification that is needed to run inference
     cfg.model.tts_config.use_unshifthed_prompt = True
     cfg.data.add_audio_prompt_after_description = True
@@ -45,12 +45,14 @@ def main():
     subword_id_to_char_ids = model.tts_model.embed_subword.subword_id_to_char_ids
     char_vocab = model.tts_model.embed_subword.char_vocab
     # create weights for the embedding layers that convert subword ids to char ids
-    vocab_size = model.embed_tokens.weight.shape[0]
+    vocab_size = len(subword_id_to_char_ids)
     max_char_len = max(len(char_ids) for char_ids in subword_id_to_char_ids.values())
     hidden_size = cfg.model.tts_config.backbone_config.hidden_size
 
     # load checkpoint
-    weights = torch.load(args.ckpt)["state_dict"]
+    weights = load_file(args.model)
+    # select tts model weights, strip off one nested layer
+    weights = {k[len("tts_model."):]: v for k, v in weights.items() if "tts_model." in k}
 
     # duplicate weights for rvq embeddings and embed code
     rvq_embs_weight = weights["tts_model.rvq_embs"].clone()  # 31 x codebook_size x latent_size
@@ -77,10 +79,7 @@ def main():
     # create weights for the embedding model that runs outside of the eartts
     embedding_module_weights = {}
     embedding_module_weights["bos_emb"] = bos_emb
-    embedding_module_weights["embed_tokens.weight"] = model.embed_tokens.weight
-    embedding_module_weights["embed_context.weight"] = weights[
-        "tts_model.embed_context.weight"
-    ]
+
     # embedding transformer has a lot of weights
     for key, weight in weights.items():
         if "tts_model.embed_subword" in key:
@@ -167,7 +166,6 @@ def main():
             "dim": flat_config["num_quantizers"],
             "dtype": "int32",
         },
-        {"name": "context_text_tokens", "dtype": "int32"},
         {"name": "text_tokens", "dtype": "int32"},
         {"name": "text_mask"},
         {"name": "bos_mask"},
