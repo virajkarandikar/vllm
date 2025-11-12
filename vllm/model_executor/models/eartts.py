@@ -166,7 +166,6 @@ class EarTTSInputEmbedding(nn.Module):
         super().__init__()
 
         hidden_size = config.hidden_size
-        context_hidden_size = config.context_hidden_size
         vocab_size = config.emb_vocab_size
         char_vocab_size = config.emb_char_vocab_size
         max_char_len = config.max_char_len
@@ -180,15 +179,6 @@ class EarTTSInputEmbedding(nn.Module):
             for _ in range(config.num_quantizers)
         ])
         self.embed_code = nn.Linear(config.latent_size, hidden_size, bias=False)
-
-        # >>> weights["embed_tokens.weight"].shape
-        # torch.Size([151936, 1536])
-        self.embed_tokens = nn.Embedding(
-            vocab_size, context_hidden_size
-        )
-        self.embed_context = nn.Linear(
-            context_hidden_size, hidden_size, bias=False
-        )
         self.embed_subword = CharAwareSubwordEncoder(
             out_size=hidden_size,
             vocab_size=vocab_size,
@@ -202,7 +192,6 @@ class EarTTSInputEmbedding(nn.Module):
     def forward(
         self,
         acoustic_tokens: torch.Tensor,
-        context_text_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
         bos_mask: torch.Tensor,
@@ -212,7 +201,6 @@ class EarTTSInputEmbedding(nn.Module):
         for EarTTS model.
         Inputs:
             acoustic_tokens: (BT x 31) - audio tokens
-            context_text_tokens: (BT) - context text tokens
             text_tokens: (BT) - text token to embed
             text_mask: (BT) - masks text embeddings for prefill
             bos_mask: (BT) - specifies where BOS is applied (first frame of prefill)
@@ -224,10 +212,6 @@ class EarTTSInputEmbedding(nn.Module):
         audio_emb = sum(emb(acoustic_tokens[i]) for i, emb in enumerate(self.rvq_embs))  # BT x latent_size
         audio_emb = self.embed_code(audio_emb)  # BT x hidden_size
 
-        # embed the context text tokens
-        context_emb = self.embed_tokens(context_text_tokens)  # BT x dim
-        context_emb_proj = self.embed_context(context_emb)  # BT x dim
-
         # prepare bos emb that is applied to audio embedding
         bos_emb = bos_mask.unsqueeze(1) * self.bos_emb  # BT x dim
 
@@ -236,7 +220,7 @@ class EarTTSInputEmbedding(nn.Module):
         text_emb = self.embed_subword(text_tokens) * text_mask.unsqueeze(1)  #  BT x dim
 
         # prepare total embedding by adding all components
-        total_emb = context_emb_proj + audio_emb + text_emb + bos_emb  # BT x dim
+        total_emb = audio_emb + text_emb + bos_emb  # BT x dim
         return total_emb
 
 
@@ -590,7 +574,6 @@ class EarTTSModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors],
         acoustic_tokens: torch.Tensor,
-        context_text_tokens: torch.Tensor,
         text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
         bos_mask: torch.Tensor,
@@ -601,7 +584,6 @@ class EarTTSModel(nn.Module):
         """
         total_emb = self.total_emb(
             acoustic_tokens=acoustic_tokens,
-            context_text_tokens=context_text_tokens,
             text_tokens=text_tokens,
             text_mask=text_mask,
             bos_mask=bos_mask,
@@ -632,7 +614,6 @@ class EarTTSForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         # input used to prepare hidden states for backbone
         acoustic_tokens: Optional[torch.Tensor] = None,
-        context_text_tokens: Optional[torch.Tensor] = None,
         text_tokens: Optional[torch.Tensor] = None,
         # text tokens are not used for prompt
         text_mask: Optional[torch.Tensor] = None,
@@ -648,7 +629,6 @@ class EarTTSForCausalLM(nn.Module):
             positions=positions,
             intermediate_tensors=intermediate_tensors,
             acoustic_tokens=acoustic_tokens,
-            context_text_tokens=context_text_tokens,
             text_tokens=text_tokens,
             text_mask=text_mask,
             bos_mask=bos_mask,
