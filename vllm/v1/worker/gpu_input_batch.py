@@ -850,7 +850,10 @@ class InputBatch:
             self.thinking_budget_state_holder.sync_batch(batch_update)
         for logit_proc in self.logitsprocs.all:
             logit_proc.update_state(batch_update)
-        if batch_update:
+
+        # TODO: merge in slava's skip_sampling metadata code
+        skip_sampling = True
+        if batch_update and not skip_sampling:
             self.sampling_metadata = self._make_sampling_metadata()
 
     def _make_sampling_metadata(self) -> SamplingMetadata:
