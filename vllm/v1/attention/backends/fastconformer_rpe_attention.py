@@ -6,13 +6,8 @@ from typing import Optional
 import math
 import torch
 import torch.nn.functional as F
-try:
-    import triton
-    import triton.language as tl
-    _HAS_TRITON = True
-except Exception:
-    _HAS_TRITON = False
-
+import triton
+import triton.language as tl
 from vllm.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
 reshape_and_cache_flash = triton_reshape_and_cache_flash
 
@@ -24,7 +19,6 @@ from vllm.attention.backends.abstract import (
     is_quantized_kv_cache,
 )
 from vllm.config import VllmConfig
-from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
@@ -134,50 +128,42 @@ def _launch_fc_single_q_attn_triton(
 
 @triton.jit
 def _fc_fused_cache_kernel(
-    # Query and biases
-    Q, PBU, PBV,                    # Q: [T, H, Dh], PBU/PBV: [H, Dh]
-    # KV cache base and strides for [B, O, H, Dh]
+    Q, PBU, PBV,
     KCACHE, VCACHE,
     stride_k_b, stride_k_o, stride_k_h, stride_k_d,
-    # Metadata tensors
-    BLOCK_TABLE,                    # [R, Wb]
-    stride_bt_r, stride_bt_c,       # row/col stride
-    QUERY_START_LOC,                # [R]
-    DECODE_OFFSET,                  # [R]
-    DOC_IDS,                        # [T]
-    # Relative position projection for bias: REL[h, d, m], m in [0..2W]
+    BLOCK_TABLE,
+    stride_bt_r, stride_bt_c,
+    QUERY_START_LOC,
+    DECODE_OFFSET,
+    DOC_IDS,
     REL,
     stride_rel_h, stride_rel_d, stride_rel_m,
-    # Output
-    OUT,                            # [T, H, Dh]
-    stride_q_t, stride_q_h, stride_q_d,   # strides for Q
-    stride_o_t, stride_o_h, stride_o_d,   # strides for OUT
-    pbu_s_h, pbu_s_d, pbv_s_h, pbv_s_d,  # strides for PBU/PBV
-    # Scalar args
-    T_live: tl.constexpr,           # not used at compile-time; grid controls bounds
+    OUT,
+    stride_q_t, stride_q_h, stride_q_d,
+    stride_o_t, stride_o_h, stride_o_d,
+    pbu_s_h, pbu_s_d, pbv_s_h, pbv_s_d,
+    T_live: tl.constexpr,
     H_heads: tl.constexpr,
     Dh: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     BT_WIDTH: tl.constexpr,
-    W: tl.constexpr,                # 71
-    KCAP: tl.constexpr,             # 72
-    TWO_WP1: tl.constexpr,          # 143
+    W: tl.constexpr,
+    KCAP: tl.constexpr,
+    TWO_WP1: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    pid_n = tl.program_id(0)   # token idx in [0, N_live)
-    pid_h = tl.program_id(1)   # head idx in [0, H)
+    pid_n = tl.program_id(0)
+    pid_h = tl.program_id(1)
     if pid_h >= H_heads:
         return
 
-    # Load req_id, q_start, dec_off
     req_id = tl.load(DOC_IDS + pid_n).to(tl.int32)
     q_start = tl.load(QUERY_START_LOC + req_id).to(tl.int32)
     dec_off = tl.load(DECODE_OFFSET + req_id).to(tl.int32)
 
     idx = tl.full((1,), pid_n, dtype=tl.int32)
-    local_q = idx - q_start
-    logical_q = local_q + dec_off
+    logical_q = idx - q_start + dec_off
     start = tl.maximum(logical_q - W, 0)
     L = logical_q - start + 1
     pad = KCAP - L
@@ -186,119 +172,120 @@ def _fc_fused_cache_kernel(
     end_block = logical_q // BLOCK_SIZE
     start_off = start - start_block * BLOCK_SIZE
 
-    # Block table lookups
     bt_row = BLOCK_TABLE + req_id * stride_bt_r
     i32_neg1 = tl.full((1,), -1, tl.int32)
     phys_start = tl.load(bt_row + start_block * stride_bt_c,
-                     mask=start_block < BT_WIDTH, other=i32_neg1)
+                         mask=start_block < BT_WIDTH,
+                         other=i32_neg1)
     phys_end   = tl.load(bt_row + end_block   * stride_bt_c,
-                     mask=end_block   < BT_WIDTH, other=i32_neg1)
+                         mask=end_block   < BT_WIDTH,
+                         other=i32_neg1)
+
     two_block = start_block != end_block
     has_start = phys_start >= 0
-    has_end = phys_end >= 0
+    has_end   = phys_end >= 0
 
-    # Pointers for Q and biases
+    k_offsets = tl.arange(0, BLOCK_K)
+    relpos = k_offsets - pad
+    thresh = BLOCK_SIZE - start_off
+
+    use_end = two_block & (relpos >= thresh)
+    kv_block = tl.where(use_end, phys_end, phys_start)
+    kv_off   = tl.where(use_end, relpos - thresh, start_off + relpos)
+    kv_off   = tl.maximum(tl.minimum(kv_off, BLOCK_SIZE - 1), 0)
+
+    valid = (k_offsets >= pad) & tl.where(use_end, has_end, has_start)
+
+    safe_block = tl.maximum(phys_start, 0)
+    safe_off   = tl.full((BLOCK_K,), 0, tl.int32)
+    kv_block = tl.where(valid, kv_block, safe_block)
+    kv_off   = tl.where(valid, kv_off,   safe_off)
+
+    mask_k = k_offsets < KCAP
+
     d_offsets = tl.arange(0, BLOCK_D)
     q_row = Q + pid_n * stride_q_t + pid_h * stride_q_h
     pbu_row = PBU + pid_h * pbu_s_h
     pbv_row = PBV + pid_h * pbv_s_h
 
-    # Load q_u, q_v in tiles and keep in registers
-    # We will re-load per tile when needed
+    logits = tl.full((BLOCK_K,), -float("inf"), dtype=tl.float32)
 
-    # Streaming softmax variables and accumulator
-    m_i = tl.full((1,), -float("inf"), dtype=tl.float32)
-    l_i = tl.zeros((1,), dtype=tl.float32)
-    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    s_tile = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    for do in range(0, Dh, BLOCK_D):
+        d_idx = do + d_offsets
+        d_mask = d_idx < Dh
 
-    # Iterate over slots in tiles of BLOCK_K
-    for ko in range(0, KCAP, BLOCK_K):
-        k_offsets = ko + tl.arange(0, BLOCK_K)
-        relpos = k_offsets - pad
-        thresh = BLOCK_SIZE - start_off
-        use_end = (two_block & (relpos >= thresh))
-        kv_block = tl.where(use_end, phys_end, phys_start)
-        kv_off = tl.where(use_end, relpos - thresh, start_off + relpos)
-        kv_off = tl.maximum(tl.minimum(kv_off, BLOCK_SIZE - 1), 0)
-        valid = (k_offsets >= pad) & tl.where(use_end, has_end, has_start)
+        q_u = tl.load(q_row + d_idx * stride_q_d,
+                      mask=d_mask, other=0.0).to(tl.float32) \
+            + tl.load(pbu_row + d_idx * pbu_s_d,
+                      mask=d_mask, other=0.0).to(tl.float32)
 
-        # Compute QK scores for this tile across Dh in BLOCK_D chunks
-        s_tile = tl.zeros((BLOCK_K,), dtype=tl.float32)
-        for do in range(0, Dh, BLOCK_D):
-            d_idx = do + d_offsets
-            d_mask = d_idx < Dh
-            # q_u = q + pos_bias_u
-            q_u = tl.load(q_row + d_idx * stride_q_d, mask=d_mask, other=0.0).to(tl.float32) + \
-                  tl.load(pbu_row + d_idx * pbu_s_d, mask=d_mask, other=0.0).to(tl.float32)
+        k_ptrs = KCACHE \
+            + kv_block[:, None] * stride_k_b \
+            + kv_off[:, None]   * stride_k_o \
+            + pid_h * stride_k_h \
+            + d_idx[None, :] * stride_k_d
+        k_mask = mask_k[:, None] & d_mask[None, :] & valid[:, None]
+        k_block = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
-            # K block gather pointers using strides
-            k_ptrs = KCACHE \
-                + kv_block[:, None] * stride_k_b \
-                + kv_off[:, None] * stride_k_o \
-                + pid_h * stride_k_h \
-                + d_idx[None, :] * stride_k_d
-            k_mask = (k_offsets[:, None] < KCAP) & d_mask[None, :] & valid[:, None]
-            k_block = tl.load(k_ptrs, mask=k_mask, other=0.0).to(tl.float32)  # [BK, Bd]
+        s_tile += tl.sum(k_block * q_u[None, :], axis=1)
 
-            # s += q_u · k
-            s_tile += tl.sum(k_block * q_u[None, :], axis=1)
+    bias_tile = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    band_idx = W + (L - 1) - relpos
+    band_idx = tl.maximum(tl.minimum(band_idx, TWO_WP1 - 1), 0)
 
-        s_tile = s_tile * (1.0 / tl.sqrt(tl.full((1,), float(Dh), dtype=tl.float32)))
+    for do in range(0, Dh, BLOCK_D):
+        d_idx = do + d_offsets
+        d_mask = d_idx < Dh
 
-        # Add bias per slot: compute band_idx and per-slot dot(q_v, rel[:, m])
-        # band_idx = clamp(W + (L - 1) - relpos, 0, 2W)
-        band_idx = W + (L - 1) - relpos
-        band_idx = tl.maximum(tl.minimum(band_idx, TWO_WP1 - 1), 0)
+        q_v = tl.load(q_row + d_idx * stride_q_d,
+                      mask=d_mask, other=0.0).to(tl.float32) \
+            + tl.load(pbv_row + d_idx * pbv_s_d,
+                      mask=d_mask, other=0.0).to(tl.float32)
 
-        bias_tile = tl.zeros((BLOCK_K,), dtype=tl.float32)
-        for do in range(0, Dh, BLOCK_D):
-            d_idx = do + d_offsets
-            d_mask = d_idx < Dh
-            q_v = tl.load(q_row + d_idx * stride_q_d, mask=d_mask, other=0.0).to(tl.float32) + \
-                  tl.load(pbv_row + d_idx * pbv_s_d, mask=d_mask, other=0.0).to(tl.float32)
-            # Vectorized load of REL[h, d, m] for all m in this tile (band_idx)
-            rel_ptrs = REL \
-                + pid_h * stride_rel_h \
-                + d_idx[:, None] * stride_rel_d \
-                + band_idx[None, :] * stride_rel_m
-            rel_mask = d_mask[:, None] & (band_idx[None, :] >= 0) & (band_idx[None, :] < TWO_WP1)
-            rel_block = tl.load(rel_ptrs, mask=rel_mask, other=0.0).to(tl.float32)  # [Bd, BK]
-            # Accumulate per-slot bias: sum_d q_v[d] * rel[h, d, m]
-            bias_tile += tl.sum(rel_block * q_v[:, None], axis=0)
-        bias_tile = bias_tile * (1.0 / tl.sqrt(tl.full((1,), float(Dh), dtype=tl.float32)))
+        rel_ptrs = REL \
+            + pid_h * stride_rel_h \
+            + d_idx[:, None] * stride_rel_d \
+            + band_idx[None, :] * stride_rel_m
+        rel_mask = d_mask[:, None] & mask_k[None, :]
+        rel_block = tl.load(rel_ptrs, mask=rel_mask, other=0.0).to(tl.float32)
 
-        s_total = s_tile + bias_tile
-        neg_inf = -float("inf")
-        s_for_max = tl.where(valid, s_total, neg_inf)
+        bias_tile += tl.sum(rel_block * q_v[:, None], axis=0)
 
-        m_ij = tl.maximum(m_i, tl.max(s_for_max, axis=0))
-        p = tl.where(valid, tl.exp(s_total - m_ij), 0.0)
+    inv_sqrt_d = 1.0 / tl.sqrt(tl.full((1,), float(Dh), dtype=tl.float32))
+    logits = (s_tile + bias_tile) * inv_sqrt_d
 
-        alpha = tl.exp(m_i - m_ij)
-        l_ij = alpha * l_i + tl.sum(p, axis=0)
+    neg_inf = -float("inf")
+    logits = tl.where(valid & mask_k, logits, neg_inf)
 
-        tile_v = tl.zeros((BLOCK_D,), dtype=tl.float32)
-        for do in range(0, Dh, BLOCK_D):
-            d_idx = do + d_offsets
-            d_mask = d_idx < Dh
-            v_ptrs = VCACHE \
-                + kv_block[:, None] * stride_k_b \
-                + kv_off[:, None] * stride_k_o \
-                + pid_h * stride_k_h \
-                + d_idx[None, :] * stride_k_d
-            v_mask = (k_offsets[:, None] < KCAP) & d_mask[None, :] & valid[:, None]
-            v_block = tl.load(v_ptrs, mask=v_mask, other=0.0).to(tl.float32)  # [BK, Bd]
-            # sum over BK -> Bd
-            tile_v += tl.sum(p[:, None] * v_block, axis=0)
+    max_l = tl.max(logits, axis=0)
+    exp_l = tl.exp(logits - max_l)
+    exp_l = tl.where(valid & mask_k, exp_l, 0.0)
+    denom = tl.sum(exp_l, axis=0)
+    p = exp_l / denom
 
-        acc = acc * alpha + tile_v
-
-        m_i = m_ij
-        l_i = l_ij
-
-    out_tile = acc / l_i
+    out_tile = tl.zeros((BLOCK_D,), dtype=tl.float32)
     out_row = OUT + pid_n * stride_o_t + pid_h * stride_o_h
-    tl.store(out_row + d_offsets * stride_o_d, out_tile, mask=d_offsets < Dh)
+
+    for do in range(0, Dh, BLOCK_D):
+        d_idx = do + d_offsets
+        d_mask = d_idx < Dh
+
+        v_ptrs = VCACHE \
+            + kv_block[:, None] * stride_k_b \
+            + kv_off[:, None]   * stride_k_o \
+            + pid_h * stride_k_h \
+            + d_idx[None, :] * stride_k_d
+        v_mask = mask_k[:, None] & d_mask[None, :] & valid[:, None]
+        v_block = tl.load(v_ptrs, mask=v_mask, other=0.0).to(tl.float32)
+
+        # (BLOCK_K, Dh_chunk) * (BLOCK_K,) -> Dh_chunk
+        contrib = tl.sum(v_block * p[:, None], axis=0)
+        out_tile = tl.where(d_mask, contrib, out_tile)
+
+        tl.store(out_row + d_idx * stride_o_d,
+                 out_tile.to(tl.float32),
+                 mask=d_mask)
 
 
 def _launch_fc_fused_cache_triton(
@@ -325,7 +312,6 @@ def _launch_fc_fused_cache_triton(
     decoff_i32 = attn_metadata.decode_offset.to(torch.int32).contiguous()
     docids_i32 = attn_metadata.doc_ids.to(torch.int32).contiguous()
 
-    # Strides (assume contiguous last dim)
     stride_q_t = query.stride(0)
     stride_q_h = query.stride(1)
     stride_q_d = query.stride(2)
@@ -338,10 +324,8 @@ def _launch_fc_fused_cache_triton(
     stride_k_d = key_cache.stride(3)
     pbu_s_h, pbu_s_d = pos_bias_u.stride(0), pos_bias_u.stride(1)
     pbv_s_h, pbv_s_d = pos_bias_v.stride(0), pos_bias_v.stride(1)
-    # Block table strides
     stride_bt_r = bt_i32.stride(0)
     stride_bt_c = bt_i32.stride(1)
-    # REL strides
     stride_rel_h = rel.stride(0)
     stride_rel_d = rel.stride(1)
     stride_rel_m = rel.stride(2)
@@ -691,20 +675,11 @@ class FastConformerRPEImpl(AttentionImpl):
         output_scale: Optional[torch.Tensor] = None,
         output_block_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Fully fused Triton path: compute metadata and attention inside the kernel.
-        Assumes fixed window W=71 (K_cap=72) and head equality (H==num_kv_heads).
-        """
-        assert output is not None, "Output tensor must be provided."
-        if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError("Output scaling not supported for FastConformer RPE.")
+        assert output is not None
         if attn_metadata is None:
             return output
-        if not _HAS_TRITON:
-            # Fallback if Triton isn't present
-            return self._forward_v2(layer, query, key, value, kv_cache, attn_metadata, output, output_scale, output_block_scale)
 
-        key_cache, value_cache = kv_cache.unbind(0)  # [num_blocks, block, H, Dh]
+        key_cache, value_cache = kv_cache.unbind(0)
         reshape_and_cache_flash(
             key,
             value,
@@ -715,18 +690,12 @@ class FastConformerRPEImpl(AttentionImpl):
             layer._k_scale,
             layer._v_scale,
         )
-
         N_live = int(attn_metadata.num_actual_tokens)
-        if N_live == 0:
-            output.zero_()
-            return output
-
-        # Precompute rel projection tensor [H, Dh, 2W+1] once (outside the kernel)
         W = 71
         rel = self._get_rel_proj(query.device, query.dtype, W)
 
         _launch_fc_fused_cache_triton(
-            query.contiguous(),                      # use raw Q; kernel adds pos biases
+            query.contiguous(),
             key_cache,
             value_cache,
             attn_metadata,
@@ -735,10 +704,9 @@ class FastConformerRPEImpl(AttentionImpl):
             rel.contiguous(),
             output,
         )
-
-        # Zero remaining tokens beyond live
         if output.shape[0] > N_live:
             output[N_live:].zero_()
+
         return output
 
     def _forward_v3(
