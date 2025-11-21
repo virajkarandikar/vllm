@@ -84,7 +84,7 @@ def remove_all(lst: list, items_to_remove: set) -> list:
     if len(items_to_remove) == 1:
         # Fast path for single item removal (most common case)
         item = next(iter(items_to_remove))
-        with contextlib.suppress(ValueError):
+        with contextlib.suppress(ValueError, KeyError):
             lst.remove(item)
         return lst
     # For multiple items, use list comprehension
