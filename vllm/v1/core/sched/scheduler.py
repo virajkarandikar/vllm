@@ -1882,6 +1882,9 @@ class Scheduler(SchedulerInterface):
         # Remove all requests from queues at once for better efficiency
         if running_requests_to_remove:
             self.running = remove_all(self.running, running_requests_to_remove)
+            if self.await_inputs:
+                request_ids_to_remove = {r.request_id for r in running_requests_to_remove}
+                self.waiting_input = remove_all(self.waiting_input, request_ids_to_remove)
         if waiting_requests_to_remove:
             self.waiting.remove_requests(waiting_requests_to_remove)
             self.skipped_waiting.remove_requests(waiting_requests_to_remove)
