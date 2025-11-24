@@ -3,32 +3,32 @@
 from dataclasses import dataclass
 
 import torch
-import xxhash
 
 from vllm.attention.backends.abstract import AttentionBackend, AttentionMetadata
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import (
+    AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
     compute_causal_conv1d_metadata,
 )
-from typing import Optional
+from typing import ClassVar, Optional
 
 logger = init_logger(__name__)
 
 
-class FastConformerBackend(AttentionBackend):
+class FastConformerConvBackend(AttentionBackend):
     @staticmethod
     def get_metadata_cls() -> type["AttentionMetadata"]:
-        return FastConformerMetadata
+        return FastConformerConvMetadata
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
-    def get_builder_cls() -> type["FastConformerMetadataBuilder"]:
-        return FastConformerMetadataBuilder
+    def get_builder_cls() -> type["FastConformerConvMetadataBuilder"]:
+        return FastConformerConvMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -44,7 +44,7 @@ class FastConformerBackend(AttentionBackend):
 
 
 @dataclass
-class FastConformerMetadata:
+class FastConformerConvMetadata:
     num_reqs: int # num_seqs
     query_start_loc: torch.Tensor # [num_seqs+1]
     slot_mapping: torch.Tensor # [num_seqs]
@@ -56,43 +56,24 @@ class FastConformerMetadata:
     token_chunk_offset_ptr: Optional[torch.Tensor] = None
 
 
-class FastConformerMetadataBuilder(AttentionMetadataBuilder):
+class FastConformerConvMetadataBuilder(AttentionMetadataBuilder):
+    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-        self._max_buffer_size = 1024
-        self._causal_conv1d_metadata_cache = {}
-
-    def _hash_query_start_loc(self, query_start_loc_cpu: torch.Tensor) -> int:
-        a = query_start_loc_cpu.to(torch.int64).contiguous().numpy()
-        mv = memoryview(a)
-        return xxhash.xxh64(mv).intdigest()
-
-    def _get_causal_conv1d_metadata(self, query_start_loc_cpu: torch.Tensor):
-        hash_value = self._hash_query_start_loc(query_start_loc_cpu)
-        if hash_value in self._causal_conv1d_metadata_cache:
-            return self._causal_conv1d_metadata_cache[hash_value]
-        else:
-            nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
-                query_start_loc_cpu,
-            )
-            if len(self._causal_conv1d_metadata_cache) < self._max_buffer_size:
-                self._causal_conv1d_metadata_cache[hash_value] = (nums_dict, batch_ptr, token_chunk_offset_ptr)
-            return nums_dict, batch_ptr, token_chunk_offset_ptr
 
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
-    ) -> FastConformerMetadata:
+    ) -> FastConformerConvMetadata:
         # for causal_conv1d
-        nums_dict, batch_ptr, token_chunk_offset_ptr = self._get_causal_conv1d_metadata(
-            common_attn_metadata.query_start_loc_cpu,
+        nums_dict, batch_ptr, token_chunk_offset_ptr = compute_causal_conv1d_metadata(
+            common_attn_metadata.query_start_loc,
         )
-
-        return FastConformerMetadata(
+        return FastConformerConvMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=common_attn_metadata.slot_mapping,

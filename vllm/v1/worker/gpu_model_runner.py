@@ -2047,6 +2047,7 @@ class GPUModelRunner(
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
         # TODO: this probably isn't optimal
+        # TODO: I don't think doc_ids is needed. verify later
         doc_ids_np = np.empty(total_num_scheduled_tokens, dtype=np.int32)
         for doc_idx in range(num_reqs):
             start = self.query_start_loc.np[doc_idx]

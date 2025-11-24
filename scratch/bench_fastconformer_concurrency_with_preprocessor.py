@@ -68,8 +68,8 @@ async def run_request(
             raise RuntimeError("Stream ended before first output")
 
         for i in range(1, steps):
-            t0 = time.perf_counter()
             chunk = build_preproc_input(i)
+            t0 = time.perf_counter()
             pkt = run_preproc_forward(chunk)
             await engine.append_request(request_id=request_id, input_embeds=pkt)
             try:

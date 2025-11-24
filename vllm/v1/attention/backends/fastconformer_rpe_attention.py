@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Optional
+from typing import ClassVar, Optional
 import math
 import torch
 import torch.nn.functional as F
@@ -11,6 +11,7 @@ import triton.language as tl
 from vllm.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
 reshape_and_cache_flash = triton_reshape_and_cache_flash
 
+from vllm.v1.attention.backends.utils import AttentionCGSupport
 from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
@@ -398,6 +399,8 @@ class FastConformerRPEBackend(AttentionBackend):
 
 
 class FastConformerRPEMetadataBuilder(AttentionMetadataBuilder[FastConformerRPEMetadata]):
+    cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,

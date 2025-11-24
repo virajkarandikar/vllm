@@ -17,9 +17,9 @@ from vllm.attention.layer import Attention
 from vllm.sequence import IntermediateTensors
 from vllm.compilation.decorators import support_torch_compile
 
-from vllm.v1.attention.backends.fastconformer_attn import (
-    FastConformerBackend,
-    FastConformerMetadata,
+from vllm.v1.attention.backends.fastconformer_conv import (
+    FastConformerConvBackend,
+    FastConformerConvMetadata,
 )
 from vllm.forward_context import get_forward_context
 from vllm.attention.backends.abstract import AttentionBackend
@@ -39,6 +39,7 @@ import math
 # TODO: This module is incomplete. It was originally designed to replicate the NeMo subsampler
 # but we've temporarily decided to run the subsampler outside of vLLM to avoid needing to implement
 # custom BT-dim input support, among other issues, e.g. https://nvidia.slack.com/archives/C09F9RY43R6/p1762350015386069
+
 class NemoSubsample8x2D(nn.Module):
     def __init__(self, d_out: int, mid_ch: int, mels: int):
         super().__init__()
@@ -344,7 +345,7 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
                 out = out.squeeze(0)
             return out
 
-        attn_metadata: FastConformerMetadata = attn_meta_all[self.prefix]
+        attn_metadata: FastConformerConvMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
@@ -401,7 +402,7 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
         conv_bias = self.dw.bias
         pre_dw_2d = pre_dw.transpose(0, 1)
 
-        attn_metadata: FastConformerMetadata = attn_meta_all[self.prefix]
+        attn_metadata: FastConformerConvMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
@@ -432,7 +433,7 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
         return y_out
 
     def get_attn_backend(self) -> AttentionBackend:
-        return FastConformerBackend
+        return FastConformerConvBackend
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
@@ -489,6 +490,7 @@ class ConformerBlock(nn.Module):
         self.ff2 = ConformerFFN(d_model, ff_mult)
         self.ln_out = nn.LayerNorm(d_model)
         self.fc_factor = 0.5
+        self.prefix = prefix
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.ln_ff1(x)
@@ -604,8 +606,8 @@ class FastConformerCTC(nn.Module):
         #     )
         # x, _ = self.subsample(x, length, dummy=True)
 
-        # xscale = math.sqrt(self.d_model)
-        # x = (x * xscale)
+        xscale = math.sqrt(self.d_model)
+        x = (x * xscale)
 
         for _, blk in enumerate(self.blocks):
             x = blk(x)
