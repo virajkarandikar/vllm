@@ -375,7 +375,6 @@ class FlexAttentionMetadata:
     physical_to_logical: torch.Tensor
     decode_offset: torch.Tensor
     num_blocks_per_seq: torch.Tensor
-    doc_ids: torch.Tensor
 
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
@@ -386,6 +385,7 @@ class FlexAttentionMetadata:
     score_mod: _score_mod_signature | None = None
     logical_mask_mod: _mask_mod_signature = causal_mask_mod
     uses_paged_kv: bool = True
+    doc_ids: Optional[torch.Tensor] = None
     direct_build: bool = True
     q_block_size: int = 16
     kv_block_size: int = 16
@@ -732,16 +732,16 @@ class FlexAttentionMetadata:
         assert self.prefix_kv_lens is None, "Not implemented yet."
         assert self.suffix_kv_lens is None, "Not implemented yet."
         # Create a lookup mapping from query indices -> request number
-        # self.doc_ids = _offsets_to_doc_ids_tensor(self.query_start_loc)
+        self.doc_ids = _offsets_to_doc_ids_tensor(self.query_start_loc)
         self.num_blocks = self.total_cache_tokens // self.block_size
 
-        # self.mask_mod = self.get_mask_mod()
-        # self.transformed_score_mod = self.get_transformed_score_mod()
+        self.mask_mod = self.get_mask_mod()
+        self.transformed_score_mod = self.get_transformed_score_mod()
 
-        # if self.direct_build and self.causal:
-        #     self.block_mask = self._build_block_mask_direct()
-        # else:
-        #     self.block_mask = self.build_block_mask()
+        if self.direct_build and self.causal:
+            self.block_mask = self._build_block_mask_direct()
+        else:
+            self.block_mask = self.build_block_mask()
 
 class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
@@ -875,16 +875,15 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         block_size = self.kv_cache_spec.block_size
         max_possible_seq_len = self.model_config.max_model_len
         num_gpu_blocks = self.cache_config.num_gpu_blocks
-        num_gpu_blocks = 1
 
-        # assert num_gpu_blocks is not None, (
-        #     "FlexAttention requires num_gpu_blocks to be set"
-        # )
+        assert num_gpu_blocks is not None, (
+            "FlexAttention requires num_gpu_blocks to be set"
+        )
         total_cache_tokens = num_gpu_blocks * block_size
 
-        # inverse_block_table = physical_to_logical_mapping(
-        #     block_table_tensor, seq_lens, block_size, num_gpu_blocks
-        # )
+        inverse_block_table = physical_to_logical_mapping(
+            block_table_tensor, seq_lens, block_size, num_gpu_blocks
+        )
 
         offset_tensor = common_attn_metadata.compute_num_computed_tokens()
         offset_tensor = copy_to_persistent(self.persistent_offset_tensor, offset_tensor)
@@ -902,7 +901,6 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
-            doc_ids=common_attn_metadata.doc_ids,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
             block_table=block_table_tensor,
@@ -915,8 +913,7 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             block_size=block_size,
             max_possible_sequence_length=max_possible_seq_len,
             num_reqs=num_reqs,
-            # physical_to_logical=inverse_block_table,
-            physical_to_logical=None,
+            physical_to_logical=inverse_block_table,
             total_cache_tokens=total_cache_tokens,
             decode_offset=offset_tensor,
             num_blocks_per_seq=num_blocks_per_seq,
