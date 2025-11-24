@@ -58,31 +58,91 @@ def _build_nemo_from_config(model_dir: str, dtype: torch.dtype):
 
 
 @torch.no_grad()
-def _nemo_full_prefill_outputs(nemo_enc: torch.nn.Module, seq_inputs: torch.Tensor) -> torch.Tensor:
-    assert seq_inputs.dim() == 2, f"Expected [T, D], got {seq_inputs.shape}"
-    T, D = seq_inputs.shape
-    audio_signal = seq_inputs.unsqueeze(0).contiguous()  # [1, T, D]
-    length = torch.tensor([T], dtype=torch.long, device=audio_signal.device)
+def _nemo_full_prefill_outputs_batched(nemo_enc: torch.nn.Module, seq_inputs: torch.Tensor) -> torch.Tensor:
+    """
+    seq_inputs: [B, T, D]
+    returns: [B, T, D]
+    """
+    assert seq_inputs.dim() == 3, f"Expected [B, T, D], got {seq_inputs.shape}"
+    B, T, D = seq_inputs.shape
+    audio_signal = seq_inputs.contiguous()  # [B, T, D]
+    length = torch.full((B,), T, dtype=torch.long, device=audio_signal.device)
     encoded, _ = nemo_enc(
         audio_signal=audio_signal,
         length=length,
         bypass_pre_encode=True,
     )
-    # convert [1, D, T] to [T, D]
-    return encoded.transpose(1, 2).contiguous().squeeze(0)
+    # convert [B, D, T] to [B, T, D]
+    return encoded.transpose(1, 2).contiguous()
 
+async def _run_stream(
+    worker_id: int,
+    engine,
+    sampling_params,
+    seq_inputs_1t: torch.Tensor,   # [T, D]
+    nemo_ref_1t: torch.Tensor,     # [T, D]
+    first_packet_len: int = 1,
+):
+    from vllm.inputs.data import EmbedsPrompt
+
+    assert seq_inputs_1t.dim() == 2 and nemo_ref_1t.dim() == 2
+    STEPS, D_IN = seq_inputs_1t.shape
+    req_id = f"fastconformer-correctness-w{worker_id}"
+
+    diffs_l2: list[float] = []
+    diffs_max_abs: list[float] = []
+
+    gen_iter = engine.generate(
+        request_id=req_id,
+        prompt=EmbedsPrompt(prompt_embeds=seq_inputs_1t[:first_packet_len, :].contiguous()),
+        sampling_params=sampling_params,
+        is_streaming=True,
+    )
+
+    try:
+        first_out = await gen_iter.__anext__()
+        hs = first_out.outputs[0].hidden_states[-1]
+        if hs.dim() == 2:
+            hs = hs[-1:, :]
+        ref = nemo_ref_1t[first_packet_len - 1:first_packet_len, :]
+        l2 = torch.norm(hs - ref).item()
+        max_abs = torch.max(torch.abs(hs - ref)).item()
+        diffs_l2.append(l2)
+        diffs_max_abs.append(max_abs)
+        print(f"[worker {worker_id} | step {first_packet_len-1}] l2={l2:.6e} | max_abs={max_abs:.6e}")
+    except StopAsyncIteration:
+        raise RuntimeError(f"Worker {worker_id}: stream ended before first output")
+
+    for i in range(first_packet_len, STEPS):
+        pkt = seq_inputs_1t[i:i+1, :].contiguous()
+        await engine.append_request(request_id=req_id, input_embeds=pkt)
+        try:
+            out = await gen_iter.__anext__()
+        except StopAsyncIteration:
+            break
+        hs = out.outputs[0].hidden_states[-1]
+        if hs.dim() == 2:
+            hs = hs[-1:, :]
+        ref = nemo_ref_1t[i:i+1, :]
+        l2 = torch.norm(hs - ref).item()
+        max_abs = torch.max(torch.abs(hs - ref)).item()
+        diffs_l2.append(l2)
+        diffs_max_abs.append(max_abs)
+        print(f"[worker {worker_id} | step {i}] l2={l2:.6e} | max_abs={max_abs:.6e}")
+
+    return diffs_l2, diffs_max_abs
 
 async def main():
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
     from vllm.sampling_params import SamplingParams
-    from vllm.inputs.data import EmbedsPrompt
 
     parser = argparse.ArgumentParser(description="vLLM FastConformer correctness (single run)")
     parser.add_argument("--model", type=str, default="/home/scratch.jdaw_coreai/landrew/fastconformer_hf/")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--dtype", type=str, default="float32")
     parser.add_argument("--eager", action="store_true")
+    parser.add_argument("--num_streams", type=int, default=2, help="Number of concurrent streams to run")
     args = parser.parse_args()
 
     DTYPE = _get_dtype(args.dtype)
@@ -98,11 +158,12 @@ async def main():
     torch.manual_seed(0)
     STEPS = int(args.steps)
     D_IN = d_model
-    seq_inputs = torch.randn(STEPS, D_IN, dtype=DTYPE)
+    NUM_STREAMS = args.num_streams
+    seq_inputs = torch.randn(NUM_STREAMS, STEPS, D_IN, dtype=DTYPE)  # [B, T, D]
 
     nemo_enc = nemo_enc.to(device="cuda", dtype=DTYPE)
     with torch.no_grad():
-        nemo_prefill_out = _nemo_full_prefill_outputs(nemo_enc, seq_inputs.cuda()).cpu()  # [T, D]
+        nemo_prefill_out = _nemo_full_prefill_outputs_batched(nemo_enc, seq_inputs.cuda()).cpu()  # [B, T, D]
 
     engine_args = AsyncEngineArgs(
         model=args.model,
@@ -119,57 +180,35 @@ async def main():
     )
     engine = AsyncLLM.from_engine_args(engine_args)
 
-    req_id = "fastconformer-correctness"
+    sampling_params = SamplingParams(max_tokens=STEPS)
     first_packet_len = 1
 
-    diffs_l2: list[float] = []
-    diffs_max_abs: list[float] = []
+    tasks = []
+    for b in range(NUM_STREAMS):
+        tasks.append(
+            _run_stream(
+                worker_id=b,
+                engine=engine,
+                sampling_params=sampling_params,
+                seq_inputs_1t=seq_inputs[b],
+                nemo_ref_1t=nemo_prefill_out[b],
+                first_packet_len=first_packet_len,
+            )
+        )
 
-    first_packet = seq_inputs[:first_packet_len, :].contiguous()
-    gen_iter = engine.generate(
-        request_id=req_id,
-        prompt=EmbedsPrompt(prompt_embeds=first_packet),
-        sampling_params=SamplingParams(max_tokens=STEPS),
-        is_streaming=True,
-    )
+    streams_results = await torch.asyncio.gather(*tasks) if hasattr(torch, "asyncio") else await __import__("asyncio").gather(*tasks)
 
-    try:
-        first_out = await gen_iter.__anext__()
-        hs = first_out.outputs[0].hidden_states[-1]
-        if hs.dim() == 2:
-            hs = hs[-1:, :]
-        ref = nemo_prefill_out[first_packet_len - 1:first_packet_len, :]
-        l2 = torch.norm(hs - ref).item()
-        max_abs = torch.max(torch.abs(hs - ref)).item()
-        diffs_l2.append(l2)
-        diffs_max_abs.append(max_abs)
-        print(f"[compare step {first_packet_len-1}] l2={l2:.6e} | max_abs={max_abs:.6e}")
-    except StopAsyncIteration:
-        print("Stream ended before first output")
-        return
+    diffs_l2_all: list[float] = []
+    diffs_max_abs_all: list[float] = []
+    for (dl2, dmax) in streams_results:
+        diffs_l2_all.extend(dl2)
+        diffs_max_abs_all.extend(dmax)
 
-    for i in range(first_packet_len, STEPS):
-        pkt = seq_inputs[i:i+1, :].contiguous()
-        await engine.append_request(request_id=req_id, input_embeds=pkt)
-        try:
-            out = await gen_iter.__anext__()
-        except StopAsyncIteration:
-            break
-
-        hs = out.outputs[0].hidden_states[-1]
-        if hs.dim() == 2:
-            hs = hs[-1:, :]
-        ref = nemo_prefill_out[i:i+1, :]
-        l2 = torch.norm(hs - ref).item()
-        max_abs = torch.max(torch.abs(hs - ref)).item()
-        diffs_l2.append(l2)
-        diffs_max_abs.append(max_abs)
-        print(f"[compare step {i}] l2={l2:.6e} | max_abs={max_abs:.6e}")
-
-    d = np.array(diffs_l2)
-    m = np.array(diffs_max_abs)
-    print("diffs vs NeMo prefill (vLLM last-token hidden state vs NeMo prefill output at t):")
-    print(f"steps compared:   {len(diffs_l2)}")
+    d = np.array(diffs_l2_all)
+    m = np.array(diffs_max_abs_all)
+    print("\ndiffs vs NeMo prefill (vLLM last-token hidden state vs NeMo prefill output at t) across all streams:")
+    print(f"streams compared: {NUM_STREAMS}")
+    print(f"total steps compared:   {len(diffs_l2_all)}")
     print(f"L2 mean:          {d.mean():.6e}")
     print(f"L2 p50/p90:       {np.percentile(d,50):.6e} / {np.percentile(d,90):.6e}")
     print(f"L2 min/max:       {d.min():.6e} / {d.max():.6e}")
