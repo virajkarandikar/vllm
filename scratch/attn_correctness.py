@@ -106,7 +106,7 @@ async def main():
 
         torch.manual_seed(0)
         seq_inputs = torch.randn(STEPS, D_IN, dtype=DTYPE)
-        first_packet_len = 1
+        first_packet_len = 10
         first_packet = seq_inputs[:first_packet_len, :].contiguous()
 
         cfg = json.load(open(os.path.join(model_dir, "config.json"), "r"))
