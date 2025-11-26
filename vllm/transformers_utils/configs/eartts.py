@@ -57,6 +57,10 @@ class EarTTSConfig(PretrainedConfig):
         max_char_len: int = 128,
         emb_char_vocab_size: int = 256,
         emb_vocab_size: int = 151936,
+        pretrained_tokenizer_name: str = "nvidia/NVIDIA-Nemotron-Nano-9B-v2",
+        use_subword_flag_emb: bool = True,
+        use_bos_eos_emb: bool = True,
+        use_gated_fusion_for_text_audio: bool = True,
         **kwargs,
     ):
         # gemma 3 config
@@ -107,6 +111,11 @@ class EarTTSConfig(PretrainedConfig):
         self.max_char_len = max_char_len
         self.emb_char_vocab_size = emb_char_vocab_size
         self.emb_vocab_size = emb_vocab_size
+
+        self.pretrained_tokenizer_name = pretrained_tokenizer_name
+        self.use_subword_flag_emb = use_subword_flag_emb
+        self.use_bos_eos_emb = use_bos_eos_emb
+        self.use_gated_fusion_for_text_audio = use_gated_fusion_for_text_audio
         
         super().__init__(**kwargs)
 

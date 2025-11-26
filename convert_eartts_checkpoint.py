@@ -36,7 +36,6 @@ def main():
     cfg.model.tts_config.disable_eos_prediction = True
     cfg.model.inference_force_speech_silence_on_eos = True
     cfg.model.use_word_sep_tokenizer = False
-    cfg.model.tts_config.use_subword_flag_emb = False
     cfg.model.num_delay_speech_tokens = 0
     cfg.data.source_sample_rate = 22050
     cfg.data.target_sample_rate = 22050
@@ -83,6 +82,13 @@ def main():
     # embedding transformer has a lot of weights
     for key, weight in weights.items():
         if "tts_model.embed_subword" in key:
+            key = key[len("tts_model.") :]
+            # bos_eos_emb and subword_flag_emb are moved outside embed_subword
+            if key.startswith("embed_subword.bos_eos_emb.") or key.startswith("embed_subword.subword_flag_emb."):
+                key = key[len("embed_subword."):]
+            embedding_module_weights[key] = weight
+    for key, weight in weights.items():
+        if "tts_model.gated_fusion_audio_text" in key:
             key = key[len("tts_model.") :]
             embedding_module_weights[key] = weight
     embedding_module_weights["embed_subword.embed_subwords.weight"] = (
@@ -158,6 +164,12 @@ def main():
     flat_config["emb_vocab_size"] = vocab_size
     flat_config["emb_char_vocab_size"] = len(char_vocab)
     flat_config["max_char_len"] = max_char_len
+
+    # configuration of flag embeddings
+    flat_config["pretrained_tokenizer_name"] = cfg.model.tts_config.cas_config.pretrained_tokenizer_name
+    flat_config["use_subword_flag_emb"] = cfg.model.tts_config.use_subword_flag_emb
+    flat_config["use_bos_eos_emb"] = cfg.model.tts_config.use_bos_eos_emb
+    flat_config["use_gated_fusion_for_text_audio"] = cfg.model.tts_config.use_gated_fusion_for_text_audio
 
     # configuring custom inputs/outputs
     flat_config["custom_input_specs"] = [

@@ -13,7 +13,7 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
     TopKLogitsWarper,
 )
-from transformers import AutoConfig
+from transformers import AutoConfig, AutoTokenizer
 
 from vllm.model_executor.models.gemma3 import Gemma3Model
 from vllm.config import VllmConfig
@@ -76,6 +76,144 @@ class MLPLayer(nn.Module):
         y = self.post_norm(y)
         x = x + y
         return x
+
+
+class GatedProjectedSumRMSNorm(nn.Module):
+    def __init__(self, audio_dim, text_dim, hidden_dim, final_norm=True, num_codebooks=31, init_residual_scale=0.5):
+        super().__init__()
+        self.num_codebooks = num_codebooks
+
+        self.audio_proj = nn.Linear(audio_dim, hidden_dim)
+        self.text_proj = nn.Linear(text_dim, hidden_dim)
+
+        nn.init.normal_(self.audio_proj.weight, mean=0.0, std=0.015)
+        nn.init.zeros_(self.audio_proj.bias)
+        nn.init.normal_(self.text_proj.weight, mean=0.0, std=0.015)
+        nn.init.zeros_(self.text_proj.bias)
+
+        # FP32 gate params
+        self.gate = nn.Parameter(torch.zeros(hidden_dim, dtype=torch.float32), requires_grad=False)
+        self.residual_scale = nn.Parameter(torch.tensor(init_residual_scale, dtype=torch.float32), requires_grad=False)
+
+        self.final_norm = RMSNorm(hidden_dim) if final_norm else nn.Identity()
+
+    def forward(self, audio_emb, text_emb):
+        audio_emb = audio_emb / self.num_codebooks
+
+        # projections run in model dtype (BF16)
+        audio_h = self.audio_proj(audio_emb)
+        text_h = self.text_proj(text_emb)
+
+        dtype = audio_h.dtype
+
+        gate = torch.sigmoid(self.gate)  # FP32
+        res = torch.sigmoid(self.residual_scale)  # FP32
+
+        h = gate.to(dtype) * audio_h + (1 - gate).to(dtype) * text_h
+        h = res.to(dtype) * h
+        h = self.final_norm(h.float()).to(dtype)
+
+        return h
+
+
+class SubwordFlagEmbedding(nn.Module):
+    """
+    Adds a small continuation embedding for subwords (tokens without word-boundary marker).
+    Automatically adds a custom padding token at index vocab_size.
+    Ignores special tokens (starting with '<') when computing continuation flags.
+    """
+
+    def __init__(self, model_name: str, d_model: int):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.vocab_size = self.tokenizer.vocab_size
+        self.d_model = d_model
+
+        # Custom pad token at vocab_size
+        self.pad_id = self.vocab_size
+        # register pad_id as a tensor buffer to avoid device issues
+        self.pad_tensor = nn.Parameter(torch.tensor(self.pad_id, dtype=torch.long), requires_grad=False)
+
+        # Precompute continuation flags
+        tokens = [self.tokenizer.convert_ids_to_tokens(i) for i in range(self.vocab_size)]
+        cont_flags = [
+            1 if not (tok.startswith("Ġ") or tok.startswith("▁") or tok.startswith("<")) else 0 for tok in tokens
+        ]
+        cont_flags.append(0)  # for the custom pad token
+        self.is_continuation = nn.Parameter(torch.tensor(cont_flags, dtype=torch.long), requires_grad=False)
+
+        # Continuation embedding
+        init_std = self.d_model**-0.5
+        self.cont_emb = nn.Embedding(2, self.d_model)
+        nn.init.normal_(self.cont_emb.weight, mean=0.0, std=init_std)
+        self.cont_emb.weight.data[0].zero_()
+
+    def forward(self, subword_embeds: torch.Tensor, token_ids: torch.LongTensor):
+        # Replace OOV token IDs with pad_id safely
+        token_ids_clamped = torch.where(token_ids >= self.vocab_size, self.pad_tensor, token_ids)
+        # Continuation flags
+        cont_flags = self.is_continuation[token_ids_clamped]
+        # Add continuation embedding
+        cont_emb = self.cont_emb(cont_flags)
+        return subword_embeds + cont_emb
+
+
+class BOSEOSEmbedding(nn.Module):
+    """
+    Adds independent embeddings for BOS and EOS tokens using a single embedding table.
+    Index 0 = regular token (ignored), 1 = BOS, 2 = EOS.
+    Compatible with Hugging Face tokenizers that may or may not have BOS/EOS.
+    """
+
+    def __init__(self, model_name: str, d_model: int):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        # vocab size that includes special tokens
+        vocab_dict = self.tokenizer.get_vocab()
+        self.vocab_size = max(vocab_dict.values())
+        self.d_model = d_model
+
+        # Custom pad token for OOVs
+        self.pad_id = self.vocab_size
+        self.pad_tensor = nn.Parameter(torch.tensor(self.pad_id, dtype=torch.long), requires_grad=False)
+
+        # Identify BOS and EOS tokens (may be None)
+        tokens = [self.tokenizer.convert_ids_to_tokens(i) for i in range(self.vocab_size)]
+
+        if 'Qwen2.5' in model_name:
+            # For Qwen, '<|im_start|>' is a common choice for a BOS token.
+            # You can check your tokenizer's vocabulary for the best candidate.
+            print("Tokenizer does not have a `bos_token`. Setting it to '<|im_start|>'.", flush=True)
+            self.tokenizer.bos_token = '<|im_start|>'
+            self.tokenizer.eos_token = '<|im_end|>'
+
+        special_flags = []
+        for tok in tokens:
+            if self.tokenizer.bos_token is not None and tok == self.tokenizer.bos_token:
+                special_flags.append(1)
+            elif self.tokenizer.eos_token is not None and tok == self.tokenizer.eos_token:
+                special_flags.append(2)
+            else:
+                special_flags.append(0)
+        special_flags.append(0)  # for custom pad token
+        self.special_flags = nn.Parameter(torch.tensor(special_flags, dtype=torch.long), requires_grad=False)
+        # Embedding table: 0 = regular, 1 = BOS, 2 = EOS
+        init_std = self.d_model**-0.5
+        self.special_emb = nn.Embedding(3, d_model)
+        nn.init.normal_(self.special_emb.weight, mean=0.0, std=init_std)
+        self.special_emb.weight.data[0].zero_()  # regular tokens ignored
+
+    def forward(self, token_embeds: torch.Tensor, token_ids: torch.LongTensor):
+        """
+        token_embeds: (B, T, d_model)
+        token_ids:    (B, T)
+        """
+        # Clamp OOVs to custom pad token
+        safe_ids = torch.where(token_ids >= self.vocab_size, self.pad_tensor, token_ids)
+
+        # Lookup flags (0=regular, 1=BOS, 2=EOS)
+        flags = self.special_flags[safe_ids]
+        return token_embeds + self.special_emb(flags)
 
 
 class CharAwareSubwordEncoder(nn.Module):
@@ -189,6 +327,19 @@ class EarTTSInputEmbedding(nn.Module):
         )
         self.bos_emb = nn.Parameter(torch.empty(hidden_size))
 
+        self.use_subword_flag_emb = config.use_subword_flag_emb
+        pretrained_tokenizer_name = config.pretrained_tokenizer_name
+        if self.use_subword_flag_emb:
+            self.subword_flag_emb = SubwordFlagEmbedding(pretrained_tokenizer_name, hidden_size)
+        self.use_bos_eos_emb = config.use_bos_eos_emb
+        if self.use_bos_eos_emb:
+            self.bos_eos_emb = BOSEOSEmbedding(pretrained_tokenizer_name, hidden_size)
+        self.use_gated_fusion_for_text_audio = config.use_gated_fusion_for_text_audio
+        if self.use_gated_fusion_for_text_audio:
+            self.gated_fusion_audio_text = GatedProjectedSumRMSNorm(
+                hidden_size, hidden_size, hidden_size, config.num_quantizers
+            )
+
     def forward(
         self,
         acoustic_tokens: torch.Tensor,
@@ -208,19 +359,27 @@ class EarTTSInputEmbedding(nn.Module):
             embedding of shape (BT x dim)
         """
 
-        acoustic_tokens = acoustic_tokens.transpose(0, 1)  # 31 x BT
-        audio_emb = sum(emb(acoustic_tokens[i]) for i, emb in enumerate(self.rvq_embs))  # BT x latent_size
-        audio_emb = self.embed_code(audio_emb)  # BT x hidden_size
-
         # prepare bos emb that is applied to audio embedding
         bos_emb = bos_mask.unsqueeze(1) * self.bos_emb  # BT x dim
+
+        acoustic_tokens = acoustic_tokens.transpose(0, 1)  # 31 x BT
+        audio_emb = sum(emb(acoustic_tokens[i]) for i, emb in enumerate(self.rvq_embs))  # BT x latent_size
+        audio_emb = self.embed_code(audio_emb) + bos_emb  # BT x hidden_size
 
         # embed text tokens by expanding them to chars and passing through transformer
         # apply the mask that turns this embedding to zeros for prefill tokens
         text_emb = self.embed_subword(text_tokens) * text_mask.unsqueeze(1)  #  BT x dim
+        # update text embeddings with flags
+        if self.use_subword_flag_emb:
+            text_emb = self.subword_flag_emb(text_emb, text_tokens)
+        if self.use_bos_eos_emb:
+            text_emb = self.bos_eos_emb(text_emb, text_tokens)
 
         # prepare total embedding by adding all components
-        total_emb = audio_emb + text_emb + bos_emb  # BT x dim
+        if self.use_gated_fusion_for_text_audio:
+            total_emb = self.gated_fusion_audio_text(audio_emb, text_emb)
+        else:
+            total_emb = audio_emb + text_emb  # BT x dim
         return total_emb
 
 
