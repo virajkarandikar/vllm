@@ -36,53 +36,6 @@ from vllm.transformers_utils.configs.fastconformer import FastConformerCTCConfig
 import math
 
 
-# TODO: This module is incomplete. It was originally designed to replicate the NeMo subsampler
-# but we've temporarily decided to run the subsampler outside of vLLM to avoid needing to implement
-# custom BT-dim input support, among other issues, e.g. https://nvidia.slack.com/archives/C09F9RY43R6/p1762350015386069
-
-class NemoSubsample8x2D(nn.Module):
-    def __init__(self, d_out: int, mid_ch: int, mels: int):
-        super().__init__()
-        self.mels = mels
-        self.mid_ch = mid_ch
-        self.act = nn.ReLU()
-
-        self.pad = nn.ConstantPad2d((2, 1, 2, 1), 0)
-
-        self.conv0 = nn.Conv2d(1, self.mid_ch, kernel_size=3, stride=(2, 2), padding=0)
-
-        self.conv2 = nn.Conv2d(self.mid_ch, self.mid_ch, kernel_size=3, stride=(2, 2),
-                               padding=0, groups=self.mid_ch)
-        self.conv3 = nn.Conv2d(self.mid_ch, self.mid_ch, kernel_size=1, stride=1, padding=0)
-
-        self.conv5 = nn.Conv2d(self.mid_ch, self.mid_ch, kernel_size=3, stride=(2, 2),
-                               padding=0, groups=self.mid_ch)
-        self.conv6 = nn.Conv2d(self.mid_ch, self.mid_ch, kernel_size=1, stride=1, padding=0)
-
-        self.out = nn.Linear(self.mid_ch * 11, d_out)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, F]
-        B, T, F = x.shape
-        assert F == self.mels, f"Expected mel dim {self.mels}, got {F}"
-
-        y = x.view(B, 1, T, F)
-        y = self.act(self.conv0(self.pad(y)))     # stage 0
-
-        y = self.conv2(self.pad(y))               # depthwise
-        y = self.act(self.conv3(y))               # pointwise + act
-
-        y = self.conv5(self.pad(y))               # depthwise
-        y = self.act(self.conv6(y))               # pointwise + act
-
-        B, C, T8, Fp = y.shape
-        if C * Fp != 2816:  # should be 256 * 11
-            raise RuntimeError(f"Subsampler produced C*F'={C}*{Fp}={C*Fp}, expected 2816.")
-
-        y = y.permute(0, 2, 1, 3).contiguous().view(B, T8, C * Fp)  # [B, T/8, 256*11]
-        y = self.out(y)                                            # [B, T/8, d_out]
-        return y
-
 class ConformerFFN(nn.Module):
     """Conformer FeedForward module."""
     def __init__(self, d_model: int, ff_mult: int = 4):
@@ -527,28 +480,6 @@ class FastConformerCTC(nn.Module):
         self.d_model = config.d_model
         self.dtype = vllm_config.model_config.dtype
 
-        self.vocab_size = config.ctc.get("vocab_size")
-        assert self.vocab_size is not None, "config missing vocab_size"
-        self.blank_id = config.blank_id
-
-        subs = config.subsampling or {}
-        assert subs.get("type", "dw_striding") == "dw_striding", "Only 'dw_striding' subsampling is implemented"
-        assert subs.get("factor", 8) == 8, "Only 8x subsampling is assumed"
-        assert subs.get("channels", 256) == 256, "Only 256 channels are supported"
-        mid_ch = subs.get("channels", 256)
-
-        # TODO: see comment above the NemoSubsample8x2D class
-        # self.subsample = NemoSubsample8x2D(d_out=self.d_model, mid_ch=mid_ch, mels=80)
-        from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling
-        self.subsample = ConvSubsampling(
-            subsampling="dw_striding",
-            subsampling_factor=8,
-            feat_in=80,
-            feat_out=self.d_model,
-            conv_channels=mid_ch,
-            is_causal=True,
-        ).to(self.dtype).eval()
-
         att_window = int(config.att_left_ctx + config.att_right_ctx)
         assert att_window > 0, "att_window must be positive"
 
@@ -569,8 +500,6 @@ class FastConformerCTC(nn.Module):
             for i in range(config.n_layers)
         ])
 
-        self.proj = nn.Linear(self.d_model, self.vocab_size)
-
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         raise Exception("not applicable for this model")
 
@@ -588,9 +517,10 @@ class FastConformerCTC(nn.Module):
         input_ids: Optional[torch.Tensor] = None,            # unused
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        proc_melspec: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert inputs_embeds is not None, "inputs_embeds must be provided as [T, F]"
-        x = inputs_embeds
+        assert proc_melspec is not None, "proc_melspec must be provided as [T, F]"
+        x = proc_melspec
         assert x.dim() == 2, f"expected [T, F], got shape {tuple(x.shape)}"
 
         # used in tests
@@ -599,26 +529,19 @@ class FastConformerCTC(nn.Module):
         if self.config.conv_only:
             return self._forward_conv_only(x)
 
-        # TODO: dummy sampler replacement, since the real sampler does not support BT input
-        # x = torch.randn(T, 512, dtype=x.dtype, device=x.device)
-        # length = x.new_full(
-        #         (x.size(0),), x.size(1), dtype=torch.int64, device=x.device
-        #     )
-        # x, _ = self.subsample(x, length, dummy=True)
-
         xscale = math.sqrt(self.d_model)
         x = (x * xscale)
 
         for _, blk in enumerate(self.blocks):
             x = blk(x)
-        return x
+        return x, x
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
     ) -> Optional[torch.Tensor]:
-        # hidden_states: [T, D]
-        return self.proj(hidden_states)  # [T, vocab]
+        # do nothing, we dont do sampling for fastconformer
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         nemo = {name: tensor for name, tensor in weights}
@@ -643,42 +566,6 @@ class FastConformerCTC(nn.Module):
                 dst_param.data.copy_(src)
             loaded_pairs.append((src_name, dst_name))
             loaded_param_names.add(dst_name)
-
-        # TODO: original sub_map used in the incomplete NemoSubsample8x2D class
-        # sub_map = [
-        #     ("encoder.pre_encode.conv.0.weight", self.subsample.conv0.weight, "subsample.conv0.weight"),
-        #     ("encoder.pre_encode.conv.0.bias",   self.subsample.conv0.bias,   "subsample.conv0.bias"),
-        #     ("encoder.pre_encode.conv.2.weight", self.subsample.conv2.weight, "subsample.conv2.weight"),
-        #     ("encoder.pre_encode.conv.2.bias",   self.subsample.conv2.bias,   "subsample.conv2.bias"),
-        #     ("encoder.pre_encode.conv.3.weight", self.subsample.conv3.weight, "subsample.conv3.weight"),
-        #     ("encoder.pre_encode.conv.3.bias",   self.subsample.conv3.bias,   "subsample.conv3.bias"),
-        #     ("encoder.pre_encode.conv.5.weight", self.subsample.conv5.weight, "subsample.conv5.weight"),
-        #     ("encoder.pre_encode.conv.5.bias",   self.subsample.conv5.bias,   "subsample.conv5.bias"),
-        #     ("encoder.pre_encode.conv.6.weight", self.subsample.conv6.weight, "subsample.conv6.weight"),
-        #     ("encoder.pre_encode.conv.6.bias",   self.subsample.conv6.bias,   "subsample.conv6.bias"),
-        #     ("encoder.pre_encode.out.weight",    self.subsample.out.weight,   "subsample.out.weight"),
-        #     ("encoder.pre_encode.out.bias",      self.subsample.out.bias,     "subsample.out.bias"),
-        # ]
-        # inside load_weights(), after nemo = {...}
-        # print([k for k in nemo if "pre_encode" in k][:50])
-        # print([k for k in nemo if "ctc" in k or "decoder" in k][:50])
-        sub_map = [
-            ("encoder.pre_encode.conv.0.weight", self.subsample.conv[0].weight, "subsample.conv.0.weight"),
-            ("encoder.pre_encode.conv.0.bias",   self.subsample.conv[0].bias,   "subsample.conv.0.bias"),
-            ("encoder.pre_encode.conv.2.weight", self.subsample.conv[2].weight, "subsample.conv.2.weight"),
-            ("encoder.pre_encode.conv.2.bias",   self.subsample.conv[2].bias,   "subsample.conv.2.bias"),
-            ("encoder.pre_encode.conv.3.weight", self.subsample.conv[3].weight, "subsample.conv.3.weight"),
-            ("encoder.pre_encode.conv.3.bias",   self.subsample.conv[3].bias,   "subsample.conv.3.bias"),
-            ("encoder.pre_encode.conv.5.weight", self.subsample.conv[5].weight, "subsample.conv.5.weight"),
-            ("encoder.pre_encode.conv.5.bias",   self.subsample.conv[5].bias,   "subsample.conv.5.bias"),
-            ("encoder.pre_encode.conv.6.weight", self.subsample.conv[6].weight, "subsample.conv.6.weight"),
-            ("encoder.pre_encode.conv.6.bias",   self.subsample.conv[6].bias,   "subsample.conv.6.bias"),
-            ("encoder.pre_encode.out.weight",    self.subsample.out.weight,   "subsample.out.weight"),
-            ("encoder.pre_encode.out.bias",      self.subsample.out.bias,     "subsample.out.bias"),
-        ]
-        for n_src, p_dst, n_dst in sub_map:
-            if n_src in nemo:
-                copy_(p_dst, nemo[n_src], n_dst, n_src)
 
         for i, blk in enumerate(self.blocks):
             base = f"encoder.layers.{i}"
@@ -769,12 +656,14 @@ class FastConformerCTC(nn.Module):
                 attn_mod.qkv_bias.copy_(b_cat)
                 attn_mod._qkv_fused_ready = True
 
+        """
         head_w = "ctc_decoder.decoder_layers.0.weight"
         head_b = "ctc_decoder.decoder_layers.0.bias"
         if head_w in nemo:
             copy_(self.proj.weight, nemo[head_w], "proj.weight", head_w)
         if head_b in nemo:
             copy_(self.proj.bias, nemo[head_b], "proj.bias", head_b)
+        """
 
         loaded_src = {src for (src, _) in loaded_pairs}
 
