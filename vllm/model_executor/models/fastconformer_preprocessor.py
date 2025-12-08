@@ -173,8 +173,12 @@ class CausalConv2D(nn.Conv2d):
         x,  # B x CH x T x F
     ):
         # pad only frequencies
+        before = x.shape
         x = F.pad(x, pad=(self._left_padding, self._right_padding))
+        print(f">>> causal conv2d padding {before} -> {x.shape}", flush=True)
+        before = x.shape
         x = super().forward(x)
+        print(f">>> causal conv2d conv {before} -> {x.shape}", flush=True)
         return x
 
 
@@ -241,7 +245,7 @@ class ConvSubsampling(nn.Module):
             )
             layers.append(activation)
 
-        self.conv = nn.Sequential(*layers)
+        self.conv = nn.ModuleList(layers)
 
         # hard code the size across frequency axis after convolutions
         # this assumes `feat_in == 80`
@@ -271,7 +275,8 @@ class ConvSubsampling(nn.Module):
         x = x.transpose(1, 2).unsqueeze(1)
 
         # Apply convolutions
-        x = self.conv(x)
+        for conv in self.conv:
+            x = conv(x)
         # Flatten and project: [B, C, T, F] -> [B, T, C*F] -> [B, T, feat_out]
         b, _, t, _ = x.size()
         x = self.out(x.transpose(1, 2).reshape(b, t, -1))
@@ -311,7 +316,9 @@ class FastConformerPreprocessor(nn.Module):
         x = torch.cat([buffer, x], dim=1)
 
         mel = self.filterbank_features(x)
+        print(f">>>>MEL shape: {mel.shape}", flush=True)
         feat = self.pre_encode(mel)
+        print(f">>> feats shape {feat.shape}", flush=True)
 
         # Update buffer with rightmost samples from the concatenated input
         # Store for next iteration BEFORE any processing
