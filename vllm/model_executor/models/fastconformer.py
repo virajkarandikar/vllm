@@ -656,15 +656,6 @@ class FastConformerCTC(nn.Module):
                 attn_mod.qkv_bias.copy_(b_cat)
                 attn_mod._qkv_fused_ready = True
 
-        """
-        head_w = "ctc_decoder.decoder_layers.0.weight"
-        head_b = "ctc_decoder.decoder_layers.0.bias"
-        if head_w in nemo:
-            copy_(self.proj.weight, nemo[head_w], "proj.weight", head_w)
-        if head_b in nemo:
-            copy_(self.proj.bias, nemo[head_b], "proj.bias", head_b)
-        """
-
         loaded_src = {src for (src, _) in loaded_pairs}
 
         print(f"[load_weights] Loaded {len(loaded_pairs)} tensors.")
