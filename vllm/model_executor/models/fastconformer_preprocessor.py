@@ -316,9 +316,7 @@ class FastConformerPreprocessor(nn.Module):
         x = torch.cat([buffer, x], dim=1)
 
         mel = self.filterbank_features(x)
-        print(f">>>>MEL shape: {mel.shape}", flush=True)
         feat = self.pre_encode(mel)
-        print(f">>> feats shape {feat.shape}", flush=True)
 
         # Update buffer with rightmost samples from the concatenated input
         # Store for next iteration BEFORE any processing
