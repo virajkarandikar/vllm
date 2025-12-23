@@ -74,6 +74,7 @@ from vllm.model_executor.model_loader.reload import (
     initialize_layerwise_reload,
 )
 from vllm.model_executor.models.fastconformer import ConformerConvModule
+from vllm.model_executor.models.toy_conv import ToyConv2dLayer
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -7653,6 +7654,13 @@ class GPUModelRunner(
         )
         for layer_name, fastconformer_conv_module in fastconformer_conv_layers.items():
             kv_cache_spec[layer_name] = fastconformer_conv_module.get_kv_cache_spec()
+
+        # TODO: this is a toy conv2d in fastconformer, combine it with the conv1d of the model
+        toy_conv_layers = get_layers_from_vllm_config(
+            self.vllm_config, ToyConv2dLayer
+        )
+        for layer_name, toy_conv_module in toy_conv_layers.items():
+            kv_cache_spec[layer_name] = toy_conv_module.get_kv_cache_spec()
 
         return kv_cache_spec
 

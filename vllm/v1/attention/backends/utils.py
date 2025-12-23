@@ -937,3 +937,94 @@ def mamba_get_block_table_tensor(
         )
         indices_to_gather = (start_indices.unsqueeze(1) + offsets).to(torch.int64)
         return torch.gather(block_table, 1, indices_to_gather)
+
+
+def compute_causal_conv2d_metadata(
+    query_start_loc: torch.Tensor,
+    time_factor: int = 1,
+    block_t: int = 64,
+):
+    """
+    Compute metadata for causal_conv2d_k3s2 kernel.
+
+    This is similar to compute_causal_conv1d_metadata but handles the 2D conv
+    with stride=2 which halves both time and frequency dimensions.
+
+    Args:
+        query_start_loc: (batch+1,) cumulative input time positions
+        time_factor: multiplier for scaling query_start_loc
+        block_t: time block size for chunking (default 64)
+
+    Returns:
+        A dict containing:
+            - batch_ptr: maps program_id -> sequence index
+            - time_chunk_offset_ptr: maps program_id -> chunk index
+            - query_start_loc_out: cumulative output time positions
+            - num_programs: total number of programs to launch
+    """
+    device = "cuda"
+
+    # Scale query_start_loc by time_factor
+    query_start_loc_scaled = query_start_loc * time_factor
+
+    # Compute input sequence lengths
+    seqlens_in = query_start_loc_scaled.diff().to("cpu")
+
+    # Output sequence lengths are halved due to stride=2
+    seqlens_out = seqlens_in // 2
+
+    batch_size = len(seqlens_in)
+
+    # Compute cumulative output positions
+    query_start_loc_out_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
+    query_start_loc_out_cpu[1:] = torch.cumsum(seqlens_out, dim=0)
+
+    # Build program mapping (like causal_conv1d but with different block size)
+    nums = -(-seqlens_out // block_t)  # ceiling division
+
+    mlist = torch.from_numpy(np.repeat(np.arange(len(nums)), nums))
+    mlist_len = len(mlist)
+
+    offsetlist = []  # type: ignore
+    for idx, num in enumerate(nums):
+        num_val = num.item() if hasattr(num, 'item') else int(num)
+        if num_val == 0:
+            num_val = 1
+            mlist_len += 1
+        offsetlist.extend(range(num_val))
+    offsetlist = torch.tensor(offsetlist, dtype=torch.int32)
+
+    # Handle edge case where mlist might need adjustment for zero-length sequences
+    if mlist_len != len(offsetlist):
+        # Rebuild mlist for sequences with zero output length
+        batch_list = []
+        for seq_idx, seq_out_len in enumerate(seqlens_out.numpy()):
+            num_chunks = int(np.ceil(seq_out_len / block_t))
+            if num_chunks == 0:
+                num_chunks = 1
+            batch_list.extend([seq_idx] * num_chunks)
+        mlist = torch.tensor(batch_list, dtype=torch.int32)
+        mlist_len = len(mlist)
+
+    num_programs = mlist_len
+
+    MAX_NUM_PROGRAMS = max(1024, mlist_len) * 2
+
+    batch_ptr = torch.full(
+        (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
+    )
+    time_chunk_offset_ptr = torch.full(
+        (MAX_NUM_PROGRAMS,), PAD_SLOT_ID, dtype=torch.int32, device=device
+    )
+
+    batch_ptr[0:mlist_len].copy_(mlist)
+    time_chunk_offset_ptr[0:mlist_len].copy_(offsetlist)
+
+    query_start_loc_out = query_start_loc_out_cpu.to(device)
+
+    return {
+        "batch_ptr": batch_ptr,
+        "time_chunk_offset_ptr": time_chunk_offset_ptr,
+        "query_start_loc_out": query_start_loc_out,
+        "num_programs": num_programs,
+    }

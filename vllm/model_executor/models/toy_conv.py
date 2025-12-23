@@ -4,221 +4,212 @@ from typing import Optional, Iterable
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
 from vllm.attention.backends.abstract import AttentionBackend
-from vllm.v1.attention.backends.fastconformer_conv import (
-    FastConformerConvBackend,
-    FastConformerConvMetadata,
+from vllm.v1.attention.backends.toy_conv2d import (
+    get_toy_conv2d_backend,
+    ToyConv2dMetadata,
 )
-from vllm.model_executor.models.fastconformer import ConformerConvModule
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.custom_op import CustomOp
 from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
-from vllm.model_executor.layers.conv import causal_conv2d_k3s2_fn
+from vllm.model_executor.layers.conv import depthwise_strided_conv2d_cached
 from vllm.forward_context import get_forward_context
 from vllm.sequence import IntermediateTensors
+from vllm.utils import direct_register_custom_op
+from vllm.compilation.decorators import support_torch_compile
 
 from .utils import AutoWeightsLoader
 
 
-class ToyConv2dLayer(ConformerConvModule):
+@CustomOp.register("toy_conv2d_layer")
+class ToyConv2dLayer(CustomOp, AttentionLayerBase):
     """
     Toy 2D convolution layer using causal_conv2d_k3s2 kernel.
+    It works for specific usecase: strided convolution is applied to melspec.
+    Here we run cached inference with cache over time dimension, while
+    both time and frequency dimensions are getting reduced.
+
+    This is a part of bigger model which works on particular time resolution.
+    Layer takes a multiplier which describes relation between target and current time resolution.
     
-    This layer uses true 2D convolution:
-    - Kernel: (3, 3) over (time, frequency)
-    - Stride: (2, 2) in both dimensions
-    - Cache: 1 time frame (kernel_t - stride_t = 3 - 2 = 1)
-    
-    Input: (C, T, F_in) where F_in = 80 (mel frequency bins)
-    Output: (C, T_out, F_out) where:
-        - T_out = (T + 1) // 2  (with cache providing time position -1)
-        - F_out = (F_in - 3) // 2 + 1 = 39 for F_in=80
-    
-    The weights are stored in nn.Conv2d for easy comparison with PyTorch:
-        # PyTorch reference (non-causal, for testing):
-        # Pad input with 1 frame on left (time) to simulate cache=0
-        # x_padded = F.pad(x, (0, 0, 1, 0))  # [B, C, T+1, F]
-        # y = self.conv2d(x_padded)  # [B, C, T_out, F_out]
+    Input: (T_target x Factor * Freq * Channels)
+    Output: (T_target x Factor/2 * Freq/2 * Channels)
     """
     
     def __init__(
         self,
-        d_model: int,  # number of channels (C)
-        freq_in: int,  # input frequency dimension (typically 80)
+        channels: int,
+        freq: int,
+        time_factor: int,
         prefix: str,
         cache_config: CacheConfig,
         dtype: torch.dtype,
     ):
-        # Do not call super().__init__ to avoid creating unused submodules
-        nn.Module.__init__(self)
+        super().__init__()
         
         self.prefix = prefix
-        self.d_model = d_model  # num channels
-        self.freq_in = freq_in
+        self.channels = channels  # num channels
+        self.freq = freq
+        self.time_factor = time_factor
         
         # Fixed kernel parameters for causal_conv2d_k3s2
-        self.kernel_size = (3, 3)  # (time, frequency)
-        self.stride = (2, 2)
-        self.cache_t = 1  # time frames to cache = kernel_t - stride_t
+        self.kernel_size = 3
+        self.stride = 2
+        self.padded_freq = 512
+        assert self.channels == 256, f"Hardedcoded padded_freq={self.padded_freq} assumes channels==256"
         
-        # Output frequency dimension
-        self.freq_out = (freq_in - 3) // 2 + 1
-        
-        # Depthwise Conv2d: groups=d_model for depthwise
-        # Shape: (d_model, 1, 3, 3) for depthwise
-        # We use groups=d_model so each channel has its own 3x3 kernel
-        self.conv2d = nn.Conv2d(
-            in_channels=d_model,
-            out_channels=d_model,
-            kernel_size=self.kernel_size,
-            stride=self.stride,
-            padding=0,  # No padding - handled by cache in time dimension
-            groups=d_model,  # Depthwise
-            bias=True,
-            dtype=dtype,
+        # depthwise separate convolution weight for a custom kernel
+        self.conv_weight = nn.Parameter(
+            torch.zeros(self.kernel_size,self.kernel_size, self.channels),
+            requires_grad=False,
         )
-        
-        # Cache shape: (cache_t * block_size, d_model, freq_in)
-        # Stores 1 time frame per channel with full frequency
-        self.left_shape = self.cache_t * cache_config.block_size
+        # TODO: create bias parameter
 
         self.cache_config = cache_config
         self.kv_cache = [torch.tensor([])]
         self.dtype = dtype
 
-        try:
-            config = get_current_vllm_config()
-            if config is not None:
-                compilation = config.compilation_config
-                if prefix not in compilation.static_forward_context:
-                    compilation.static_forward_context[prefix] = self
-        except Exception:
-            pass
-
-    def get_kernel_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Extract weights in the format expected by causal_conv2d_k3s2_fn.
-        
-        Returns:
-            weight: (C, 3, 3) tensor - depthwise 2D kernel
-            bias: (C,) tensor
-        """
-        # conv2d.weight shape for depthwise: (C, 1, 3, 3)
-        # We need: (C, 3, 3)
-        weight = self.conv2d.weight.squeeze(1)  # (C, 3, 3)
-        bias = self.conv2d.bias  # (C,)
-        return weight, bias
-
-    def pytorch_reference(
-        self, 
-        x: torch.Tensor, 
-        cache: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        PyTorch reference implementation for testing.
-        
-        Args:
-            x: (C, T, F) input tensor
-            cache: (C, 1, F) cached time frame or None (treated as zeros)
-            
-        Returns:
-            output: (C, T_out, F_out) tensor
-        """
-        C, T, F = x.shape
-        assert F == self.freq_in
-        
-        # Reshape to (1, C, T, F) for conv2d
-        x_4d = x.unsqueeze(0)  # (1, C, T, F)
-        
-        # Prepend cache (or zeros) for causal padding in time
-        if cache is None:
-            cache = torch.zeros(1, C, 1, F, dtype=x.dtype, device=x.device)
-        else:
-            cache = cache.unsqueeze(0)  # (1, C, 1, F)
-        
-        # Concatenate cache + input: (1, C, T+1, F)
-        x_padded = torch.cat([cache, x_4d], dim=2)
-        
-        # Apply conv2d with stride=(2,2), kernel=(3,3)
-        y = self.conv2d(x_padded)  # (1, C, T_out, F_out)
-        
-        # Remove batch dimension
-        return y.squeeze(0)  # (C, T_out, F_out)
+        compilation = get_current_vllm_config().compilation_config
+        if prefix in compilation.static_forward_context:
+            raise ValueError(f"duplicate layer name: {prefix}")
+        compilation.static_forward_context[prefix] = self
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.ops.vllm.toy_conv2d_layer(
+            hidden_states,
+            self.prefix,
+        )
+
+    def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass using causal_conv2d_k3s2 kernel.
+        CUDA forward using the custom convolution kernel.
         
         Args:
-            hidden_states: (C, T, F) input tensor
+            hidden_states: (T_target x Factor * Freq * Channels) input tensor
             
         Returns:
-            output: (C, T_out, F_out) tensor after 2D strided convolution
+            output: (T_target x Factor/2 * Freq/2 * Channels)
         """
-        assert hidden_states.dim() == 3, "forward expects a 3D tensor (C, T, F)"
-        C, T, F = hidden_states.shape
-        #assert C == self.d_model
-        assert F == self.freq_in
+        assert hidden_states.dim() == 2, "forward expects a 2D tensor (T_target x Factor * Freq * Channels)"
+        t_target, factor_freq_channels = hidden_states.shape
+        assert factor_freq_channels == self.time_factor * self.freq * self.channels, f"hidden state dim {factor_freq_channels} should be a prod of time factor, freq, channels"
+        
+        hidden_states = hidden_states.view(t_target * self.time_factor, self.freq, self.channels)  # T x Freq x Channels
 
         fctx = get_forward_context()
         attn_meta_all = fctx.attn_metadata
 
         if attn_meta_all is None:
             # Profile run - return zeros with correct output shape
-            T_out = (T + 1) // 2
-            return torch.zeros(C, T_out, self.freq_out, 
-                             dtype=hidden_states.dtype, 
-                             device=hidden_states.device)
-
-        # Get weights from Conv2d in kernel format
-        conv_weights, conv_bias = self.get_kernel_weights()
+            return torch.zeros(
+                t_target,
+                self.time_factor // 2 * self.freq // 2 * self.channels,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device
+            )
         
         # Input is already (C, T, F) - matches kernel expectation
         x = hidden_states.contiguous()
 
-        attn_metadata: FastConformerConvMetadata = attn_meta_all[self.prefix]
+        attn_metadata: ToyConv2dMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
-        # Get conv state cache: (num_cache_lines, C, 1, F)
-        store = self.kv_cache[fctx.virtual_engine]
-        # The cache is stored as (num_lines, left_shape, C, F)? 
-        # We need (num_lines, C, 1, F) for the kernel
-        # Assuming cache layout matches what we need
-        conv_state = store[:, :self.cache_t, :, :].transpose(1, 2).contiguous()
+        # store is larger across `freq` dimension, but kernel only uses [idx, :freq] part
+        store = self.kv_cache[fctx.virtual_engine]  # (num_blocks, 512, Channels)
 
         query_start_loc = attn_metadata.query_start_loc
+        
+        # has_initial_state comes from metadata - True if cache has valid data (decode),
+        # False for first call (prefill). This is computed based on num_computed_tokens.
+        # has_initial_state = attn_metadata.has_initial_state
         has_initial_state = torch.ones(
             page_indices.size(0), dtype=torch.bool, device=x.device
         )
 
-        # Call the 2D causal conv kernel
-        y = causal_conv2d_k3s2_fn(
-            x=x,                                  # (C, cu_time, F)
-            weight=conv_weights,                  # (C, 3, 3)
-            bias=conv_bias,                       # (C,)
-            conv_state=conv_state,                # (num_cache_lines, C, 1, F)
-            query_start_loc=query_start_loc,      # (batch + 1,)
-            cache_indices=page_indices,           # (batch,)
-            has_initial_state=has_initial_state,  # (batch,)
-            activation=None,
-            metadata=attn_metadata,
+        # Allocate output tensor before calling kernel
+        # Output shape: (cu_time_out, freq//2, channels) where cu_time_out = cu_time_in // 2
+        cu_time_in = x.shape[0]
+        cu_time_out = cu_time_in // 2
+        freq_out = self.freq // 2
+        out = torch.empty(
+            (cu_time_out, freq_out, self.channels),
+            device=x.device,
+            dtype=x.dtype
         )
+
+        # Use pre-computed metadata from the builder (no CPU blocking)
+        # The backend returned by get_toy_conv2d_backend(time_factor) has a builder
+        # that pre-computes metadata with the correct time_factor.
+        depthwise_strided_conv2d_cached(
+            x,
+            self.conv_weight,
+            out,
+            store,
+            query_start_loc,
+            page_indices,
+            has_initial_state,
+            metadata=attn_metadata,
+        )  # (time / 2, freq / 2, channels)
         
-        return y  # (C, T_out, F_out)
+        # reshape back to (t_target, Factor/2 * Freq/2 * Channels)
+        return out.view(t_target, self.time_factor // 2 * self.freq // 2 * self.channels)
 
     def get_attn_backend(self) -> AttentionBackend:
-        return FastConformerConvBackend
+        # Return a backend configured for this layer's time_factor
+        # The backend's builder will pre-compute metadata with the correct time_factor
+        return get_toy_conv2d_backend(self.time_factor)
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
-            block_size=self.cache_config.block_size,
-            shape=(self.left_shape, self.d_model, self.freq_in),
+            # WARNING: when caching is enabled, block size be the same across all layers.
+            # for conv we need only 1 though.
+            block_size=1,
+            # WARNING: this we hardcode a larger cache, so the page has same
+            # size as page for fastconformer attn.
+            # self.padded_freq is computed assuming certain channels number.
+            # during usage we just slice according to self.freq. 
+            shape=(self.padded_freq, self.channels),
             dtype=self.dtype,
         )
 
 
+def toy_conv2d_fwd(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    return self.forward_cuda(hidden_states=hidden_states)
+
+
+def toy_conv2d_fwd_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    # The fake kernel must return the correct OUTPUT shape, not input shape.
+    # Input:  (T_target, time_factor * freq * channels)
+    # Output: (T_target, time_factor/2 * freq/2 * channels)
+    # Since stride=2 in both time and freq dimensions, output is 1/4 the size.
+    t_target = hidden_states.shape[0]
+    output_dim = hidden_states.shape[1] // 4
+    return torch.zeros(
+        t_target, output_dim,
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="toy_conv2d_layer",
+    op_func=toy_conv2d_fwd,
+    fake_impl=toy_conv2d_fwd_fake,
+)
+
+
+@support_torch_compile
 class ToyConv(nn.Module):
     """
     Toy model for testing causal_conv2d_k3s2 kernel.
@@ -233,25 +224,21 @@ class ToyConv(nn.Module):
     ) -> None:
         super().__init__()
         self.config = vllm_config.model_config.hf_config
-        self.d_model = self.config.d_model
-        
-        # Frequency input dimension (mel bins)
-        #self.freq_in = getattr(self.config, "freq_in", 80)
-        self.freq_in = 82
 
-        self.conv = nn.ModuleList([
-            ToyConv2dLayer(
-                d_model=self.d_model,
-                freq_in=self.freq_in,
-                prefix=f"{prefix}.conv.0",
-                cache_config=vllm_config.cache_config,
-                dtype=vllm_config.model_config.dtype,
-            )
-        ])
+        # TODO: extract the values from config
+        self.conv = torch.nn.ModuleList([ToyConv2dLayer(
+            channels=256,
+            freq=80,
+            time_factor=2,
+            prefix=f"{prefix}.conv.0",
+            cache_config=vllm_config.cache_config,
+            dtype=vllm_config.model_config.dtype,
+        )])
         
+        # not used, but present for compatability with vLLM generation model
         self.vocab_size = getattr(self.config, "vocab_size", 1)
-        self.embed_tokens = nn.Embedding(self.vocab_size, self.d_model)
-        self.proj = nn.Linear(self.d_model, self.vocab_size)
+        self.embed_tokens = nn.Embedding(self.vocab_size, 256)
+        self.proj = nn.Linear(256, self.vocab_size)
 
     def forward(
         self,
@@ -265,15 +252,13 @@ class ToyConv(nn.Module):
         Forward pass.
         
         Args:
-            conv_input: (T, F) tensor
+            conv_input: (T_target, Factor * Freq * Channels) tensor
             
         Returns:
-            x: (C, T_out, F_out) output after 2D strided convolution
+            x: (T_target, Factor/2 * Freq/2 * Channels) output
         """
-        conv_input = conv_input.unsqueeze(0)  # 1 x T x F
-        x = self.conv[0](conv_input)  # C x time x freq
-        x = x.transpose(0, 1)  # time x C x freq
-        x = x.flatten(1)  # time x C*freq
+        conv_0 = self.conv[0]
+        x = conv_0(conv_input)
         return x, x
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:

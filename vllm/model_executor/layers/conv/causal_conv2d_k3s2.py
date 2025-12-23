@@ -1,886 +1,345 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-# Copyright (c) 2025 NVIDIA
-
-"""
-Causal 2D Convolution with kernel_size=(3,3), stride=(2,2) for mel spectrogram processing.
-
-This kernel is designed for audio preprocessing (e.g., FastConformer subsampling) where:
-- Time dimension: requires caching for causality, kernel=3, stride=2
-- Frequency dimension: fixed input size (80 or padded), no caching needed
-- Maximum frequency input size: 82 (freq_out <= 40)
-
-Kernel: (3, 3) over (time, frequency)
-Stride: (2, 2) in both dimensions  
-Cache: 1 time frame (kernel_t - stride_t = 3 - 2 = 1)
-
-Supports two modes:
-1. Depthwise convolution (in_channels == out_channels):
-   - Input: (C, T, F_in), Weight: (C, 3, 3), Output: (C, T_out, F_out)
-   - Each output channel only depends on the corresponding input channel
-   - Equivalent to nn.Conv2d with groups=C
-   
-2. Broadcast convolution (in_channels == 1):
-   - Input: (1, T, F_in), Weight: (C_out, 3, 3), Output: (C_out, T_out, F_out)
-   - All output channels read from the single input channel
-   - Equivalent to nn.Conv2d with in_channels=1, out_channels=C_out
-
-Output dimensions:
-    - T_out = (T + 1) // 2  (with cache providing the -1 time position)
-    - F_out = (F_in - 3) // 2 + 1
-
-For each output position (c_out, t_out, f_out):
-    out[c_out, t_out, f_out] = sum over (kt, kf) of:
-        w[c_out, kt, kf] * x[c_in, t_out*2 + kt - 1, f_out*2 + kf]
-    Where c_in = c_out for depthwise, c_in = 0 for broadcast.
-    Time position -1 comes from cache.
-
-Optimization notes:
-    - BLOCK_F=64 covers all frequencies at once (freq_out <= 40 for freq_in <= 82)
-    - No frequency loop needed - all frequencies processed in parallel
-    - BLOCK_C=64 for efficient channel parallelism
-"""
-
-from typing import Optional
-
-import numpy as np
+import triton
 import torch
+import triton.language as tl
+import numpy as np
 
-from vllm.attention.backends.utils import PAD_SLOT_ID
-from vllm.triton_utils import tl, triton
+# =============================================================================
+# CACHED VERSION: Supports cache (conv_state) for step-by-step execution
+# =============================================================================
+# Similar to causal_conv1d_fn, this version:
+# - Takes conv_state as input for temporal history cache
+# - Uses cache_indices to map sequences to cache lines
+# - Uses has_initial_state to determine whether to read from cache
+# - Updates cache with final state after processing
 
-# Maximum frequency dimensions - kernel assumes freq_in <= 82
-MAX_FREQ_IN = 82
-MAX_FREQ_OUT = (MAX_FREQ_IN - 3) // 2 + 1  # = 40
-
-
-@triton.jit()
-def _causal_conv2d_k3s2_fwd_kernel(
-    # Pointers to matrices
-    x_ptr,  # (C_in, cu_time, F_in) input
-    w_ptr,  # (C_out, 3, 3) weights for each output channel
-    bias_ptr,  # (C_out,) optional bias
-    cache_ptr,  # (num_cache_lines, C_in, 1, F_in) conv cache - 1 time frame
-    cache_indices_ptr,  # (batch,) maps sequence to cache line
-    has_initial_state_ptr,  # (batch,) whether sequence has cached state
-    query_start_loc_ptr,  # (batch + 1,) cumsum of input time lengths
-    output_start_loc_ptr,  # (batch + 1,) cumsum of output time lengths
-    batch_ptr,  # (num_programs,) maps program_id to sequence index
-    time_chunk_offset_ptr,  # (num_programs,) maps program_id to output time chunk
-    o_ptr,  # (C_out, cu_time_out, F_out) output
-    # Matrix dimensions
-    in_channels: tl.constexpr,
-    out_channels: tl.constexpr,
-    freq_in: tl.constexpr,
-    freq_out: tl.constexpr,
+@triton.jit
+def depthwise_strided_conv2d_cached_kernel(
+    # Pointers
+    x_ptr,              # input: (cu_time_in, frequency, channels) - packed sequences
+    w_ptr,              # kernel: (3, 3, channels)
+    out_ptr,            # output: (cu_time_out, frequency//2, channels) - packed sequences
+    # Cache pointers (like conv_states in causal_conv1d)
+    conv_state_ptr,     # cache: (num_cache_lines, freq_len, channels) - stores last odd time values
+    cache_indices_ptr,  # (batch,) int32 - maps sequence to cache line index
+    has_initial_state_ptr,  # (batch,) bool - whether to use cached state
+    # Sequence mapping (computed on CPU, passed to kernel)
+    batch_ptr,          # (num_programs,) maps program_id -> sequence index
+    time_chunk_offset_ptr,  # (num_programs,) maps program_id -> chunk index within sequence
+    # Sequence boundaries
+    query_start_loc_in_ptr,   # (batch+1,) cumulative input time positions
+    query_start_loc_out_ptr,  # (batch+1,) cumulative output time positions
+    # Dimensions
+    FREQ_LEN: tl.constexpr,
+    TOTAL_CHANNELS: tl.constexpr,
     num_cache_lines: tl.constexpr,
-    # Strides for x: (C_in, T, F)
-    stride_x_c: tl.constexpr,
-    stride_x_t: tl.constexpr,
-    stride_x_f: tl.constexpr,
-    # Strides for w: (C_out, 3, 3)
-    stride_w_c: tl.constexpr,
-    stride_w_kt: tl.constexpr,
-    stride_w_kf: tl.constexpr,
-    # Strides for cache: (num_cache_lines, C_in, 1, F_in)
-    stride_cache_seq: tl.constexpr,
-    stride_cache_c: tl.constexpr,
-    stride_cache_t: tl.constexpr,
-    stride_cache_f: tl.constexpr,
-    # Strides for output: (C_out, T_out, F_out)
-    stride_o_c: tl.constexpr,
-    stride_o_t: tl.constexpr,
-    stride_o_f: tl.constexpr,
-    # Others
-    pad_slot_id: tl.constexpr,
-    # Meta-parameters
-    HAS_BIAS: tl.constexpr,
-    SILU_ACTIVATION: tl.constexpr,
-    USE_PAD_SLOT: tl.constexpr,
-    IS_DEPTHWISE: tl.constexpr,  # True if in_channels == out_channels (1:1 mapping)
-    BLOCK_T: tl.constexpr,  # output time positions per chunk
-    BLOCK_C: tl.constexpr,  # channels per block
-    BLOCK_F: tl.constexpr,  # frequency outputs per block (covers all freq_out)
+    # Strides for conv_state
+    stride_state_seq: tl.constexpr,
+    stride_state_freq: tl.constexpr,
+    stride_state_ch: tl.constexpr,
+    # Block sizes
+    BLOCK_CHANNELS: tl.constexpr,
+    BLOCK_TIME: tl.constexpr,  # Number of output time steps per chunk
 ):
     """
-    Forward kernel for causal 2D conv with kernel=(3,3), stride=(2,2).
-
-    Grid: (num_programs, ceil(out_channels / BLOCK_C))
-    - program_id(0): indexes into batch_ptr/time_chunk_offset_ptr
-    - program_id(1): output channel block index
-
-    Each program processes BLOCK_T consecutive output time positions for
-    BLOCK_C output channels, computing all F_out frequency outputs in parallel.
+    Varlen depthwise strided 2D conv with cache support for step-by-step execution.
     
-    Optimizations:
-    - All frequency outputs processed in parallel (no freq loop)
-    - Uses 2D (BLOCK_C, BLOCK_F) tensor operations
-    - Assumes freq_out <= BLOCK_F (no need to tile over frequency)
+    Grid: (num_programs, freq_out, channel_blocks)
+    - program_id(0): sequence/chunk program (from batch_ptr/time_chunk_offset_ptr)
+    - program_id(1): output frequency index  
+    - program_id(2): channel block index
     
-    Supports two modes:
-    - IS_DEPTHWISE=True: in_channels == out_channels, 1:1 channel mapping
-    - IS_DEPTHWISE=False: in_channels == 1, all outputs read from channel 0
+    Cache layout: (num_cache_lines, freq_len, channels)
+    - Stores the values from the last processed odd time step
+    - When chunk_offset == 0 and has_initial_state == True, reads from cache
+    - After processing, updates cache with final odd time values
     """
-    # Get sequence index and chunk offset for this program
+    # ==========================================================================
+    # Step 1: Map program_id to (sequence_idx, chunk_offset)
+    # ==========================================================================
     idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
     chunk_offset = tl.load(time_chunk_offset_ptr + tl.program_id(0))
-
-    if idx_seq == pad_slot_id:
-        return
-
-    # Output channel indices for this block: (BLOCK_C,)
-    idx_out_channels = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
-    mask_c = idx_out_channels < out_channels
     
-    # Output frequency indices: (BLOCK_F,) - process all frequencies at once
-    idx_f_out = tl.arange(0, BLOCK_F)
-    mask_f = idx_f_out < freq_out
+    f_out = tl.program_id(1)  # Output frequency index
+    pid_ch = tl.program_id(2)  # Channel block index
     
-    # 2D mask for (BLOCK_C, BLOCK_F)
-    mask_cf = mask_c[:, None] & mask_f[None, :]
+    idx_ch = pid_ch * BLOCK_CHANNELS + tl.arange(0, BLOCK_CHANNELS)
+    mask_ch = idx_ch < TOTAL_CHANNELS
     
-    # Input channel indices: same as output for depthwise, always 0 for broadcast
-    if IS_DEPTHWISE:
-        idx_in_channels = idx_out_channels
-    else:
-        # in_channels == 1, all outputs read from input channel 0
-        idx_in_channels = tl.zeros((BLOCK_C,), dtype=tl.int32)
-
-    # Get sequence boundaries (input time)
-    in_t_start = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
-    in_t_end = tl.load(query_start_loc_ptr + idx_seq + 1).to(tl.int64)
-    in_t_len = in_t_end - in_t_start
-
-    # Output time length: (T_in + 1) // 2 (cache provides position -1)
-    out_t_len = (in_t_len + 1) // 2
-
-    # Get output sequence start position
-    out_t_start = tl.load(output_start_loc_ptr + idx_seq).to(tl.int64)
-
-    # Get cache index for this sequence
+    # ==========================================================================
+    # Step 2: Get cache index for this sequence
+    # ==========================================================================
     cache_idx = tl.load(cache_indices_ptr + idx_seq).to(tl.int64)
-
-    if USE_PAD_SLOT:
-        if cache_idx == pad_slot_id:
-            return
-
-    # Preload weights: w[c_out, kt, kf] for all 9 kernel positions
-    # Shape: (BLOCK_C,) for each of 9 positions, will broadcast to (BLOCK_C, BLOCK_F)
-    w_base = w_ptr + idx_out_channels * stride_w_c
-
-    w00 = tl.load(w_base + 0 * stride_w_kt + 0 * stride_w_kf, mask=mask_c, other=0.0)
-    w01 = tl.load(w_base + 0 * stride_w_kt + 1 * stride_w_kf, mask=mask_c, other=0.0)
-    w02 = tl.load(w_base + 0 * stride_w_kt + 2 * stride_w_kf, mask=mask_c, other=0.0)
-    w10 = tl.load(w_base + 1 * stride_w_kt + 0 * stride_w_kf, mask=mask_c, other=0.0)
-    w11 = tl.load(w_base + 1 * stride_w_kt + 1 * stride_w_kf, mask=mask_c, other=0.0)
-    w12 = tl.load(w_base + 1 * stride_w_kt + 2 * stride_w_kf, mask=mask_c, other=0.0)
-    w20 = tl.load(w_base + 2 * stride_w_kt + 0 * stride_w_kf, mask=mask_c, other=0.0)
-    w21 = tl.load(w_base + 2 * stride_w_kt + 1 * stride_w_kf, mask=mask_c, other=0.0)
-    w22 = tl.load(w_base + 2 * stride_w_kt + 2 * stride_w_kf, mask=mask_c, other=0.0)
-
-    # Preload bias if present (indexed by output channel)
-    if HAS_BIAS:
-        bias_val = tl.load(bias_ptr + idx_out_channels, mask=mask_c, other=0.0).to(
-            tl.float32
-        )
-    else:
-        bias_val = tl.zeros((BLOCK_C,), dtype=tl.float32)
-
-    # Input frequency positions for all output frequencies: (BLOCK_F,)
-    # f_in = f_out * 2 + kf, for kf in {0, 1, 2}
-    f_in0 = idx_f_out * 2 + 0  # (BLOCK_F,)
-    f_in1 = idx_f_out * 2 + 1  # (BLOCK_F,)
-    f_in2 = idx_f_out * 2 + 2  # (BLOCK_F,)
-
-    # Base pointers for input/cache (indexed by input channel): (BLOCK_C,)
-    cache_base = (
-        cache_ptr
-        + cache_idx * stride_cache_seq
-        + idx_in_channels * stride_cache_c
-    )
-
-    x_base = (
-        x_ptr
-        + in_t_start * stride_x_t
-        + idx_in_channels * stride_x_c
-    )
-
-    # Base pointer for output (indexed by output channel): (BLOCK_C,)
-    o_base = (
-        o_ptr
-        + out_t_start * stride_o_t
-        + idx_out_channels * stride_o_c
-    )
-
-    # First chunk (chunk_offset == 0): determine if we have cached state
+    
+    # ==========================================================================
+    # Step 3: Locate this sequence in the packed input/output
+    # ==========================================================================
+    seq_start_in = tl.load(query_start_loc_in_ptr + idx_seq)
+    seq_start_out = tl.load(query_start_loc_out_ptr + idx_seq)
+    seq_end_out = tl.load(query_start_loc_out_ptr + idx_seq + 1)
+    seq_time_out = seq_end_out - seq_start_out
+    
+    # ==========================================================================
+    # Step 4: Compute chunk boundaries within this sequence
+    # ==========================================================================
+    t_out_start = chunk_offset * BLOCK_TIME
+    t_out_end = tl.minimum(t_out_start + BLOCK_TIME, seq_time_out)
+    chunk_len = t_out_end - t_out_start
+    
+    if chunk_len <= 0:
+        return
+    
+    # ==========================================================================
+    # Step 5: Setup frequency indices and strides
+    # ==========================================================================
+    f_hi = f_out * 2 + 1
+    f_mid = f_out * 2
+    f_lo = f_out * 2 - 1
+    valid_f_lo = f_lo >= 0
+    
+    # Strides for packed layout (time, freq, channels)
+    x_stride_t = FREQ_LEN * TOTAL_CHANNELS
+    x_stride_f = TOTAL_CHANNELS
+    out_stride_t = (FREQ_LEN // 2) * TOTAL_CHANNELS
+    out_stride_f = TOTAL_CHANNELS
+    w_stride_t = 3 * TOTAL_CHANNELS
+    w_stride_f = TOTAL_CHANNELS
+    
+    # ==========================================================================
+    # Step 6: Load kernel weights
+    # ==========================================================================
+    w00 = tl.load(w_ptr + 0*w_stride_t + 0*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    w01 = tl.load(w_ptr + 0*w_stride_t + 1*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    w02 = tl.load(w_ptr + 0*w_stride_t + 2*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    w10 = tl.load(w_ptr + 1*w_stride_t + 0*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    w11 = tl.load(w_ptr + 1*w_stride_t + 1*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    w12 = tl.load(w_ptr + 1*w_stride_t + 2*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    w20 = tl.load(w_ptr + 2*w_stride_t + 0*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    w21 = tl.load(w_ptr + 2*w_stride_t + 1*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    w22 = tl.load(w_ptr + 2*w_stride_t + 2*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    
+    # ==========================================================================
+    # Step 7: Initialize temporal cache (like causal_conv1d)
+    # ==========================================================================
     if chunk_offset == 0:
-        # Load cached frame (time position -1) if available
-        has_state = tl.load(has_initial_state_ptr + idx_seq).to(tl.int1)
-    else:
-        has_state = True  # For non-first chunks, we always have prior data from x
-
-    # Compute output time position range for this chunk
-    t_out_start = chunk_offset * BLOCK_T
-
-    # Process output time positions in this chunk
-    for t_idx in range(BLOCK_T):
-        t_out = t_out_start + t_idx
-        # Use conditional guard instead of break (Triton doesn't support break)
-        if t_out < out_t_len:
-            # Accumulator: (BLOCK_C, BLOCK_F)
-            acc = bias_val[:, None] + tl.zeros((BLOCK_C, BLOCK_F), dtype=tl.float32)
-
-            # Input time positions: t_out*2 + kt - 1 for kt in 0,1,2
-            t_in0 = t_out * 2 - 1
-            t_in1 = t_out * 2
-            t_in2 = t_out * 2 + 1
-
-            # Create 2D pointers: (BLOCK_C, BLOCK_F)
-            # For cache: cache_base[:, None] + f_in[None, :] * stride_cache_f
-            # For x: x_base[:, None] + t * stride_x_t + f_in[None, :] * stride_x_f
-
-            # Load x values for kt=0 (t_in0 may be -1)
-            if t_in0 < 0:
-                # Load from cache: (BLOCK_C, BLOCK_F)
-                if has_state:
-                    cache_ptr_2d_0 = cache_base[:, None] + f_in0[None, :] * stride_cache_f
-                    cache_ptr_2d_1 = cache_base[:, None] + f_in1[None, :] * stride_cache_f
-                    cache_ptr_2d_2 = cache_base[:, None] + f_in2[None, :] * stride_cache_f
-                    x00 = tl.load(cache_ptr_2d_0, mask=mask_cf, other=0.0)
-                    x01 = tl.load(cache_ptr_2d_1, mask=mask_cf, other=0.0)
-                    x02 = tl.load(cache_ptr_2d_2, mask=mask_cf, other=0.0)
-                else:
-                    x00 = tl.zeros((BLOCK_C, BLOCK_F), dtype=x_ptr.dtype.element_ty)
-                    x01 = tl.zeros((BLOCK_C, BLOCK_F), dtype=x_ptr.dtype.element_ty)
-                    x02 = tl.zeros((BLOCK_C, BLOCK_F), dtype=x_ptr.dtype.element_ty)
-            else:
-                x_ptr_2d_t0_f0 = x_base[:, None] + t_in0 * stride_x_t + f_in0[None, :] * stride_x_f
-                x_ptr_2d_t0_f1 = x_base[:, None] + t_in0 * stride_x_t + f_in1[None, :] * stride_x_f
-                x_ptr_2d_t0_f2 = x_base[:, None] + t_in0 * stride_x_t + f_in2[None, :] * stride_x_f
-                x00 = tl.load(x_ptr_2d_t0_f0, mask=mask_cf, other=0.0)
-                x01 = tl.load(x_ptr_2d_t0_f1, mask=mask_cf, other=0.0)
-                x02 = tl.load(x_ptr_2d_t0_f2, mask=mask_cf, other=0.0)
-
-            # Load x values for kt=1 (t_in1): (BLOCK_C, BLOCK_F)
-            x_ptr_2d_t1_f0 = x_base[:, None] + t_in1 * stride_x_t + f_in0[None, :] * stride_x_f
-            x_ptr_2d_t1_f1 = x_base[:, None] + t_in1 * stride_x_t + f_in1[None, :] * stride_x_f
-            x_ptr_2d_t1_f2 = x_base[:, None] + t_in1 * stride_x_t + f_in2[None, :] * stride_x_f
-            x10 = tl.load(x_ptr_2d_t1_f0, mask=mask_cf, other=0.0)
-            x11 = tl.load(x_ptr_2d_t1_f1, mask=mask_cf, other=0.0)
-            x12 = tl.load(x_ptr_2d_t1_f2, mask=mask_cf, other=0.0)
-
-            # Load x values for kt=2 (t_in2): (BLOCK_C, BLOCK_F)
-            x_ptr_2d_t2_f0 = x_base[:, None] + t_in2 * stride_x_t + f_in0[None, :] * stride_x_f
-            x_ptr_2d_t2_f1 = x_base[:, None] + t_in2 * stride_x_t + f_in1[None, :] * stride_x_f
-            x_ptr_2d_t2_f2 = x_base[:, None] + t_in2 * stride_x_t + f_in2[None, :] * stride_x_f
-            x20 = tl.load(x_ptr_2d_t2_f0, mask=mask_cf, other=0.0)
-            x21 = tl.load(x_ptr_2d_t2_f1, mask=mask_cf, other=0.0)
-            x22 = tl.load(x_ptr_2d_t2_f2, mask=mask_cf, other=0.0)
-
-            # Compute convolution: broadcast weights (BLOCK_C,) -> (BLOCK_C, BLOCK_F)
-            acc += w00[:, None] * x00 + w01[:, None] * x01 + w02[:, None] * x02
-            acc += w10[:, None] * x10 + w11[:, None] * x11 + w12[:, None] * x12
-            acc += w20[:, None] * x20 + w21[:, None] * x21 + w22[:, None] * x22
-
-            # Apply activation if specified
-            if SILU_ACTIVATION:
-                acc = acc / (1 + tl.exp(-acc))
-
-            # Store output: (BLOCK_C, BLOCK_F)
-            o_ptr_2d = o_base[:, None] + t_out * stride_o_t + idx_f_out[None, :] * stride_o_f
-            tl.store(o_ptr_2d, acc, mask=mask_cf)
-
-    # Update cache with last input time frame for next batch
-    # Cache stores input[T-1, :] which becomes position -1 for next batch
-    # IMPORTANT: This must happen AFTER reading cache for t_out=0 above
-    # For broadcast mode (in_channels=1), only first output block updates cache
-    should_update_cache = chunk_offset == 0
-    if not IS_DEPTHWISE:
-        # In broadcast mode, only program_id(1)==0 should update the single input channel cache
-        should_update_cache = should_update_cache and (tl.program_id(1) == 0)
-    
-    if should_update_cache:
-        tl.debug_barrier()
-        last_t = in_t_len - 1
-        # For broadcast mode, mask should cover the single input channel
-        if IS_DEPTHWISE:
-            cache_mask = mask_c
-        else:
-            # in_channels=1, only one value to store (no mask needed, always valid)
-            cache_mask = tl.arange(0, BLOCK_C) < 1
+        # First chunk: check if we should load from cache
+        load_init_state = tl.load(has_initial_state_ptr + idx_seq).to(tl.int1)
         
-        # Update cache for all input frequencies at once
-        # Cache shape: (BLOCK_C,) -> store freq_in values
-        idx_f_cache = tl.arange(0, BLOCK_F)
-        mask_f_cache = idx_f_cache < freq_in
-        mask_cache_2d = cache_mask[:, None] & mask_f_cache[None, :]
-        
-        cache_store_ptr = cache_base[:, None] + idx_f_cache[None, :] * stride_cache_f
-        x_load_ptr = x_base[:, None] + last_t * stride_x_t + idx_f_cache[None, :] * stride_x_f
-        val = tl.load(x_load_ptr, mask=mask_cache_2d, other=0.0)
-        tl.store(cache_store_ptr, val, mask=mask_cache_2d)
-
-
-@triton.jit()
-def _causal_conv2d_k3s2_update_kernel(
-    # Pointers to matrices
-    x_ptr,  # (batch, C_in, T, F_in) or (C_in, cu_time, F_in) for varlen
-    w_ptr,  # (C_out, 3, 3) weights
-    bias_ptr,  # (C_out,) optional bias
-    cache_ptr,  # (num_cache_lines, C_in, 1, F_in) conv cache
-    cache_indices_ptr,  # (batch,) maps sequence to cache line
-    query_start_loc_ptr,  # (batch + 1,) for varlen mode
-    o_ptr,  # output
-    # Matrix dimensions
-    batch: int,
-    in_channels: tl.constexpr,
-    out_channels: tl.constexpr,
-    time_len: tl.constexpr,  # input time length per sequence
-    freq_in: tl.constexpr,
-    freq_out: tl.constexpr,
-    num_cache_lines: tl.constexpr,
-    # Strides for x
-    stride_x_b: tl.constexpr,
-    stride_x_c: tl.constexpr,
-    stride_x_t: tl.constexpr,
-    stride_x_f: tl.constexpr,
-    # Strides for w
-    stride_w_c: tl.constexpr,
-    stride_w_kt: tl.constexpr,
-    stride_w_kf: tl.constexpr,
-    # Strides for cache
-    stride_cache_seq: tl.constexpr,
-    stride_cache_c: tl.constexpr,
-    stride_cache_t: tl.constexpr,
-    stride_cache_f: tl.constexpr,
-    # Strides for output
-    stride_o_b: tl.constexpr,
-    stride_o_c: tl.constexpr,
-    stride_o_t: tl.constexpr,
-    stride_o_f: tl.constexpr,
-    # Others
-    pad_slot_id: tl.constexpr,
-    # Meta-parameters
-    HAS_BIAS: tl.constexpr,
-    SILU_ACTIVATION: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    USE_PAD_SLOT: tl.constexpr,
-    IS_DEPTHWISE: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-    BLOCK_F: tl.constexpr,  # frequency outputs per block (covers all freq_out)
-):
-    """
-    Update kernel for decode mode (small number of time frames).
-
-    Grid: (batch, ceil(out_channels / BLOCK_C))
-    
-    Optimizations:
-    - All frequency outputs processed in parallel (no freq loop)
-    - Uses 2D (BLOCK_C, BLOCK_F) tensor operations
-    - Assumes freq_out <= BLOCK_F (no need to tile over frequency)
-    
-    Supports two modes:
-    - IS_DEPTHWISE=True: in_channels == out_channels, 1:1 channel mapping
-    - IS_DEPTHWISE=False: in_channels == 1, all outputs read from channel 0
-    """
-    idx_batch = tl.program_id(0)
-    if idx_batch >= batch:
-        return
-
-    # Output channel indices for this block: (BLOCK_C,)
-    idx_out_channels = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
-    mask_c = idx_out_channels < out_channels
-    
-    # Output frequency indices: (BLOCK_F,) - process all frequencies at once
-    idx_f_out = tl.arange(0, BLOCK_F)
-    mask_f = idx_f_out < freq_out
-    
-    # 2D mask for (BLOCK_C, BLOCK_F)
-    mask_cf = mask_c[:, None] & mask_f[None, :]
-    
-    # Input channel indices
-    if IS_DEPTHWISE:
-        idx_in_channels = idx_out_channels
-    else:
-        idx_in_channels = tl.zeros((BLOCK_C,), dtype=tl.int32)
-
-    # Get cache index
-    cache_idx = tl.load(cache_indices_ptr + idx_batch).to(tl.int64)
-
-    if USE_PAD_SLOT:
-        if cache_idx == pad_slot_id:
-            return
-
-    # Handle varlen vs fixed length
-    if IS_VARLEN:
-        t_start = tl.load(query_start_loc_ptr + idx_batch).to(tl.int64)
-        t_end = tl.load(query_start_loc_ptr + idx_batch + 1).to(tl.int64)
-        actual_t_len = t_end - t_start
-        x_offset = t_start * stride_x_t
-        out_t_len = (actual_t_len + 1) // 2
-        out_t_start = (t_start + 1) // 2  # Approximate - should use output_start_loc
-        o_offset = out_t_start * stride_o_t
-    else:
-        actual_t_len = time_len
-        x_offset = idx_batch * stride_x_b
-        out_t_len = (actual_t_len + 1) // 2
-        o_offset = idx_batch * stride_o_b
-
-    if actual_t_len == 0:
-        return
-
-    # Load weights (indexed by output channel): (BLOCK_C,)
-    w_base = w_ptr + idx_out_channels * stride_w_c
-    w00 = tl.load(w_base + 0 * stride_w_kt + 0 * stride_w_kf, mask=mask_c, other=0.0)
-    w01 = tl.load(w_base + 0 * stride_w_kt + 1 * stride_w_kf, mask=mask_c, other=0.0)
-    w02 = tl.load(w_base + 0 * stride_w_kt + 2 * stride_w_kf, mask=mask_c, other=0.0)
-    w10 = tl.load(w_base + 1 * stride_w_kt + 0 * stride_w_kf, mask=mask_c, other=0.0)
-    w11 = tl.load(w_base + 1 * stride_w_kt + 1 * stride_w_kf, mask=mask_c, other=0.0)
-    w12 = tl.load(w_base + 1 * stride_w_kt + 2 * stride_w_kf, mask=mask_c, other=0.0)
-    w20 = tl.load(w_base + 2 * stride_w_kt + 0 * stride_w_kf, mask=mask_c, other=0.0)
-    w21 = tl.load(w_base + 2 * stride_w_kt + 1 * stride_w_kf, mask=mask_c, other=0.0)
-    w22 = tl.load(w_base + 2 * stride_w_kt + 2 * stride_w_kf, mask=mask_c, other=0.0)
-
-    # Load bias (indexed by output channel)
-    if HAS_BIAS:
-        bias_val = tl.load(bias_ptr + idx_out_channels, mask=mask_c, other=0.0).to(
-            tl.float32
-        )
-    else:
-        bias_val = tl.zeros((BLOCK_C,), dtype=tl.float32)
-
-    # Input frequency positions for all output frequencies: (BLOCK_F,)
-    f_in0 = idx_f_out * 2 + 0
-    f_in1 = idx_f_out * 2 + 1
-    f_in2 = idx_f_out * 2 + 2
-
-    # Base pointers for input/cache (indexed by input channel): (BLOCK_C,)
-    cache_base = cache_ptr + cache_idx * stride_cache_seq + idx_in_channels * stride_cache_c
-    x_base = x_ptr + x_offset + idx_in_channels * stride_x_c
-    # Base pointer for output (indexed by output channel): (BLOCK_C,)
-    o_base = o_ptr + o_offset + idx_out_channels * stride_o_c
-
-    # Process output time positions
-    for t_out in range(out_t_len):
-        # Accumulator: (BLOCK_C, BLOCK_F)
-        acc = bias_val[:, None] + tl.zeros((BLOCK_C, BLOCK_F), dtype=tl.float32)
-
-        t_in0 = t_out * 2 - 1
-        t_in1 = t_out * 2
-        t_in2 = t_out * 2 + 1
-
-        # Load x for kt=0: (BLOCK_C, BLOCK_F)
-        if t_in0 < 0:
-            cache_ptr_2d_0 = cache_base[:, None] + f_in0[None, :] * stride_cache_f
-            cache_ptr_2d_1 = cache_base[:, None] + f_in1[None, :] * stride_cache_f
-            cache_ptr_2d_2 = cache_base[:, None] + f_in2[None, :] * stride_cache_f
-            x00 = tl.load(cache_ptr_2d_0, mask=mask_cf, other=0.0)
-            x01 = tl.load(cache_ptr_2d_1, mask=mask_cf, other=0.0)
-            x02 = tl.load(cache_ptr_2d_2, mask=mask_cf, other=0.0)
-        else:
-            x_ptr_2d_t0_f0 = x_base[:, None] + t_in0 * stride_x_t + f_in0[None, :] * stride_x_f
-            x_ptr_2d_t0_f1 = x_base[:, None] + t_in0 * stride_x_t + f_in1[None, :] * stride_x_f
-            x_ptr_2d_t0_f2 = x_base[:, None] + t_in0 * stride_x_t + f_in2[None, :] * stride_x_f
-            x00 = tl.load(x_ptr_2d_t0_f0, mask=mask_cf, other=0.0)
-            x01 = tl.load(x_ptr_2d_t0_f1, mask=mask_cf, other=0.0)
-            x02 = tl.load(x_ptr_2d_t0_f2, mask=mask_cf, other=0.0)
-
-        # Load x for kt=1: (BLOCK_C, BLOCK_F)
-        x_ptr_2d_t1_f0 = x_base[:, None] + t_in1 * stride_x_t + f_in0[None, :] * stride_x_f
-        x_ptr_2d_t1_f1 = x_base[:, None] + t_in1 * stride_x_t + f_in1[None, :] * stride_x_f
-        x_ptr_2d_t1_f2 = x_base[:, None] + t_in1 * stride_x_t + f_in2[None, :] * stride_x_f
-        x10 = tl.load(x_ptr_2d_t1_f0, mask=mask_cf, other=0.0)
-        x11 = tl.load(x_ptr_2d_t1_f1, mask=mask_cf, other=0.0)
-        x12 = tl.load(x_ptr_2d_t1_f2, mask=mask_cf, other=0.0)
-
-        # Load x for kt=2: (BLOCK_C, BLOCK_F)
-        x_ptr_2d_t2_f0 = x_base[:, None] + t_in2 * stride_x_t + f_in0[None, :] * stride_x_f
-        x_ptr_2d_t2_f1 = x_base[:, None] + t_in2 * stride_x_t + f_in1[None, :] * stride_x_f
-        x_ptr_2d_t2_f2 = x_base[:, None] + t_in2 * stride_x_t + f_in2[None, :] * stride_x_f
-        x20 = tl.load(x_ptr_2d_t2_f0, mask=mask_cf, other=0.0)
-        x21 = tl.load(x_ptr_2d_t2_f1, mask=mask_cf, other=0.0)
-        x22 = tl.load(x_ptr_2d_t2_f2, mask=mask_cf, other=0.0)
-
-        # Compute convolution: broadcast weights (BLOCK_C,) -> (BLOCK_C, BLOCK_F)
-        acc += w00[:, None] * x00 + w01[:, None] * x01 + w02[:, None] * x02
-        acc += w10[:, None] * x10 + w11[:, None] * x11 + w12[:, None] * x12
-        acc += w20[:, None] * x20 + w21[:, None] * x21 + w22[:, None] * x22
-
-        if SILU_ACTIVATION:
-            acc = acc / (1 + tl.exp(-acc))
-
-        # Store output: (BLOCK_C, BLOCK_F)
-        o_ptr_2d = o_base[:, None] + t_out * stride_o_t + idx_f_out[None, :] * stride_o_f
-        tl.store(o_ptr_2d, acc, mask=mask_cf)
-
-    # Update cache with last input time frame for next batch
-    # IMPORTANT: This must happen AFTER reading cache for t_out=0 above
-    # For broadcast mode (in_channels=1), only first output block updates cache
-    should_update_cache = True
-    if not IS_DEPTHWISE:
-        should_update_cache = (tl.program_id(1) == 0)
-    
-    if should_update_cache:
-        tl.debug_barrier()
-        last_t = actual_t_len - 1
-        if IS_DEPTHWISE:
-            cache_mask = mask_c
-        else:
-            cache_mask = tl.arange(0, BLOCK_C) < 1
-        
-        # Update cache for all input frequencies at once
-        idx_f_cache = tl.arange(0, BLOCK_F)
-        mask_f_cache = idx_f_cache < freq_in
-        mask_cache_2d = cache_mask[:, None] & mask_f_cache[None, :]
-        
-        cache_store_ptr = cache_base[:, None] + idx_f_cache[None, :] * stride_cache_f
-        x_load_ptr = x_base[:, None] + last_t * stride_x_t + idx_f_cache[None, :] * stride_x_f
-        val = tl.load(x_load_ptr, mask=mask_cache_2d, other=0.0)
-        tl.store(cache_store_ptr, val, mask=mask_cache_2d)
-
-
-def causal_conv2d_k3s2_fn(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    conv_state: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    cache_indices: Optional[torch.Tensor] = None,
-    has_initial_state: Optional[torch.Tensor] = None,
-    activation: Optional[str] = None,
-    pad_slot_id: int = PAD_SLOT_ID,
-    metadata=None,
-    out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Causal 2D convolution with kernel=(3,3), stride=(2,2) for continuous batching.
-
-    This is the prefill function for processing variable-length sequences.
-    
-    Supports two modes:
-    - Depthwise: in_channels == out_channels, weight shape (C, 3, 3)
-    - Broadcast: in_channels == 1, weight shape (C_out, 3, 3)
-
-    Args:
-        x: (C_in, cu_time, F_in) input tensor where cu_time is total time across
-           all sequences concatenated. F_in is typically 80 for mel spectrograms.
-        weight: (C_out, 3, 3) 2D convolution weights
-        bias: (C_out,) optional bias
-        conv_state: (num_cache_lines, C_in, 1, F_in) cache storing 1 time frame
-        query_start_loc: (batch + 1,) cumulative time lengths prepended by 0
-        cache_indices: (batch,) indices into conv_state for each sequence
-        has_initial_state: (batch,) whether each sequence has a cached state
-        activation: "silu"/"swish" or None
-        pad_slot_id: value indicating padded entries in cache_indices
-        metadata: optional precomputed metadata for kernel launch
-        out: optional pre-allocated output tensor (C_out, cu_time_out, F_out).
-             If provided, avoids .item() call for CUDA graph compatibility.
-
-    Returns:
-        output: (C_out, cu_time_out, F_out) where:
-            cu_time_out = sum((seq_len + 1) // 2 for each seq)
-            F_out = (F_in - 3) // 2 + 1
-    """
-    if isinstance(activation, bool) and activation:
-        activation = "silu"
-
-    # Get dimensions
-    in_channels, cu_time, freq_in = x.shape
-    out_channels = weight.shape[0]
-    assert weight.shape == (out_channels, 3, 3), f"Expected weight shape (C_out, 3, 3), got {weight.shape}"
-    
-    # Determine mode: depthwise (in==out) or broadcast (in==1)
-    is_depthwise = (in_channels == out_channels)
-    if not is_depthwise:
-        assert in_channels == 1, f"Only depthwise (in==out) or broadcast (in==1) supported, got in={in_channels}, out={out_channels}"
-
-    # Compute output frequency dimension
-    freq_out = (freq_in - 3) // 2 + 1
-    assert freq_out > 0, f"freq_in={freq_in} too small for kernel=3, stride=2"
-
-    batch = query_start_loc.size(0) - 1
-
-    # Compute output time lengths per sequence
-    time_lens = query_start_loc.diff()
-    out_time_lens = (time_lens + 1) // 2
-    output_start_loc = torch.zeros(
-        batch + 1, dtype=query_start_loc.dtype, device=x.device
-    )
-    output_start_loc[1:] = out_time_lens.cumsum(0)
-
-    # Allocate output (with out_channels) or use pre-allocated buffer
-    if out is not None:
-        # Use pre-allocated output - avoids .item() for CUDA graph compatibility
-        cu_time_out = out.shape[1]
-    else:
-        # Allocate dynamically - requires CPU sync, not CUDA graph compatible
-        cu_time_out = output_start_loc[-1].item()
-        out = torch.empty((out_channels, cu_time_out, freq_out), dtype=x.dtype, device=x.device)
-
-    if cu_time_out == 0:
-        return out
-
-    # Setup cache indices if not provided
-    if cache_indices is None:
-        cache_indices = torch.arange(batch, dtype=torch.int32, device=x.device)
-
-    if has_initial_state is None:
-        has_initial_state = torch.ones(batch, dtype=torch.bool, device=x.device)
-
-    # Compute program grid
-    BLOCK_T = 4  # output time positions per chunk
-    BLOCK_C = 64  # channels per block (increased for better parallelism)
-    BLOCK_F = 64  # frequency outputs per block (covers all freq_out <= 40)
-    
-    # Validate frequency constraint
-    assert freq_in <= MAX_FREQ_IN, f"freq_in={freq_in} exceeds MAX_FREQ_IN={MAX_FREQ_IN}"
-    assert freq_out <= BLOCK_F, f"freq_out={freq_out} exceeds BLOCK_F={BLOCK_F}"
-
-    num_cache_lines = conv_state.size(0)
-
-    if metadata is not None:
-        batch_ptr = metadata.batch_ptr
-        time_chunk_offset_ptr = metadata.token_chunk_offset_ptr
-        # Use pre-computed output_start_loc from metadata if available
-        if hasattr(metadata, 'output_start_loc') and metadata.output_start_loc is not None:
-            output_start_loc = metadata.output_start_loc
-    else:
-        # This path uses CPU sync - not compatible with CUDA graph capture
-        if out is not None:
-            raise RuntimeError(
-                "When 'out' is provided for CUDA graph compatibility, "
-                "'metadata' must also be provided to avoid CPU sync operations."
+        if load_init_state:
+            # Load from conv_state cache
+            # Cache layout: (num_cache_lines, freq_len, channels)
+            cache_base = conv_state_ptr + cache_idx * stride_state_seq
+            
+            cache_f_hi = tl.load(
+                cache_base + f_hi * stride_state_freq + idx_ch * stride_state_ch,
+                mask=mask_ch, other=0.0
             )
-        # Compute number of programs needed
-        time_lens_cpu = time_lens.cpu().numpy()
-        out_time_lens_cpu = (time_lens_cpu + 1) // 2
-        num_chunks = (out_time_lens_cpu + BLOCK_T - 1) // BLOCK_T
-
-        total_programs = int(num_chunks.sum())
-
-        # Build batch_ptr and time_chunk_offset_ptr
-        batch_list = np.repeat(np.arange(batch), num_chunks)
-        offset_list = []
-        for n in num_chunks:
-            offset_list.extend(range(n))
-
-        batch_ptr = torch.from_numpy(batch_list).to(torch.int32).to(x.device)
-        time_chunk_offset_ptr = (
-            torch.tensor(offset_list, dtype=torch.int32, device=x.device)
+            cache_f_mid = tl.load(
+                cache_base + f_mid * stride_state_freq + idx_ch * stride_state_ch,
+                mask=mask_ch, other=0.0
+            )
+            cache_f_lo = tl.load(
+                cache_base + f_lo * stride_state_freq + idx_ch * stride_state_ch,
+                mask=mask_ch & valid_f_lo, other=0.0
+            )
+        else:
+            # No cached state, initialize to zeros
+            cache_f_hi = tl.zeros((BLOCK_CHANNELS,), dtype=x_ptr.dtype.element_ty)
+            cache_f_mid = tl.zeros((BLOCK_CHANNELS,), dtype=x_ptr.dtype.element_ty)
+            cache_f_lo = tl.zeros((BLOCK_CHANNELS,), dtype=x_ptr.dtype.element_ty)
+    else:
+        # Subsequent chunk: load from previous chunk's last odd time in x
+        t_prev_odd = (t_out_start - 1) * 2 + 1
+        t_abs_prev = seq_start_in + t_prev_odd
+        
+        cache_f_hi = tl.load(x_ptr + t_abs_prev * x_stride_t + f_hi * x_stride_f + idx_ch,
+                             mask=mask_ch, other=0.0)
+        cache_f_mid = tl.load(x_ptr + t_abs_prev * x_stride_t + f_mid * x_stride_f + idx_ch,
+                              mask=mask_ch, other=0.0)
+        cache_f_lo = tl.load(x_ptr + t_abs_prev * x_stride_t + f_lo * x_stride_f + idx_ch,
+                             mask=mask_ch & valid_f_lo, other=0.0)
+    
+    # ==========================================================================
+    # Step 8: Main convolution loop over time chunk
+    # ==========================================================================
+    # Track the last odd time values for cache update
+    last_x_odd_hi = cache_f_hi
+    last_x_odd_mid = cache_f_mid
+    last_x_odd_lo = cache_f_lo
+    
+    for t_local in range(BLOCK_TIME):
+        t_out_seq = t_out_start + t_local
+        valid_t = t_out_seq < seq_time_out
+        
+        t_odd_seq = t_out_seq * 2 + 1
+        t_even_seq = t_out_seq * 2
+        t_odd_abs = seq_start_in + t_odd_seq
+        t_even_abs = seq_start_in + t_even_seq
+        
+        # Load input values
+        x_odd_hi = tl.load(x_ptr + t_odd_abs * x_stride_t + f_hi * x_stride_f + idx_ch,
+                           mask=mask_ch & valid_t, other=0.0)
+        x_odd_mid = tl.load(x_ptr + t_odd_abs * x_stride_t + f_mid * x_stride_f + idx_ch,
+                            mask=mask_ch & valid_t, other=0.0)
+        x_odd_lo = tl.load(x_ptr + t_odd_abs * x_stride_t + f_lo * x_stride_f + idx_ch,
+                           mask=mask_ch & valid_f_lo & valid_t, other=0.0)
+        x_even_hi = tl.load(x_ptr + t_even_abs * x_stride_t + f_hi * x_stride_f + idx_ch,
+                            mask=mask_ch & valid_t, other=0.0)
+        x_even_mid = tl.load(x_ptr + t_even_abs * x_stride_t + f_mid * x_stride_f + idx_ch,
+                             mask=mask_ch & valid_t, other=0.0)
+        x_even_lo = tl.load(x_ptr + t_even_abs * x_stride_t + f_lo * x_stride_f + idx_ch,
+                            mask=mask_ch & valid_f_lo & valid_t, other=0.0)
+        
+        # Use cached values for t_prev
+        x_prev_hi = cache_f_hi
+        x_prev_mid = cache_f_mid
+        x_prev_lo = cache_f_lo
+        
+        # Compute 2D conv
+        out = (w00 * x_odd_hi  + w01 * x_odd_mid  + w02 * x_odd_lo +
+               w10 * x_even_hi + w11 * x_even_mid + w12 * x_even_lo +
+               w20 * x_prev_hi + w21 * x_prev_mid + w22 * x_prev_lo)
+        
+        # Store result
+        t_out_abs = seq_start_out + t_out_seq
+        tl.store(out_ptr + t_out_abs * out_stride_t + f_out * out_stride_f + idx_ch,
+                 out, mask=mask_ch & valid_t)
+        
+        # Update caches for next iteration
+        cache_f_hi = x_odd_hi
+        cache_f_mid = x_odd_mid
+        cache_f_lo = x_odd_lo
+        
+        # Track last valid values for final cache update
+        if valid_t:
+            last_x_odd_hi = x_odd_hi
+            last_x_odd_mid = x_odd_mid
+            last_x_odd_lo = x_odd_lo
+    
+    # ==========================================================================
+    # Step 9: Update conv_state cache with final state
+    # Only the last chunk for each sequence should update the cache
+    # We check if this is the last chunk by seeing if t_out_end == seq_time_out
+    # ==========================================================================
+    is_last_chunk = (t_out_end >= seq_time_out)
+    if is_last_chunk:
+        cache_base = conv_state_ptr + cache_idx * stride_state_seq
+        
+        tl.store(
+            cache_base + f_hi * stride_state_freq + idx_ch * stride_state_ch,
+            last_x_odd_hi, mask=mask_ch
+        )
+        tl.store(
+            cache_base + f_mid * stride_state_freq + idx_ch * stride_state_ch,
+            last_x_odd_mid, mask=mask_ch
+        )
+        tl.store(
+            cache_base + f_lo * stride_state_freq + idx_ch * stride_state_ch,
+            last_x_odd_lo, mask=mask_ch & valid_f_lo
         )
 
-    def grid(META):
-        return (
-            batch_ptr.size(0),
-            triton.cdiv(out_channels, META["BLOCK_C"]),
-        )
 
-    _causal_conv2d_k3s2_fwd_kernel[grid](
-        x,
-        weight,
-        bias,
-        conv_state,
-        cache_indices,
-        has_initial_state,
-        query_start_loc,
-        output_start_loc,
-        batch_ptr,
-        time_chunk_offset_ptr,
-        out,
-        # Dimensions
-        in_channels,
-        out_channels,
-        freq_in,
-        freq_out,
-        num_cache_lines,
-        # Strides for x
-        x.stride(0),
-        x.stride(1),
-        x.stride(2),
-        # Strides for w
-        weight.stride(0),
-        weight.stride(1),
-        weight.stride(2),
-        # Strides for cache
-        conv_state.stride(0),
-        conv_state.stride(1),
-        conv_state.stride(2),
-        conv_state.stride(3),
-        # Strides for output
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        # Others
-        pad_slot_id,
-        # Meta
-        HAS_BIAS=bias is not None,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        USE_PAD_SLOT=pad_slot_id is not None,
-        IS_DEPTHWISE=is_depthwise,
-        BLOCK_T=BLOCK_T,
-        BLOCK_C=BLOCK_C,
-        BLOCK_F=BLOCK_F,
-    )
-
-    return out
-
-
-def causal_conv2d_k3s2_update(
-    x: torch.Tensor,
-    conv_state: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor] = None,
-    activation: Optional[str] = None,
-    conv_state_indices: Optional[torch.Tensor] = None,
-    query_start_loc: Optional[torch.Tensor] = None,
-    pad_slot_id: int = PAD_SLOT_ID,
-    out: Optional[torch.Tensor] = None,
+def depthwise_strided_conv2d_cached(
+    x: torch.Tensor,                    # (cu_time_in, freq, channels) - packed sequences
+    w: torch.Tensor,                    # (3, 3, channels)
+    out: torch.Tensor,                  # (cu_time_out, freq//2, channels) - pre-allocated output
+    conv_state: torch.Tensor,           # (num_cache_lines, freq, channels) - cache
+    query_start_loc: torch.Tensor,      # (batch+1,) cumulative input time positions
+    cache_indices: torch.Tensor,        # (batch,) maps sequence to cache line
+    has_initial_state: torch.Tensor,    # (batch,) bool - whether to use cached state
+    block_ch: int = 256,
+    block_t: int = 64,
+    metadata=None,                      # Optional: provides pre-computed batch_ptr, etc.
 ) -> torch.Tensor:
     """
-    Update function for decode mode (processing small number of time frames).
+    Varlen depthwise strided 2D convolution with cache support.
     
-    Supports two modes:
-    - Depthwise: in_channels == out_channels, weight shape (C, 3, 3)
-    - Broadcast: in_channels == 1, weight shape (C_out, 3, 3)
-
+    Similar to causal_conv1d_fn, this supports step-by-step execution where:
+    - conv_state stores temporal history from previous tokens
+    - cache_indices maps each sequence to its cache line
+    - has_initial_state indicates whether to read from cache
+    
+    If metadata is provided, uses pre-computed batch_ptr/time_chunk_offset_ptr from it
+    (no CPU blocking). Otherwise computes on the fly (CPU blocking - not for CUDA graphs).
+    
     Args:
-        x: Input tensor:
-           - (batch, C_in, T, F_in) for fixed-length batched input
-           - (C_in, cu_time, F_in) for varlen continuous batching (requires query_start_loc)
-        conv_state: (num_cache_lines, C_in, 1, F_in) cache
-        weight: (C_out, 3, 3) weights
-        bias: (C_out,) optional bias
-        activation: "silu"/"swish" or None
-        conv_state_indices: (batch,) cache line indices per sequence
-        query_start_loc: (batch + 1,) for varlen mode
-        pad_slot_id: value indicating padded entries
-        out: optional pre-allocated output tensor. If provided, avoids .item()
-             call for CUDA graph compatibility.
-
+        x: Packed input tensor (cu_time_in, freq, channels)
+        w: Kernel weights (3, 3, channels)
+        out: Pre-allocated output tensor (cu_time_out, freq//2, channels)
+        conv_state: Cache tensor (num_cache_lines, freq, channels)
+                   Stores the last processed odd time step values.
+                   Updated in-place after processing.
+        query_start_loc: Cumulative sequence boundaries (batch+1,)
+        cache_indices: Maps each sequence to cache line (batch,)
+        has_initial_state: Whether to use cached state (batch,) bool
+        block_ch: Channel block size
+        block_t: Time block size
+        metadata: Optional metadata with pre-computed batch_ptr, time_chunk_offset_ptr,
+                  query_start_loc_out, num_programs (for CUDA graph compatibility)
+    
     Returns:
-        output: (batch, C_out, T_out, F_out) or (C_out, cu_time_out, F_out)
+        Output tensor (cu_time_out, freq//2, channels)
     """
-    if isinstance(activation, bool):
-        activation = "silu" if activation else None
-
-    is_varlen = query_start_loc is not None
-    out_channels = weight.shape[0]
-
-    if is_varlen:
-        # Varlen mode: x is (C_in, cu_time, F_in)
-        in_channels, cu_time, freq_in = x.shape
-        batch = query_start_loc.size(0) - 1
-        time_len = 0  # Computed per-sequence
-        freq_out = (freq_in - 3) // 2 + 1
-
-        # Allocate output or use pre-allocated buffer
-        if out is not None:
-            # Use pre-allocated output - avoids .item() for CUDA graph compatibility
-            cu_time_out = out.shape[1]
-        else:
-            # Allocate dynamically - requires CPU sync, not CUDA graph compatible
-            time_lens = query_start_loc.diff()
-            out_time_lens = (time_lens + 1) // 2
-            cu_time_out = out_time_lens.sum().item()
-            out = torch.empty((out_channels, cu_time_out, freq_out), dtype=x.dtype, device=x.device)
-
-        stride_x_b = 0
-        stride_x_c = x.stride(0)
-        stride_x_t = x.stride(1)
-        stride_x_f = x.stride(2)
-        stride_o_b = 0
-        stride_o_c = out.stride(0)
-        stride_o_t = out.stride(1)
-        stride_o_f = out.stride(2)
+    cu_time_in, freq_len, channels = x.shape
+    freq_out = freq_len // 2
+    
+    assert freq_len % 2 == 0, "Frequency dimension must be even"
+    assert conv_state.shape[1] >= freq_len, "conv_state frequency dimension must be >= freq_len"
+    assert conv_state.shape[2] == channels, "conv_state channels dimension must be == channels"
+    
+    # Get batch_ptr, time_chunk_offset_ptr, query_start_loc_out from metadata or compute
+    if metadata is not None:
+        # Use pre-computed values from metadata (no CPU blocking)
+        batch_ptr = metadata.batch_ptr
+        time_chunk_offset_ptr = metadata.time_chunk_offset_ptr
+        query_start_loc_out = metadata.query_start_loc_out
+        num_programs = metadata.num_programs
     else:
-        # Fixed length mode: x is (batch, C_in, T, F_in)
-        if x.dim() == 3:
-            # (C_in, T, F_in) -> (1, C_in, T, F_in)
-            x = x.unsqueeze(0)
-
-        batch, in_channels, time_len, freq_in = x.shape
-        freq_out = (freq_in - 3) // 2 + 1
-        out_time_len = (time_len + 1) // 2
-
-        # Allocate output or use pre-allocated buffer
-        if out is None:
-            out = torch.empty((batch, out_channels, out_time_len, freq_out), dtype=x.dtype, device=x.device)
-
-        stride_x_b = x.stride(0)
-        stride_x_c = x.stride(1)
-        stride_x_t = x.stride(2)
-        stride_x_f = x.stride(3)
-        stride_o_b = out.stride(0)
-        stride_o_c = out.stride(1)
-        stride_o_t = out.stride(2)
-        stride_o_f = out.stride(3)
-
-    # Determine mode
-    is_depthwise = (in_channels == out_channels)
-    if not is_depthwise:
-        assert in_channels == 1, f"Only depthwise (in==out) or broadcast (in==1) supported, got in={in_channels}, out={out_channels}"
-
-    if conv_state_indices is None:
-        conv_state_indices = torch.arange(batch, dtype=torch.int32, device=x.device)
-
-    assert weight.shape == (out_channels, 3, 3)
+        # Compute on the fly (CPU blocking - not safe for CUDA graphs)
+        query_start_loc_cpu = query_start_loc.cpu()
+        seqlens_in = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        seqlens_out = seqlens_in // 2
+        
+        batch_size = len(seqlens_in)
+        
+        query_start_loc_out_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
+        query_start_loc_out_cpu[1:] = torch.cumsum(seqlens_out, dim=0)
+        
+        # Build program mapping
+        batch_list = []
+        chunk_offset_list = []
+        
+        for seq_idx, seq_out_len in enumerate(seqlens_out.numpy()):
+            num_chunks = int(np.ceil(seq_out_len / block_t))
+            if num_chunks == 0:
+                num_chunks = 1
+            batch_list.extend([seq_idx] * num_chunks)
+            chunk_offset_list.extend(range(num_chunks))
+        
+        num_programs = len(batch_list)
+        
+        batch_ptr = torch.tensor(batch_list, dtype=torch.int32, device=x.device)
+        time_chunk_offset_ptr = torch.tensor(chunk_offset_list, dtype=torch.int32, device=x.device)
+        query_start_loc_out = query_start_loc_out_cpu.to(x.device)
     
-    # Validate frequency constraint
-    assert freq_in <= MAX_FREQ_IN, f"freq_in={freq_in} exceeds MAX_FREQ_IN={MAX_FREQ_IN}"
-
-    num_cache_lines = conv_state.size(0)
-
-    BLOCK_C = 64  # channels per block (increased for better parallelism)
-    BLOCK_F = 64  # frequency outputs per block (covers all freq_out <= 40)
+    # Get strides
+    stride_state_seq, stride_state_freq, stride_state_ch = conv_state.stride()
     
-    assert freq_out <= BLOCK_F, f"freq_out={freq_out} exceeds BLOCK_F={BLOCK_F}"
+    # Launch kernel
+    grid = (num_programs, freq_out, triton.cdiv(channels, block_ch))
 
-    def grid(META):
-        return (batch, triton.cdiv(out_channels, META["BLOCK_C"]))
-
-    _causal_conv2d_k3s2_update_kernel[grid](
-        x,
-        weight,
-        bias,
-        conv_state,
-        conv_state_indices,
-        query_start_loc,
-        out,
-        # Dimensions
-        batch,
-        in_channels,
-        out_channels,
-        time_len,
-        freq_in,
-        freq_out,
-        num_cache_lines,
-        # Strides
-        stride_x_b,
-        stride_x_c,
-        stride_x_t,
-        stride_x_f,
-        weight.stride(0),
-        weight.stride(1),
-        weight.stride(2),
-        conv_state.stride(0),
-        conv_state.stride(1),
-        conv_state.stride(2),
-        conv_state.stride(3),
-        stride_o_b,
-        stride_o_c,
-        stride_o_t,
-        stride_o_f,
-        # Others
-        pad_slot_id,
-        # Meta
-        HAS_BIAS=bias is not None,
-        SILU_ACTIVATION=activation in ["silu", "swish"],
-        IS_VARLEN=is_varlen,
-        USE_PAD_SLOT=pad_slot_id is not None,
-        IS_DEPTHWISE=is_depthwise,
-        BLOCK_C=BLOCK_C,
-        BLOCK_F=BLOCK_F,
+    depthwise_strided_conv2d_cached_kernel[grid](
+        x, w, out,
+        conv_state, cache_indices, has_initial_state,
+        batch_ptr, time_chunk_offset_ptr,
+        query_start_loc, query_start_loc_out,
+        FREQ_LEN=freq_len,
+        TOTAL_CHANNELS=channels,
+        num_cache_lines=conv_state.shape[0],
+        stride_state_seq=stride_state_seq,
+        stride_state_freq=stride_state_freq,
+        stride_state_ch=stride_state_ch,
+        BLOCK_CHANNELS=block_ch,
+        BLOCK_TIME=block_t,
     )
-
+    
     return out
