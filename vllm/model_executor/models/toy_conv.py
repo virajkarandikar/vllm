@@ -226,14 +226,25 @@ class ToyConv(nn.Module):
         self.config = vllm_config.model_config.hf_config
 
         # TODO: extract the values from config
-        self.conv = torch.nn.ModuleList([ToyConv2dLayer(
-            channels=256,
-            freq=80,
-            time_factor=2,
-            prefix=f"{prefix}.conv.0",
-            cache_config=vllm_config.cache_config,
-            dtype=vllm_config.model_config.dtype,
-        )])
+        self.conv = torch.nn.ModuleList([
+            ToyConv2dLayer(
+                channels=256,
+                freq=80,
+                time_factor=4,
+                prefix=f"{prefix}.conv.0",
+                cache_config=vllm_config.cache_config,
+                dtype=vllm_config.model_config.dtype,
+            ),
+            ToyConv2dLayer(
+                channels=256,
+                freq=40,
+                time_factor=2,
+                prefix=f"{prefix}.conv.1",
+                cache_config=vllm_config.cache_config,
+                dtype=vllm_config.model_config.dtype,
+            ),
+
+        ])
         
         # not used, but present for compatability with vLLM generation model
         self.vocab_size = getattr(self.config, "vocab_size", 1)
@@ -257,8 +268,8 @@ class ToyConv(nn.Module):
         Returns:
             x: (T_target, Factor/2 * Freq/2 * Channels) output
         """
-        conv_0 = self.conv[0]
-        x = conv_0(conv_input)
+        x = self.conv[0](conv_input)
+        x = self.conv[1](x)
         return x, x
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
