@@ -2,12 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from vllm.model_executor.layers.conv.causal_conv2d_k3s2 import (
-    causal_conv2d_k3s2_fn,
-    causal_conv2d_k3s2_update,
+    depthwise_strided_conv2d_cached,
 )
 
 __all__ = [
-    "causal_conv2d_k3s2_fn",
-    "causal_conv2d_k3s2_update",
+    "depthwise_strided_conv2d_cached",
 ]
 
