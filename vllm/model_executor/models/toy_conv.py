@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""
+Cached 2D Convolution Model for FastConformer-style mel-spectrogram subsampling.
+
+Implements strided depthwise conv layers with KV-cache-like state management
+for streaming inference. Downsamples (T*8, 80) mel features to (T, 512).
+"""
 
 from typing import Optional, Iterable
 
@@ -20,22 +26,14 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils import direct_register_custom_op
 from vllm.compilation.decorators import support_torch_compile
 
-from .utils import AutoWeightsLoader
-
 
 @CustomOp.register("toy_conv2d_layer")
 class ToyConv2dLayer(CustomOp, AttentionLayerBase):
     """
-    Toy 2D convolution layer using causal_conv2d_k3s2 kernel.
-    It works for specific usecase: strided convolution is applied to melspec.
-    Here we run cached inference with cache over time dimension, while
-    both time and frequency dimensions are getting reduced.
-
-    This is a part of bigger model which works on particular time resolution.
-    Layer takes a multiplier which describes relation between target and current time resolution.
+    Cached depthwise strided 2D convolution layer with kernel=3, stride=2.
     
-    Input: (T_target x Factor * Freq * Channels)
-    Output: (T_target x Factor/2 * Freq/2 * Channels)
+    Processes (T, Freq, Channels) -> (T/2, Freq/2, Channels).
+    Maintains cache for causal streaming over time dimension.
     """
     
     def __init__(
@@ -50,22 +48,27 @@ class ToyConv2dLayer(CustomOp, AttentionLayerBase):
         super().__init__()
         
         self.prefix = prefix
-        self.channels = channels  # num channels
+        self.channels = channels
         self.freq = freq
         self.time_factor = time_factor
         
         # Fixed kernel parameters for causal_conv2d_k3s2
         self.kernel_size = 3
         self.stride = 2
+        # Padded to 512 so cache pages have same size as fastconformer attention
         self.padded_freq = 512
-        assert self.channels == 256, f"Hardedcoded padded_freq={self.padded_freq} assumes channels==256"
+        assert self.channels == 256, \
+            f"padded_freq={self.padded_freq} assumes channels==256"
         
-        # depthwise separate convolution weight for a custom kernel
+        # Depthwise conv weight: (kH, kW, C) for custom kernel
         self.conv_weight = nn.Parameter(
-            torch.zeros(self.kernel_size,self.kernel_size, self.channels),
+            torch.zeros(self.kernel_size, self.kernel_size, self.channels),
             requires_grad=False,
         )
-        # TODO: create bias parameter
+        self.conv_bias = nn.Parameter(
+            torch.zeros(self.channels),
+            requires_grad=False,
+        )
 
         self.cache_config = cache_config
         self.kv_cache = [torch.tensor([])]
@@ -84,19 +87,18 @@ class ToyConv2dLayer(CustomOp, AttentionLayerBase):
 
     def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        CUDA forward using the custom convolution kernel.
-        
         Args:
-            hidden_states: (T_target x Factor * Freq * Channels) input tensor
-            
+            hidden_states: (T, Freq, Channels) input tensor
         Returns:
-            output: (T_target x Factor/2 * Freq/2 * Channels)
+            output: (T/2, Freq/2, Channels)
         """
-        assert hidden_states.dim() == 2, "forward expects a 2D tensor (T_target x Factor * Freq * Channels)"
-        t_target, factor_freq_channels = hidden_states.shape
-        assert factor_freq_channels == self.time_factor * self.freq * self.channels, f"hidden state dim {factor_freq_channels} should be a prod of time factor, freq, channels"
+        assert hidden_states.dim() == 3, "forward expects 3D tensor (T, F, C)"
+        assert hidden_states.shape[1] == self.freq
+        assert hidden_states.shape[2] == self.channels
         
-        hidden_states = hidden_states.view(t_target * self.time_factor, self.freq, self.channels)  # T x Freq x Channels
+        seq_len = hidden_states.shape[0]
+        out_seq_len = seq_len // 2
+        out_freq = self.freq // 2
 
         fctx = get_forward_context()
         attn_meta_all = fctx.attn_metadata
@@ -104,73 +106,53 @@ class ToyConv2dLayer(CustomOp, AttentionLayerBase):
         if attn_meta_all is None:
             # Profile run - return zeros with correct output shape
             return torch.zeros(
-                t_target,
-                self.time_factor // 2 * self.freq // 2 * self.channels,
+                (out_seq_len, out_freq, self.channels),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device
             )
         
-        # Input is already (C, T, F) - matches kernel expectation
         x = hidden_states.contiguous()
 
         attn_metadata: ToyConv2dMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
-        # store is larger across `freq` dimension, but kernel only uses [idx, :freq] part
-        store = self.kv_cache[fctx.virtual_engine]  # (num_blocks, 512, Channels)
+        # Cache store: (num_blocks, padded_freq, channels)
+        # Only [:, :freq, :] is used; padding ensures uniform page sizes
+        store = self.kv_cache[fctx.virtual_engine]
 
         query_start_loc = attn_metadata.query_start_loc
         
-        # has_initial_state comes from metadata - True if cache has valid data (decode),
-        # False for first call (prefill). This is computed based on num_computed_tokens.
-        # has_initial_state = attn_metadata.has_initial_state
+        # True if cache has valid data (decode), False for first call (prefill)
         has_initial_state = torch.ones(
             page_indices.size(0), dtype=torch.bool, device=x.device
         )
 
-        # Allocate output tensor before calling kernel
-        # Output shape: (cu_time_out, freq//2, channels) where cu_time_out = cu_time_in // 2
-        cu_time_in = x.shape[0]
-        cu_time_out = cu_time_in // 2
-        freq_out = self.freq // 2
         out = torch.empty(
-            (cu_time_out, freq_out, self.channels),
+            (out_seq_len, out_freq, self.channels),
             device=x.device,
             dtype=x.dtype
         )
 
-        # Use pre-computed metadata from the builder (no CPU blocking)
-        # The backend returned by get_toy_conv2d_backend(time_factor) has a builder
-        # that pre-computes metadata with the correct time_factor.
         depthwise_strided_conv2d_cached(
             x,
             self.conv_weight,
+            self.conv_bias,
             out,
             store,
             query_start_loc,
             page_indices,
             has_initial_state,
             metadata=attn_metadata,
-        )  # (time / 2, freq / 2, channels)
-        
-        # reshape back to (t_target, Factor/2 * Freq/2 * Channels)
-        return out.view(t_target, self.time_factor // 2 * self.freq // 2 * self.channels)
+        )
+        return out
 
     def get_attn_backend(self) -> AttentionBackend:
-        # Return a backend configured for this layer's time_factor
-        # The backend's builder will pre-compute metadata with the correct time_factor
         return get_toy_conv2d_backend(self.time_factor)
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
-            # WARNING: when caching is enabled, block size be the same across all layers.
-            # for conv we need only 1 though.
             block_size=1,
-            # WARNING: this we hardcode a larger cache, so the page has same
-            # size as page for fastconformer attn.
-            # self.padded_freq is computed assuming certain channels number.
-            # during usage we just slice according to self.freq. 
             shape=(self.padded_freq, self.channels),
             dtype=self.dtype,
         )
@@ -189,14 +171,10 @@ def toy_conv2d_fwd_fake(
     hidden_states: torch.Tensor,
     layer_name: str,
 ) -> torch.Tensor:
-    # The fake kernel must return the correct OUTPUT shape, not input shape.
-    # Input:  (T_target, time_factor * freq * channels)
-    # Output: (T_target, time_factor/2 * freq/2 * channels)
-    # Since stride=2 in both time and freq dimensions, output is 1/4 the size.
-    t_target = hidden_states.shape[0]
-    output_dim = hidden_states.shape[1] // 4
+    # Output shape after stride=2: (seq_len/2, freq/2, channels)
+    seq_len, freq, channels = hidden_states.shape
     return torch.zeros(
-        t_target, output_dim,
+        (seq_len // 2, freq // 2, channels),
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
@@ -209,13 +187,89 @@ direct_register_custom_op(
 )
 
 
+class ConvSubsampling(nn.Module):
+    """
+    FastConformer convolutional subsampling: 8x time reduction, 80->11 freq.
+    
+    Stack: Conv(3x3,s=2) -> ReLU -> [Conv -> Linear -> ReLU] x2 -> Linear
+    """
+    
+    def __init__(self, hf_config, cache_config, dtype, prefix: str = ""):
+        super().__init__()
+        self.config = hf_config
+
+        self.freq_no_pad = 80   # Input mel bins
+        self.orig_freq = 88     # After padding (divisible by 8)
+        self.freq_out = 11      # Output freq after 3x stride-2
+        self.total_time_factor = 8
+        self.channels = 256
+        self.padding = self.orig_freq - self.freq_no_pad
+        out_dim = 512
+        
+        layers = []
+        activation = torch.nn.ReLU(inplace=True)
+        time_factor = self.total_time_factor
+        freq = self.orig_freq
+
+        # First conv layer
+        layers.append(
+            ToyConv2dLayer(
+                channels=self.channels,
+                freq=freq,
+                time_factor=time_factor,
+                prefix=f"{prefix}.conv.0",
+                cache_config=cache_config,
+                dtype=dtype,
+            )
+        )
+        freq = freq // 2
+        time_factor = time_factor // 2
+        layers.append(activation)
+
+        # Two more conv layers, each followed by pointwise conv
+        for i in range(2):
+            layers.append(
+                ToyConv2dLayer(
+                    channels=self.channels,
+                    freq=freq,
+                    time_factor=time_factor,
+                    prefix=f"{prefix}.conv.{i+1}",
+                    cache_config=cache_config,
+                    dtype=dtype,
+                )
+            )
+            freq = freq // 2
+            time_factor = time_factor // 2
+            layers.append(torch.nn.Linear(self.channels, self.channels))
+            layers.append(activation)
+        
+        self.conv = nn.ModuleList(layers)
+        self.out = nn.Linear(self.channels * self.freq_out, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input: (T_target, Factor * Freq) flattened mel features
+        Output: (T_target, out_dim)
+        """
+        # Reshape to (T*factor, freq_no_pad)
+        x = x.view(-1, self.freq_no_pad)
+        # Pad frequency: 80 + 8 = 88 -> 44 -> 22 -> 11
+        x = torch.nn.functional.pad(x, (self.padding, 0))
+        # Expand channels: mimic 1->256 conv
+        x = x.unsqueeze(2).repeat(1, 1, self.channels).contiguous()
+
+        # Apply conv stack
+        for layer in self.conv:
+            x = layer(x)
+
+        # Final projection: (T, 11, 256) -> (T, 11*256) -> (T, 512)
+        x = self.out(x.transpose(2, 1).flatten(start_dim=1))
+        return x
+
+
 @support_torch_compile
 class ToyConv(nn.Module):
-    """
-    Toy model for testing causal_conv2d_k3s2 kernel.
-    
-    Uses a single ToyConv2dLayer with kernel=(3,3), stride=(2,2).
-    """
+    """Toy model for testing cached strided conv2d kernel."""
     
     def __init__(
         self,
@@ -223,33 +277,19 @@ class ToyConv(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.config = vllm_config.model_config.hf_config
+        hf_config = vllm_config.model_config.hf_config
 
-        # TODO: extract the values from config
-        self.conv = torch.nn.ModuleList([
-            ToyConv2dLayer(
-                channels=256,
-                freq=80,
-                time_factor=4,
-                prefix=f"{prefix}.conv.0",
-                cache_config=vllm_config.cache_config,
-                dtype=vllm_config.model_config.dtype,
-            ),
-            ToyConv2dLayer(
-                channels=256,
-                freq=40,
-                time_factor=2,
-                prefix=f"{prefix}.conv.1",
-                cache_config=vllm_config.cache_config,
-                dtype=vllm_config.model_config.dtype,
-            ),
-
-        ])
+        self.pre_encode = ConvSubsampling(
+            hf_config=hf_config,
+            cache_config=vllm_config.cache_config,
+            dtype=vllm_config.model_config.dtype,
+            prefix=prefix,
+        )
         
-        # not used, but present for compatability with vLLM generation model
-        self.vocab_size = getattr(self.config, "vocab_size", 1)
+        # Compatibility with vLLM generation interface
+        self.vocab_size = 1
         self.embed_tokens = nn.Embedding(self.vocab_size, 256)
-        self.proj = nn.Linear(256, self.vocab_size)
+        self.proj = nn.Linear(512, self.vocab_size)
 
     def forward(
         self,
@@ -260,16 +300,12 @@ class ToyConv(nn.Module):
         conv_input: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Forward pass.
-        
         Args:
-            conv_input: (T_target, Factor * Freq * Channels) tensor
-            
+            conv_input: (T_target, Factor * Freq) tensor
         Returns:
-            x: (T_target, Factor/2 * Freq/2 * Channels) output
+            x: (T_target, OutDim) output
         """
-        x = self.conv[0](conv_input)
-        x = self.conv[1](x)
+        x = self.pre_encode(conv_input)
         return x, x
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -278,6 +314,40 @@ class ToyConv(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.proj(hidden_states)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        """Load weights from FastConformer checkpoint."""
+        nemo = {name: tensor for name, tensor in weights}
+        
+        # Depthwise conv layers: (C, 1, kH, kW) -> (kH, kW, C) with flip
+        self.pre_encode.conv[0].conv_weight.data.copy_(
+            nemo["encoder.pre_encode.conv.0.weight"]
+            .squeeze(1).permute(1, 2, 0).flip(1).flip(0).contiguous())
+        self.pre_encode.conv[2].conv_weight.data.copy_(
+            nemo["encoder.pre_encode.conv.2.weight"]
+            .squeeze(1).permute(1, 2, 0).flip(1).flip(0))
+        self.pre_encode.conv[5].conv_weight.data.copy_(
+            nemo["encoder.pre_encode.conv.5.weight"]
+            .squeeze(1).permute(1, 2, 0).flip(1).flip(0))
+        
+        # Pointwise conv (1x1): (out, in, 1, 1) -> (out, in)
+        self.pre_encode.conv[3].weight.data.copy_(
+            nemo["encoder.pre_encode.conv.3.weight"].squeeze(-1).squeeze(-1))
+        self.pre_encode.conv[3].bias.data.copy_(
+            nemo["encoder.pre_encode.conv.3.bias"])
+        
+        self.pre_encode.conv[6].weight.data.copy_(
+            nemo["encoder.pre_encode.conv.6.weight"].squeeze(-1).squeeze(-1))
+        self.pre_encode.conv[6].bias.data.copy_(
+            nemo["encoder.pre_encode.conv.6.bias"])
+
+        # Conv biases
+        self.pre_encode.conv[0].conv_bias.data.copy_(
+            nemo["encoder.pre_encode.conv.0.bias"])
+        self.pre_encode.conv[2].conv_bias.data.copy_(
+            nemo["encoder.pre_encode.conv.2.bias"])
+        self.pre_encode.conv[5].conv_bias.data.copy_(
+            nemo["encoder.pre_encode.conv.5.bias"])
+        
+        # Output projection
+        self.pre_encode.out.weight.data.copy_(nemo["encoder.pre_encode.out.weight"])
+        self.pre_encode.out.bias.data.copy_(nemo["encoder.pre_encode.out.bias"])
