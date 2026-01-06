@@ -17,6 +17,7 @@ def depthwise_strided_conv2d_cached_kernel(
     # Pointers
     x_ptr,              # input: (cu_time_in, frequency, channels) - packed sequences
     w_ptr,              # kernel: (3, 3, channels)
+    bias_ptr,           # bias: (channels,)
     out_ptr,            # output: (cu_time_out, frequency//2, channels) - packed sequences
     # Cache pointers (like conv_states in causal_conv1d)
     conv_state_ptr,     # cache: (num_cache_lines, freq_len, channels) - stores last odd time values
@@ -116,6 +117,7 @@ def depthwise_strided_conv2d_cached_kernel(
     w20 = tl.load(w_ptr + 2*w_stride_t + 0*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
     w21 = tl.load(w_ptr + 2*w_stride_t + 1*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
     w22 = tl.load(w_ptr + 2*w_stride_t + 2*w_stride_f + idx_ch, mask=mask_ch, other=0.0)
+    bias = tl.load(bias_ptr + idx_ch, mask=mask_ch, other=0.0)
     
     # ==========================================================================
     # Step 7: Initialize temporal cache (like causal_conv1d)
@@ -197,7 +199,7 @@ def depthwise_strided_conv2d_cached_kernel(
         # Compute 2D conv
         out = (w00 * x_odd_hi  + w01 * x_odd_mid  + w02 * x_odd_lo +
                w10 * x_even_hi + w11 * x_even_mid + w12 * x_even_lo +
-               w20 * x_prev_hi + w21 * x_prev_mid + w22 * x_prev_lo)
+               w20 * x_prev_hi + w21 * x_prev_mid + w22 * x_prev_lo + bias)
         
         # Store result
         t_out_abs = seq_start_out + t_out_seq
@@ -241,6 +243,7 @@ def depthwise_strided_conv2d_cached_kernel(
 def depthwise_strided_conv2d_cached(
     x: torch.Tensor,                    # (cu_time_in, freq, channels) - packed sequences
     w: torch.Tensor,                    # (3, 3, channels)
+    bias: torch.Tensor,                 # (channels,)
     out: torch.Tensor,                  # (cu_time_out, freq//2, channels) - pre-allocated output
     conv_state: torch.Tensor,           # (num_cache_lines, freq, channels) - cache
     query_start_loc: torch.Tensor,      # (batch+1,) cumulative input time positions
@@ -264,6 +267,7 @@ def depthwise_strided_conv2d_cached(
     Args:
         x: Packed input tensor (cu_time_in, freq, channels)
         w: Kernel weights (3, 3, channels)
+        bias: Bias (channels,)
         out: Pre-allocated output tensor (cu_time_out, freq//2, channels)
         conv_state: Cache tensor (num_cache_lines, freq, channels)
                    Stores the last processed odd time step values.
@@ -328,7 +332,7 @@ def depthwise_strided_conv2d_cached(
     grid = (num_programs, freq_out, triton.cdiv(channels, block_ch))
 
     depthwise_strided_conv2d_cached_kernel[grid](
-        x, w, out,
+        x, w, bias, out,
         conv_state, cache_indices, has_initial_state,
         batch_ptr, time_chunk_offset_ptr,
         query_start_loc, query_start_loc_out,
