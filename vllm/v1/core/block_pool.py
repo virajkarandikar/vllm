@@ -178,6 +178,10 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+        
+        # Track block IDs that were freed and need to be zeroed by the worker
+        # This is populated by free_blocks() and consumed by take_freed_block_ids()
+        self._freed_block_ids: list[int] = []
 
         self.metrics_collector = metrics_collector
 
@@ -419,6 +423,11 @@ class BlockPool:
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
         eviction priority, where the first block will be evicted first.
+        
+        When a block's reference count reaches zero, its block ID is tracked
+        so that the worker can zero the block's GPU tensors. This prevents state
+        contamination when the block is reused by another request, which is 
+        critical for correctness in Mamba-based models.
 
         Args:
             ordered_blocks: A list of blocks to free ordered by their eviction
@@ -426,8 +435,14 @@ class BlockPool:
         """
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
+        
         for block in blocks_list:
             block.ref_cnt -= 1
+            
+            # Track block for zeroing when ref_cnt reaches 0
+            if block.ref_cnt == 0 and not block.is_null:
+                self._freed_block_ids.append(block.block_id)
+        
         self.free_block_queue.append_n(
             [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
         )
@@ -518,3 +533,16 @@ class BlockPool:
         events = self.kv_event_queue
         self.kv_event_queue = []
         return events
+
+    def take_freed_block_ids(self) -> list[int]:
+        """Atomically takes all freed block IDs and clears the tracking list.
+        
+        These block IDs should be zeroed by the worker to prevent state
+        contamination when blocks are reused.
+
+        Returns:
+            A list of block IDs that were freed since the last call.
+        """
+        freed_ids = self._freed_block_ids
+        self._freed_block_ids = []
+        return freed_ids
