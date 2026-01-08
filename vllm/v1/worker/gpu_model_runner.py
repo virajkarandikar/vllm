@@ -1166,6 +1166,10 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        # Zero freed KV cache blocks to prevent state contamination
+        if scheduler_output.block_ids_to_zero:
+            self._zero_kv_cache_blocks(scheduler_output.block_ids_to_zero)
+        
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
