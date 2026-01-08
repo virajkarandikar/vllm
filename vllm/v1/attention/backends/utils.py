@@ -937,27 +937,36 @@ def mamba_get_block_table_tensor(
         return torch.gather(block_table, 1, indices_to_gather)
 
 
-def compute_causal_conv2d_metadata(
+def compute_varlen_chunk_metadata(
     query_start_loc: torch.Tensor,
     time_factor: int = 1,
-    block_t: int = 64,
+    output_divisor: int = 2,
+    block_size: int = 64,
 ):
     """
-    Compute metadata for causal_conv2d_k3s2 kernel.
+    Compute metadata for varlen chunked kernels (conv2d, STFT, etc.).
 
-    This is similar to compute_causal_conv1d_metadata but handles the 2D conv
-    with stride=2 which halves both time and frequency dimensions.
+    This is a generic function for kernels that process packed sequences
+    in chunks. It computes batch_ptr and time_chunk_offset_ptr for mapping
+    program IDs to (sequence_index, chunk_index) pairs.
+
+    Output length formula: seqlens_out = seqlens_in // output_divisor
+    
+    Examples:
+        - Conv2d stride=2: output_divisor=2
+        - STFT: output_divisor=hop_length (assumes cache is always used)
 
     Args:
-        query_start_loc: (batch+1,) cumulative input time positions
-        time_factor: multiplier for scaling query_start_loc
-        block_t: time block size for chunking (default 64)
+        query_start_loc: (batch+1,) cumulative input positions
+        time_factor: multiplier for scaling query_start_loc (default 1)
+        output_divisor: divisor for output length (default 2)
+        block_size: chunk size for processing (default 64)
 
     Returns:
         A dict containing:
             - batch_ptr: maps program_id -> sequence index
             - time_chunk_offset_ptr: maps program_id -> chunk index
-            - query_start_loc_out: cumulative output time positions
+            - query_start_loc_out: cumulative output positions
             - num_programs: total number of programs to launch
     """
     device = "cuda"
@@ -968,8 +977,8 @@ def compute_causal_conv2d_metadata(
     # Compute input sequence lengths
     seqlens_in = query_start_loc_scaled.diff().to("cpu")
 
-    # Output sequence lengths are halved due to stride=2
-    seqlens_out = seqlens_in // 2
+    # Compute output sequence lengths: seqlens_out = seqlens_in // output_divisor
+    seqlens_out = seqlens_in // output_divisor
 
     batch_size = len(seqlens_in)
 
@@ -977,8 +986,8 @@ def compute_causal_conv2d_metadata(
     query_start_loc_out_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
     query_start_loc_out_cpu[1:] = torch.cumsum(seqlens_out, dim=0)
 
-    # Build program mapping (like causal_conv1d but with different block size)
-    nums = -(-seqlens_out // block_t)  # ceiling division
+    # Build program mapping (like causal_conv1d but with configurable block size)
+    nums = -(-seqlens_out // block_size)  # ceiling division
 
     mlist = torch.from_numpy(np.repeat(np.arange(len(nums)), nums))
     mlist_len = len(mlist)
@@ -997,7 +1006,7 @@ def compute_causal_conv2d_metadata(
         # Rebuild mlist for sequences with zero output length
         batch_list = []
         for seq_idx, seq_out_len in enumerate(seqlens_out.numpy()):
-            num_chunks = int(np.ceil(seq_out_len / block_t))
+            num_chunks = int(np.ceil(seq_out_len / block_size))
             if num_chunks == 0:
                 num_chunks = 1
             batch_list.extend([seq_idx] * num_chunks)

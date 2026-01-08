@@ -8,23 +8,200 @@ for streaming inference. Downsamples (T*8, 80) mel features to (T, 512).
 
 from typing import Optional, Iterable
 
+import librosa
 import torch
 import torch.nn as nn
+import numpy as np
 
 from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
 from vllm.attention.backends.abstract import AttentionBackend
-from vllm.v1.attention.backends.toy_conv2d import (
-    get_toy_conv2d_backend,
-    ToyConv2dMetadata,
+from vllm.v1.attention.backends.varlen_chunk import (
+    get_varlen_chunk_backend,
+    VarlenChunkMetadata,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.custom_op import CustomOp
 from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
-from vllm.model_executor.layers.conv import depthwise_strided_conv2d_cached
+from vllm.model_executor.layers.conv import depthwise_strided_conv2d_cached, stft_cached
 from vllm.forward_context import get_forward_context
 from vllm.sequence import IntermediateTensors
 from vllm.utils import direct_register_custom_op
 from vllm.compilation.decorators import support_torch_compile
+
+
+@CustomOp.register("mel_spec_layer")
+class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
+    """
+    Extracts mel spectrogram from the audio
+
+    Processes (Samples,) -> (Frames, Frequencies)
+    For cached inference feed in chuks of `hop_length * N`
+    """
+    def __init__(
+        self,
+        time_factor: int,
+        prefix: str,
+        cache_config: CacheConfig,
+        dtype: torch.dtype,
+        window_length=400,
+        hop_length=160,
+        n_fft=512,
+        mag_power=2.0, 
+        n_filt=80,
+    ):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.mag_power = float(mag_power)
+        self.n_filt = n_filt
+        self.freq_bins = n_fft // 2 + 1
+        self.cache_len = n_fft - window_length
+
+        # stft requires 1d cache. cache pages should have the same size across layers.
+        # we have to use a cache that corresponds to the conv1d, conv2d and attention layers
+        # in fastconformer.
+        self.pad_cache_len = 512 * 256
+        assert self.pad_cache_len >= self.cache_len
+        self.log_zero_guard_value=5.960464477539063e-08
+
+        # compute basis for STFT and mel filterbank
+        # Prepare windowed basis functions
+        window = np.hanning(window_length).astype(np.float32)
+        pad_left = (n_fft - window_length) // 2
+        pad_right = n_fft - window_length - pad_left
+        window_centered = np.pad(window, (pad_left, pad_right), mode='constant')
+
+        s = np.arange(0, n_fft, dtype=np.float32)
+        wsin = np.zeros((self.freq_bins, n_fft), dtype=np.float32)
+        wcos = np.zeros((self.freq_bins, n_fft), dtype=np.float32)
+        for k in range(self.freq_bins):
+            wsin[k, :] = np.sin(2 * np.pi * k * s / n_fft) * window_centered
+            wcos[k, :] = np.cos(2 * np.pi * k * s / n_fft) * window_centered
+
+        self.register_buffer("wsin", torch.from_numpy(wsin, dtype=self.dtype))
+        self.register_buffer("wcos", torch.from_numpy(wcos, dtype=self.dtype))
+
+        # Mel filterbank
+        filterbanks = torch.tensor(
+            librosa.filters.mel(
+                sr=16000, n_fft=n_fft, n_mels=n_filt,
+                fmin=0, fmax=16000 / 2, norm="slaney",
+            ),
+            dtype=self.dtype,
+        ).transpose(0, 1)  # nfft x mel
+        self.register_buffer("fb", filterbanks)
+
+        self.cache_config = cache_config
+        self.kv_cache = [torch.tensor([])]
+        self.dtype = dtype
+
+        compilation = get_current_vllm_config().compilation_config
+        if prefix in compilation.static_forward_context:
+            raise ValueError(f"duplicate layer name: {prefix}")
+        compilation.static_forward_context[prefix] = self
+
+
+    def forward(self, audio: torch.Tensor) -> torch.Tensor:
+        return torch.ops.vllm.mel_spec_layer(
+            audio,
+            self.prefix,
+        )
+
+    def forward_cuda(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            audio: (Samples,) packed audio to extract melspec from.
+            For proper streaming, the audio should be divisible by hop_length.
+        Returns:
+            melspec: (Frames, Frequencies), where Frames = Samples // hop_length
+        """
+        assert audio.dim() == 1, "audio should be 1D tensor"
+        assert audio.shape[0] >= self.hop_length, "audio should be at least one hop_length long"
+
+        seq_len = audio.shape[0]
+        out_seq_len = seq_len // self.hop_length
+
+        fctx = get_forward_context()
+        attn_meta_all = fctx.attn_metadata
+
+        if attn_meta_all is None:
+            # profile run, return zeros with correct output shape
+            return torch.zeros(
+                (out_seq_len, self.n_filt),
+                dtype=audio.dtype,
+                device=audio.device,
+            )
+
+        x = audio.contiguous()
+        attn_metadata: VarlenChunkMetadata = attn_meta_all[self.prefix]
+        block_table = attn_metadata.block_table_tensor
+        page_indices = block_table[:, 0]
+
+        # Cache store: (num_blocks, samples)
+        # Only self.cache_len is used, rest is ignored
+        store = self.kv_cache[fctx.virtual_engine]
+        query_start_loc = attn_metadata.query_start_loc
+
+        out = torch.empty(
+            (out_seq_len, self.n_filt),
+            device=x.device,
+            dtype=x.dtype
+        )
+        stft_cached(
+            x,
+            self.wcos, # real
+            self.wsin,  # imag
+            out,
+            store,
+            query_start_loc,
+            page_indices,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            metadata=attn_metadata,
+        )
+        return out
+
+    def get_attn_backend(self) -> AttentionBackend:
+        return get_varlen_chunk_backend(self.time_factor, self.hop_length)
+
+    def get_kv_cache_spec(self) -> KVCacheSpec:
+        return FastConformerConvSpec(
+            block_size=1,
+            shape=(self.pad_cache_len,),
+            dtype=self.dtype,
+        )
+
+
+def mel_spec_fwd(
+    audio: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    return self.forward_cuda(audio=audio)
+
+
+def mel_spec_fwd_fake(
+    audio: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    # output shape: (frames_num, freq_bins)
+    samples_num = audio.shape[0]
+    frames_num = samples_num // self.hop_length
+    return torch.zeros(
+        (frames_num, self.n_filt),
+        dtype=audio.dtype,
+        device=audio.device,
+    )
+
+direct_register_custom_op(
+    op_name="mel_spec_layer",
+    op_func=mel_spec_fwd,
+    fake_impl=mel_spec_fwd_fake,
+)
 
 
 @CustomOp.register("toy_conv2d_layer")
@@ -113,7 +290,7 @@ class ToyConv2dLayer(CustomOp, AttentionLayerBase):
         
         x = hidden_states.contiguous()
 
-        attn_metadata: ToyConv2dMetadata = attn_meta_all[self.prefix]
+        attn_metadata: VarlenChunkMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
@@ -148,7 +325,7 @@ class ToyConv2dLayer(CustomOp, AttentionLayerBase):
         return out
 
     def get_attn_backend(self) -> AttentionBackend:
-        return get_toy_conv2d_backend(self.time_factor)
+        return get_varlen_chunk_backend(self.time_factor, self.stride)
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
