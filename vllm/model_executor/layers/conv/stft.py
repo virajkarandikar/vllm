@@ -32,7 +32,7 @@ def stft_cached_kernel(
     cache_indices_ptr,      # (batch,) int32 - maps sequence to cache line index
     # Sequence mapping (computed on CPU, passed to kernel)
     batch_ptr,              # (num_programs,) maps program_id -> sequence index
-    time_chunk_offset_ptr,  # (num_programs,) maps program_id -> chunk index (not frame offset)
+    time_chunk_offset_ptr,  # (num_programs,) maps program_id -> chunk index
     # Sequence boundaries
     query_start_loc_ptr,     # (batch+1,) cumulative sample positions
     query_start_loc_out_ptr, # (batch+1,) cumulative frame positions
@@ -47,7 +47,7 @@ def stft_cached_kernel(
     CACHE_BLOCK: tl.constexpr,  # Power of 2 >= CACHE_LEN for tl.arange
     MAG_POWER: tl.constexpr,
     BLOCK_F: tl.constexpr,
-    BLOCK_FRAMES: tl.constexpr,
+    BLOCK_FRAMES: tl.constexpr,  # Number of frames per chunk (like BLOCK_TIME in conv2d)
     pad_slot_id: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
 ):
@@ -55,26 +55,26 @@ def stft_cached_kernel(
     Varlen STFT magnitude kernel with cache support for streaming execution.
     
     Grid: (num_programs, freq_blocks)
-    - program_id(0): sequence/frame chunk program (from batch_ptr/frame_chunk_offset_ptr)
+    - program_id(0): sequence/chunk program (from batch_ptr/time_chunk_offset_ptr)
     - program_id(1): frequency block index
     
-    Cache layout: (num_cache_lines, CACHE_LEN) where CACHE_LEN = N_FFT - HOP
-    - Stores the last CACHE_LEN samples from previous chunk
-    - Cache is ALWAYS used: virtual input = [cache | new_samples]
-    - For first call, initialize cache to zeros (gives zero-padding effect)
-    - After processing, updates cache with last CACHE_LEN samples
+    Each program processes BLOCK_FRAMES consecutive frames of one sequence.
+    This is analogous to BLOCK_TIME in the conv2d kernel.
     
-    Virtual addressing (always with cache):
-    - Virtual position 0 to CACHE_LEN-1: read from cache
-    - Virtual position CACHE_LEN onwards: read from input (offset by CACHE_LEN)
+    Virtual buffer model:
+    - Virtual buffer = [cache(CACHE_LEN) | input(seq_len)]
+    - Frame i reads virtual[i*HOP : i*HOP + N_FFT]
+    - Cache contains last CACHE_LEN samples from previous call (or zeros for first call)
+    
+    After processing, the LAST chunk for each sequence updates the cache
+    with the last CACHE_LEN samples from the virtual buffer.
     """
     # ==========================================================================
-    # Step 1: Map program_id to (sequence_idx, frame_chunk_start)
+    # Step 1: Map program_id to (sequence_idx, chunk_offset)
     # ==========================================================================
     prog_id = tl.program_id(0)
     idx_seq = tl.load(batch_ptr + prog_id).to(tl.int64)
     chunk_offset = tl.load(time_chunk_offset_ptr + prog_id)
-    frame_chunk_start = chunk_offset * BLOCK_FRAMES  # Convert chunk index to frame offset
     
     pid_freq = tl.program_id(1)  # Frequency block index
     
@@ -104,7 +104,17 @@ def stft_cached_kernel(
     seq_num_frames = seq_frame_end - seq_frame_start
     
     # ==========================================================================
-    # Step 4: Load Basis Functions (Real and Imaginary) for this freq block
+    # Step 4: Compute chunk boundaries (like conv2d)
+    # ==========================================================================
+    frame_chunk_start = chunk_offset * BLOCK_FRAMES
+    frame_chunk_end = tl.minimum(frame_chunk_start + BLOCK_FRAMES, seq_num_frames)
+    chunk_len = frame_chunk_end - frame_chunk_start
+    
+    if chunk_len <= 0:
+        return
+    
+    # ==========================================================================
+    # Step 5: Load Basis Functions (Real and Imaginary) for this freq block
     # ==========================================================================
     freq_offsets = pid_freq * BLOCK_F + tl.arange(0, BLOCK_F)
     freq_mask = freq_offsets < NUM_FREQS
@@ -119,16 +129,18 @@ def stft_cached_kernel(
     w_imag = tl.load(w_imag_ptrs, mask=freq_mask[:, None], other=0.0)
     
     # ==========================================================================
-    # Step 5: Cache base pointer
+    # Step 6: Cache base pointer
     # ==========================================================================
     cache_base = stft_state_ptr + cache_idx * stride_cache_seq
     
     # ==========================================================================
-    # Step 6: Process frames in this chunk
+    # Step 7: Process frames in this chunk
     # ==========================================================================
-    # Virtual space is ALWAYS [cache(CACHE_LEN) | input(seq_len)]
-    # - Positions [0, CACHE_LEN): from cache
-    # - Positions [CACHE_LEN, CACHE_LEN + seq_len): from input
+    # Virtual buffer = [cache(CACHE_LEN) | input(seq_len)]
+    # Total virtual length = CACHE_LEN + seq_len
+    # Frame i reads virtual[i*HOP : i*HOP + N_FFT]
+    
+    virtual_len = CACHE_LEN + seq_len
     
     for frame_local in tl.static_range(BLOCK_FRAMES):
         frame_seq = frame_chunk_start + frame_local  # Frame index within sequence
@@ -136,29 +148,36 @@ def stft_cached_kernel(
         
         # Virtual window for this frame: [frame_seq * HOP, frame_seq * HOP + N_FFT)
         window_start = frame_seq * HOP
-        virtual_pos = window_start + sample_offsets  # (N_FFT,) - positions in virtual space
+        virtual_pos = window_start + sample_offsets  # (N_FFT,) positions in virtual space
+        
+        # Bounds check for virtual buffer
+        valid_pos = virtual_pos < virtual_len
         
         # Determine which samples come from cache vs input
         is_from_cache = virtual_pos < CACHE_LEN
         
         # === Cache reads ===
         # For samples from cache, use virtual_pos directly as cache index
-        # Clamp positions for safe memory access (masked out for input samples)
         cache_read_pos = tl.where(is_from_cache, virtual_pos, 0)
         cache_vals = tl.load(
             cache_base + cache_read_pos * stride_cache_sample,
-            mask=is_from_cache & valid_frame,
+            mask=is_from_cache & valid_pos & valid_frame,
             other=0.0
         )
         
         # === Input reads ===
         # Input position = virtual_pos - CACHE_LEN
         input_read_pos = virtual_pos - CACHE_LEN
-        # Clamp for safe access (masked out for cache samples)
-        input_read_pos_safe = tl.where(is_from_cache, 0, input_read_pos)
+        # Clamp for safe access
+        input_read_pos_safe = tl.where(
+            is_from_cache | (input_read_pos < 0) | (input_read_pos >= seq_len),
+            0,
+            input_read_pos
+        )
+        input_valid = (~is_from_cache) & (input_read_pos >= 0) & (input_read_pos < seq_len)
         input_vals = tl.load(
             X_ptr + seq_sample_start + input_read_pos_safe,
-            mask=(~is_from_cache) & valid_frame,
+            mask=input_valid & valid_frame,
             other=0.0
         )
         
@@ -186,33 +205,53 @@ def stft_cached_kernel(
         tl.store(out_ptrs, mag, mask=freq_mask & valid_frame)
     
     # ==========================================================================
-    # Step 7: Update cache with last CACHE_LEN samples from input
-    # Only the last chunk (for this freq block, but we only need pid_freq==0) 
-    # should update the cache. We check if this chunk contains the last frame.
+    # Step 8: Update cache (only for last chunk, only freq block 0)
     # ==========================================================================
-    last_frame_in_chunk = frame_chunk_start + BLOCK_FRAMES - 1
-    is_last_chunk = (last_frame_in_chunk >= seq_num_frames - 1) | (frame_chunk_start + BLOCK_FRAMES > seq_num_frames)
+    # New cache = last CACHE_LEN samples of virtual buffer
+    # = virtual[seq_len : seq_len + CACHE_LEN]
     
-    # Only one frequency block should update the cache to avoid races
+    is_last_chunk = (frame_chunk_end >= seq_num_frames)
+    
     if is_last_chunk & (pid_freq == 0):
-        # Store last CACHE_LEN samples from input to cache
-        # These are input samples at positions [seq_len - CACHE_LEN, seq_len)
-        # Use CACHE_BLOCK (power of 2) for tl.arange and mask with CACHE_LEN
         cache_write_offsets = tl.arange(0, CACHE_BLOCK)
         cache_mask = cache_write_offsets < CACHE_LEN
-        input_tail_start = seq_sample_start + seq_len - CACHE_LEN
         
-        # Load last CACHE_LEN samples from input
-        tail_samples = tl.load(
-            X_ptr + input_tail_start + cache_write_offsets,
-            mask=cache_mask,
+        # Virtual position for each new cache sample
+        # New cache = virtual[seq_len : seq_len + CACHE_LEN]
+        virtual_pos_for_cache = seq_len + cache_write_offsets
+        
+        # Determine source: old cache or input
+        is_from_old_cache = virtual_pos_for_cache < CACHE_LEN
+        
+        # === Load from old cache ===
+        old_cache_pos = tl.where(is_from_old_cache, virtual_pos_for_cache, 0)
+        old_cache_vals = tl.load(
+            cache_base + old_cache_pos * stride_cache_sample,
+            mask=cache_mask & is_from_old_cache,
             other=0.0
         )
+        
+        # === Load from input ===
+        input_pos = virtual_pos_for_cache - CACHE_LEN
+        input_pos_safe = tl.where(
+            is_from_old_cache | (input_pos < 0) | (input_pos >= seq_len),
+            0,
+            input_pos
+        )
+        input_valid_cache = (~is_from_old_cache) & (input_pos >= 0) & (input_pos < seq_len)
+        input_vals_cache = tl.load(
+            X_ptr + seq_sample_start + input_pos_safe,
+            mask=cache_mask & input_valid_cache,
+            other=0.0
+        )
+        
+        # Combine
+        new_cache_vals = old_cache_vals + input_vals_cache
         
         # Store to cache
         tl.store(
             cache_base + cache_write_offsets * stride_cache_sample,
-            tail_samples,
+            new_cache_vals,
             mask=cache_mask
         )
 
@@ -221,7 +260,6 @@ def _next_power_of_2(n: int) -> int:
     """Return the smallest power of 2 >= n."""
     if n <= 0:
         return 1
-    # Bit manipulation: subtract 1, then find next power of 2
     n -= 1
     n |= n >> 1
     n |= n >> 2
@@ -244,7 +282,7 @@ def stft_cached(
     mag_power: float = 2.0,
     pad_slot_id: int = PAD_SLOT_ID,
     block_f: int = 32,
-    block_frames: int = 16,
+    block_frames: int = 16,  # Can be overridden by metadata
     metadata=None,                      # Optional: provides pre-computed batch_ptr, etc.
 ) -> torch.Tensor:
     """
@@ -255,11 +293,10 @@ def stft_cached(
     - cache_indices maps each sequence to its cache line
     - Initialize cache to zeros before first call (gives zero-padding effect)
     
+    Each program processes kernel_block_size (or block_frames) consecutive frames.
+    
     For proper streaming, input lengths should be divisible by hop_length.
     This ensures: num_frames = seq_len // hop_length
-    
-    If metadata is provided, uses pre-computed batch_ptr/time_chunk_offset_ptr from it
-    (no CPU blocking). Otherwise computes on the fly (CPU blocking - not for CUDA graphs).
     
     Args:
         x: Packed input samples (total_samples,)
@@ -276,19 +313,15 @@ def stft_cached(
         mag_power: Power for magnitude (1.0 = magnitude, 2.0 = power spectrum)
         pad_slot_id: Padding slot ID for skipping invalid sequences
         block_f: Frequency block size
-        block_frames: Number of frames per program
+        block_frames: Number of frames per chunk (default 16, overridden by metadata)
         metadata: Optional metadata with pre-computed batch_ptr, time_chunk_offset_ptr,
-                  query_start_loc_out, num_programs (for CUDA graph compatibility)
+                  query_start_loc_out, num_programs, kernel_block_size (for CUDA graph compatibility)
     
     Returns:
         Output tensor (total_frames, n_freqs)
     """
     n_freqs = w_real.shape[0]
     cache_len = n_fft - hop_length
-    
-    assert stft_state.shape[1] == cache_len, (
-        f"stft_state cache_len mismatch: {stft_state.shape[1]} vs expected {cache_len}"
-    )
     
     # Get batch_ptr, time_chunk_offset_ptr, query_start_loc_out from metadata or compute
     if metadata is not None:
@@ -316,15 +349,17 @@ def stft_cached(
         if total_frames == 0:
             return out
         
-        # Build program mapping: each program handles BLOCK_FRAMES frames of one sequence
+        # Build program mapping: each program handles block_frames frames
+        # Use ceiling division to ensure all frames are covered
         batch_list = []
         chunk_offset_list = []
         
         for seq_idx, seq_frames in enumerate(seqlens_frames.numpy()):
-            num_chunks = int(np.ceil(seq_frames / block_frames)) if seq_frames > 0 else 0
+            seq_frames = int(seq_frames)
+            num_chunks = (seq_frames + block_frames - 1) // block_frames if seq_frames > 0 else 1
             if num_chunks > 0:
                 batch_list.extend([seq_idx] * num_chunks)
-                chunk_offset_list.extend(range(num_chunks))  # Chunk indices: 0, 1, 2, ...
+                chunk_offset_list.extend(range(num_chunks))
         
         num_programs = len(batch_list)
         

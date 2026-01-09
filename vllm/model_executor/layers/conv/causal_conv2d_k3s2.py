@@ -239,7 +239,6 @@ def depthwise_strided_conv2d_cached_kernel(
             last_x_odd_lo, mask=mask_ch & valid_f_lo
         )
 
-
 def depthwise_strided_conv2d_cached(
     x: torch.Tensor,                    # (cu_time_in, freq, channels) - packed sequences
     w: torch.Tensor,                    # (3, 3, channels)
@@ -250,7 +249,7 @@ def depthwise_strided_conv2d_cached(
     cache_indices: torch.Tensor,        # (batch,) maps sequence to cache line
     has_initial_state: torch.Tensor,    # (batch,) bool - whether to use cached state
     block_ch: int = 256,
-    block_t: int = 64,
+    block_t: int = 16,  # Can be overridden by metadata.kernel_block_size
     metadata=None,                      # Optional: provides pre-computed batch_ptr, etc.
 ) -> torch.Tensor:
     """
@@ -276,9 +275,9 @@ def depthwise_strided_conv2d_cached(
         cache_indices: Maps each sequence to cache line (batch,)
         has_initial_state: Whether to use cached state (batch,) bool
         block_ch: Channel block size
-        block_t: Time block size
+        block_t: Time block size (overridden by metadata.kernel_block_size if provided)
         metadata: Optional metadata with pre-computed batch_ptr, time_chunk_offset_ptr,
-                  query_start_loc_out, num_programs (for CUDA graph compatibility)
+                  query_start_loc_out, num_programs, kernel_block_size (for CUDA graph compatibility)
     
     Returns:
         Output tensor (cu_time_out, freq//2, channels)
@@ -308,14 +307,13 @@ def depthwise_strided_conv2d_cached(
         query_start_loc_out_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
         query_start_loc_out_cpu[1:] = torch.cumsum(seqlens_out, dim=0)
         
-        # Build program mapping
+        # Build program mapping (use ceiling division)
         batch_list = []
         chunk_offset_list = []
         
         for seq_idx, seq_out_len in enumerate(seqlens_out.numpy()):
-            num_chunks = int(np.ceil(seq_out_len / block_t))
-            if num_chunks == 0:
-                num_chunks = 1
+            seq_out_len = int(seq_out_len)
+            num_chunks = (seq_out_len + block_t - 1) // block_t if seq_out_len > 0 else 1
             batch_list.extend([seq_idx] * num_chunks)
             chunk_offset_list.extend(range(num_chunks))
         
