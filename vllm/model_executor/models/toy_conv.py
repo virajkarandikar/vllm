@@ -92,18 +92,6 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
             requires_grad=False,
         )
 
-        # Create fresh cache for this call (cache_len = n_fft - hop_length = 352)
-        # The cache must be zeros for proper zero-padding on first frame
-        # Use register_buffer (NOT nn.Parameter) for mutable runtime state
-        # nn.Parameter is for model weights; buffers are for persistent tensors
-        # that need in-place modification across forward calls
-        self.register_buffer(
-            'stft_state',
-            torch.zeros(10, self.pad_cache_len, dtype=dtype),
-            persistent=False  # Don't save to state_dict
-        )
-
-
     def init_stft_basis(self):
         """Compute STFT basis functions and mel filterbank.
         
@@ -151,7 +139,7 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
             melspec: (Frames, Frequencies), where Frames = Samples // hop_length
         """
         assert audio.dim() == 1, "audio should be 1D tensor"
-        assert audio.shape[0] >= self.hop_length, "audio should be at least one hop_length long"
+        assert audio.shape[0] >= self.hop_length, "audio should be at least one hop_length long"  
 
         seq_len = audio.shape[0]
         out_seq_len = seq_len // self.hop_length
@@ -162,7 +150,7 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
         if attn_meta_all is None:
             # profile run, return zeros with correct output shape
             return torch.zeros(
-                (out_seq_len, self.n_fft // 2 + 1),
+                (out_seq_len, self.n_filt),
                 dtype=audio.dtype,
                 device=audio.device,
             )
@@ -193,31 +181,6 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
             block_frames=attn_metadata.kernel_block_size,
             metadata=attn_metadata,
         )
-
-        """
-        # reimplement using dummy cache
-        query_start_loc = torch.tensor(
-            [0, x.shape[0]], 
-            dtype=torch.int32, 
-            device=x.device,
-        )
-        # cache_indices must be int32/int64, not float!
-        cache_indices = torch.zeros(1, dtype=torch.int32, device=x.device)
-        # output tensor dtype must match basis matrices dtype
-        out = torch.empty(out_seq_len, self.freq_bins, dtype=x.dtype, device=x.device)
-        
-        stft_cached(
-            x,
-            self.wcos, # real
-            self.wsin,  # imag
-            out,
-            self.stft_state,
-            query_start_loc,
-            cache_indices,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-        )
-        """
 
         # compute mel spec
         x = torch.matmul(out, self.fb)
@@ -491,11 +454,9 @@ class ConvSubsampling(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Input: (T_target, Factor * Freq) flattened mel features
+        Input: (T_target * Factor, Freq) flattened mel features
         Output: (T_target, out_dim)
         """
-        # Reshape to (T*factor, freq_no_pad)
-        x = x.view(-1, self.freq_no_pad)
         # Pad frequency: 80 + 8 = 88 -> 44 -> 22 -> 11
         x = torch.nn.functional.pad(x, (self.padding, 0))
         # Expand channels: mimic 1->256 conv
@@ -522,7 +483,7 @@ class ToyConv(nn.Module):
         super().__init__()
         hf_config = vllm_config.model_config.hf_config
         self.mel_spec = MelSpectrogramLayer(
-            time_factor=160,
+            time_factor=160 * 8,
             prefix=f"{prefix}.mel_spec.0",
             cache_config=vllm_config.cache_config,
             dtype=vllm_config.model_config.dtype,
@@ -538,7 +499,7 @@ class ToyConv(nn.Module):
         # Compatibility with vLLM generation interface
         self.vocab_size = 1
         self.embed_tokens = nn.Embedding(self.vocab_size, 256)
-        self.proj = nn.Linear(1280, self.vocab_size)
+        self.proj = nn.Linear(512, self.vocab_size)
 
     def forward(
         self,
@@ -553,10 +514,11 @@ class ToyConv(nn.Module):
             audio: (T_target, 8 * 160) tensor,
             where factor = 8 (subsampling factor) * 160 (hop length)
         Returns:
-            x: (T_target, 8 * Freq) output
+            x: (T_target, 512) output
         """
-        mel = self.mel_spec(audio.view(-1))
-        return mel, mel
+        mel = self.mel_spec(audio.view(-1))  # frames x freq_bins
+        emb = self.pre_encode(mel)  # frames/8 x 512
+        return emb, emb
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
