@@ -56,6 +56,7 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
         self.n_filt = n_filt
         self.freq_bins = n_fft // 2 + 1
         self.cache_len = n_fft - window_length
+        self.window_length = window_length
 
         # stft requires 1d cache. cache pages should have the same size across layers.
         # we have to use a cache that corresponds to the conv1d, conv2d and attention layers
@@ -64,41 +65,75 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
         assert self.pad_cache_len >= self.cache_len
         self.log_zero_guard_value=5.960464477539063e-08
 
-        # compute basis for STFT and mel filterbank
-        # Prepare windowed basis functions
-        window = np.hanning(window_length).astype(np.float32)
-        pad_left = (n_fft - window_length) // 2
-        pad_right = n_fft - window_length - pad_left
-        window_centered = np.pad(window, (pad_left, pad_right), mode='constant')
-
-        s = np.arange(0, n_fft, dtype=np.float32)
-        wsin = np.zeros((self.freq_bins, n_fft), dtype=np.float32)
-        wcos = np.zeros((self.freq_bins, n_fft), dtype=np.float32)
-        for k in range(self.freq_bins):
-            wsin[k, :] = np.sin(2 * np.pi * k * s / n_fft) * window_centered
-            wcos[k, :] = np.cos(2 * np.pi * k * s / n_fft) * window_centered
-
-        self.register_buffer("wsin", torch.from_numpy(wsin, dtype=self.dtype))
-        self.register_buffer("wcos", torch.from_numpy(wcos, dtype=self.dtype))
-
-        # Mel filterbank
-        filterbanks = torch.tensor(
-            librosa.filters.mel(
-                sr=16000, n_fft=n_fft, n_mels=n_filt,
-                fmin=0, fmax=16000 / 2, norm="slaney",
-            ),
-            dtype=self.dtype,
-        ).transpose(0, 1)  # nfft x mel
-        self.register_buffer("fb", filterbanks)
-
+        # definitions used by vllm layer with cache 
+        self.time_factor = time_factor
         self.cache_config = cache_config
         self.kv_cache = [torch.tensor([])]
         self.dtype = dtype
-
+        self.prefix = prefix
         compilation = get_current_vllm_config().compilation_config
         if prefix in compilation.static_forward_context:
             raise ValueError(f"duplicate layer name: {prefix}")
         compilation.static_forward_context[prefix] = self
+
+        # STFT basis functions and mel filterbank - initialized as parameters
+        # so they are properly moved to CUDA during model loading.
+        # Actual values are computed in load_weights().
+        self.wsin = nn.Parameter(
+            torch.zeros(self.freq_bins, n_fft, dtype=dtype),
+            requires_grad=False,
+        )
+        self.wcos = nn.Parameter(
+            torch.zeros(self.freq_bins, n_fft, dtype=dtype),
+            requires_grad=False,
+        )
+        self.fb = nn.Parameter(
+            torch.zeros(self.freq_bins, n_filt, dtype=dtype),
+            requires_grad=False,
+        )
+
+        # Create fresh cache for this call (cache_len = n_fft - hop_length = 352)
+        # The cache must be zeros for proper zero-padding on first frame
+        # Use register_buffer (NOT nn.Parameter) for mutable runtime state
+        # nn.Parameter is for model weights; buffers are for persistent tensors
+        # that need in-place modification across forward calls
+        self.register_buffer(
+            'stft_state',
+            torch.zeros(10, self.pad_cache_len, dtype=dtype),
+            persistent=False  # Don't save to state_dict
+        )
+
+
+    def init_stft_basis(self):
+        """Compute STFT basis functions and mel filterbank.
+        
+        Called during load_weights() after model is on device.
+        """
+        # Prepare windowed basis functions
+        window = np.hanning(self.window_length).astype(np.float32)
+        pad_left = (self.n_fft - self.window_length) // 2
+        pad_right = self.n_fft - self.window_length - pad_left
+        window_centered = np.pad(window, (pad_left, pad_right), mode='constant')
+
+        s = np.arange(0, self.n_fft, dtype=np.float32)
+        wsin = np.zeros((self.freq_bins, self.n_fft), dtype=np.float32)
+        wcos = np.zeros((self.freq_bins, self.n_fft), dtype=np.float32)
+        for k in range(self.freq_bins):
+            wsin[k, :] = np.sin(2 * np.pi * k * s / self.n_fft) * window_centered
+            wcos[k, :] = np.cos(2 * np.pi * k * s / self.n_fft) * window_centered
+
+        self.wsin.data.copy_(torch.from_numpy(wsin).to(dtype=self.dtype))
+        self.wcos.data.copy_(torch.from_numpy(wcos).to(dtype=self.dtype))
+
+        # Mel filterbank
+        filterbanks = torch.tensor(
+            librosa.filters.mel(
+                sr=16000, n_fft=self.n_fft, n_mels=self.n_filt,
+                fmin=0, fmax=16000 / 2, norm="slaney",
+            ),
+            dtype=self.dtype,
+        ).transpose(0, 1)  # freq_bins x n_filt
+        self.fb.data.copy_(filterbanks)
 
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
@@ -127,12 +162,17 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
         if attn_meta_all is None:
             # profile run, return zeros with correct output shape
             return torch.zeros(
-                (out_seq_len, self.n_filt),
+                (out_seq_len, self.n_fft // 2 + 1),
                 dtype=audio.dtype,
                 device=audio.device,
             )
 
         x = audio.contiguous()
+        out = torch.empty(
+            (out_seq_len, self.n_fft // 2 + 1),
+            device=x.device,
+            dtype=x.dtype
+        )
         attn_metadata: VarlenChunkMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
@@ -140,29 +180,54 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
         # Cache store: (num_blocks, samples)
         # Only self.cache_len is used, rest is ignored
         store = self.kv_cache[fctx.virtual_engine]
-        query_start_loc = attn_metadata.query_start_loc
-
-        out = torch.empty(
-            (out_seq_len, self.n_filt),
-            device=x.device,
-            dtype=x.dtype
-        )
         stft_cached(
             x,
             self.wcos, # real
             self.wsin,  # imag
             out,
             store,
-            query_start_loc,
+            attn_metadata.query_start_loc,
             page_indices,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
+            block_frames=attn_metadata.kernel_block_size,
             metadata=attn_metadata,
         )
-        return out
+
+        """
+        # reimplement using dummy cache
+        query_start_loc = torch.tensor(
+            [0, x.shape[0]], 
+            dtype=torch.int32, 
+            device=x.device,
+        )
+        # cache_indices must be int32/int64, not float!
+        cache_indices = torch.zeros(1, dtype=torch.int32, device=x.device)
+        # output tensor dtype must match basis matrices dtype
+        out = torch.empty(out_seq_len, self.freq_bins, dtype=x.dtype, device=x.device)
+        
+        stft_cached(
+            x,
+            self.wcos, # real
+            self.wsin,  # imag
+            out,
+            self.stft_state,
+            query_start_loc,
+            cache_indices,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+        )
+        """
+
+        # compute mel spec
+        x = torch.matmul(out, self.fb)
+        x = torch.log(x + self.log_zero_guard_value)
+
+        return x
 
     def get_attn_backend(self) -> AttentionBackend:
-        return get_varlen_chunk_backend(self.time_factor, self.hop_length)
+        # kernel_block_size=16 for STFT (16 frames per program)
+        return get_varlen_chunk_backend(self.time_factor, self.hop_length, kernel_block_size=16)
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
@@ -325,7 +390,8 @@ class ToyConv2dLayer(CustomOp, AttentionLayerBase):
         return out
 
     def get_attn_backend(self) -> AttentionBackend:
-        return get_varlen_chunk_backend(self.time_factor, self.stride)
+        # kernel_block_size=64 for conv2d (64 output time steps per program)
+        return get_varlen_chunk_backend(self.time_factor, self.stride, kernel_block_size=16)
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
@@ -455,7 +521,13 @@ class ToyConv(nn.Module):
     ) -> None:
         super().__init__()
         hf_config = vllm_config.model_config.hf_config
-
+        self.mel_spec = MelSpectrogramLayer(
+            time_factor=160,
+            prefix=f"{prefix}.mel_spec.0",
+            cache_config=vllm_config.cache_config,
+            dtype=vllm_config.model_config.dtype,
+            hop_length=160,
+        )
         self.pre_encode = ConvSubsampling(
             hf_config=hf_config,
             cache_config=vllm_config.cache_config,
@@ -466,7 +538,7 @@ class ToyConv(nn.Module):
         # Compatibility with vLLM generation interface
         self.vocab_size = 1
         self.embed_tokens = nn.Embedding(self.vocab_size, 256)
-        self.proj = nn.Linear(512, self.vocab_size)
+        self.proj = nn.Linear(1280, self.vocab_size)
 
     def forward(
         self,
@@ -474,16 +546,17 @@ class ToyConv(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        conv_input: Optional[torch.Tensor] = None,
+        audio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            conv_input: (T_target, Factor * Freq) tensor
+            audio: (T_target, 8 * 160) tensor,
+            where factor = 8 (subsampling factor) * 160 (hop length)
         Returns:
-            x: (T_target, OutDim) output
+            x: (T_target, 8 * Freq) output
         """
-        x = self.pre_encode(conv_input)
-        return x, x
+        mel = self.mel_spec(audio.view(-1))
+        return mel, mel
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -494,6 +567,9 @@ class ToyConv(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Load weights from FastConformer checkpoint."""
         nemo = {name: tensor for name, tensor in weights}
+        
+        # Initialize mel spectrogram STFT basis and filterbank
+        self.mel_spec.init_stft_basis()
         
         # Depthwise conv layers: (C, 1, kH, kW) -> (kH, kW, C) with flip
         self.pre_encode.conv[0].conv_weight.data.copy_(
