@@ -73,7 +73,7 @@ from vllm.model_executor.model_loader.reload import (
     initialize_layerwise_reload,
 )
 from vllm.model_executor.models.fastconformer import ConformerConvModule
-from vllm.model_executor.models.toy_conv import ToyConv2dLayer
+from vllm.model_executor.models.toy_conv import ToyConv2dLayer, MelSpectrogramLayer
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -7484,6 +7484,11 @@ class GPUModelRunner(
         )
         for layer_name, toy_conv_module in toy_conv_layers.items():
             kv_cache_spec[layer_name] = toy_conv_module.get_kv_cache_spec()
+        stft_layers = get_layers_from_vllm_config(
+            self.vllm_config, MelSpectrogramLayer
+        )
+        for layer_name, stft_module in stft_layers.items():
+            kv_cache_spec[layer_name] = stft_module.get_kv_cache_spec()
 
         return kv_cache_spec
 

@@ -36,6 +36,7 @@ class VarlenChunkMetadata:
     query_start_loc: torch.Tensor  # [num_seqs+1]
     slot_mapping: torch.Tensor  # [num_seqs]
     block_table_tensor: torch.Tensor  # [num_seqs, num_blocks]
+    kernel_block_size: int  # number of output frames per Triton program
 
     # Chunk mapping for triton kernels
     batch_ptr: Optional[torch.Tensor] = None  # maps program_id -> sequence index
@@ -47,7 +48,7 @@ class VarlenChunkMetadata:
 def _create_builder(
     time_factor: int,
     output_divisor: int,
-    block_size: int,
+    kernel_block_size: int,
 ) -> Type[AttentionMetadataBuilder]:
     """Create a metadata builder class with the specified configuration."""
 
@@ -55,8 +56,8 @@ def _create_builder(
         """Builder for varlen chunk metadata."""
         cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
         _time_factor: ClassVar[int] = time_factor
+        _kernel_block_size: ClassVar[int] = kernel_block_size
         _output_divisor: ClassVar[int] = output_divisor
-        _block_size: ClassVar[int] = block_size
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
@@ -72,18 +73,19 @@ def _create_builder(
                 common_attn_metadata.query_start_loc,
                 time_factor=self._time_factor,
                 output_divisor=self._output_divisor,
-                block_size=self._block_size,
+                kernel_block_size=self._kernel_block_size,
             )
 
             return VarlenChunkMetadata(
                 num_reqs=common_attn_metadata.num_reqs,
-                query_start_loc=common_attn_metadata.query_start_loc,
+                query_start_loc=chunk_meta["query_start_loc"],
                 slot_mapping=common_attn_metadata.slot_mapping,
                 block_table_tensor=common_attn_metadata.block_table_tensor,
                 batch_ptr=chunk_meta["batch_ptr"],
                 time_chunk_offset_ptr=chunk_meta["time_chunk_offset_ptr"],
                 query_start_loc_out=chunk_meta["query_start_loc_out"],
                 num_programs=chunk_meta["num_programs"],
+                kernel_block_size=self._kernel_block_size,
             )
 
     # Set a meaningful class name for debugging
@@ -97,7 +99,7 @@ def _create_builder(
 def get_varlen_chunk_backend(
     time_factor: int = 1,
     output_divisor: int = 2,
-    block_size: int = 64,
+    kernel_block_size: int = 1,
 ) -> Type[AttentionBackend]:
     """
     Factory function that returns a backend for varlen chunked kernels.
@@ -114,12 +116,12 @@ def get_varlen_chunk_backend(
     Args:
         time_factor: Multiplier for scaling query_start_loc (default 1)
         output_divisor: Divisor for output length calculation (default 2)
-        block_size: Chunk size for processing (default 64)
+        kernel_block_size: Chunk size for processing (default 64)
         
     Returns:
         A VarlenChunkBackend class configured with the given parameters
     """
-    builder_cls = _create_builder(time_factor, output_divisor, block_size)
+    builder_cls = _create_builder(time_factor, output_divisor, kernel_block_size)
 
     class VarlenChunkBackend(AttentionBackend):
         """Backend for varlen chunked kernels."""

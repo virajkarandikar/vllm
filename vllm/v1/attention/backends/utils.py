@@ -941,7 +941,7 @@ def compute_varlen_chunk_metadata(
     query_start_loc: torch.Tensor,
     time_factor: int = 1,
     output_divisor: int = 2,
-    block_size: int = 64,
+    kernel_block_size: int = 1,
 ):
     """
     Compute metadata for varlen chunked kernels (conv2d, STFT, etc.).
@@ -960,7 +960,7 @@ def compute_varlen_chunk_metadata(
         query_start_loc: (batch+1,) cumulative input positions
         time_factor: multiplier for scaling query_start_loc (default 1)
         output_divisor: divisor for output length (default 2)
-        block_size: chunk size for processing (default 64)
+        kernel_block_size: chunk size for processing (default 64)
 
     Returns:
         A dict containing:
@@ -987,31 +987,22 @@ def compute_varlen_chunk_metadata(
     query_start_loc_out_cpu[1:] = torch.cumsum(seqlens_out, dim=0)
 
     # Build program mapping (like causal_conv1d but with configurable block size)
-    nums = -(-seqlens_out // block_size)  # ceiling division
+    # Use ceiling division to ensure all output frames are covered
+    nums = (seqlens_out + kernel_block_size - 1) // kernel_block_size
 
-    mlist = torch.from_numpy(np.repeat(np.arange(len(nums)), nums))
-    mlist_len = len(mlist)
-
-    offsetlist = []  # type: ignore
-    for idx, num in enumerate(nums):
+    # Build batch mapping and offset list in a single loop
+    batch_list = []
+    offsetlist = []
+    for seq_idx, num in enumerate(nums):
         num_val = num.item() if hasattr(num, 'item') else int(num)
         if num_val == 0:
-            num_val = 1
-            mlist_len += 1
+            num_val = 1  # at least one chunk per sequence
+        batch_list.extend([seq_idx] * num_val)
         offsetlist.extend(range(num_val))
-    offsetlist = torch.tensor(offsetlist, dtype=torch.int32)
 
-    # Handle edge case where mlist might need adjustment for zero-length sequences
-    if mlist_len != len(offsetlist):
-        # Rebuild mlist for sequences with zero output length
-        batch_list = []
-        for seq_idx, seq_out_len in enumerate(seqlens_out.numpy()):
-            num_chunks = int(np.ceil(seq_out_len / block_size))
-            if num_chunks == 0:
-                num_chunks = 1
-            batch_list.extend([seq_idx] * num_chunks)
-        mlist = torch.tensor(batch_list, dtype=torch.int32)
-        mlist_len = len(mlist)
+    mlist = torch.tensor(batch_list, dtype=torch.int32)
+    offsetlist = torch.tensor(offsetlist, dtype=torch.int32)
+    mlist_len = len(mlist)
 
     num_programs = mlist_len
 
@@ -1032,6 +1023,7 @@ def compute_varlen_chunk_metadata(
     return {
         "batch_ptr": batch_ptr,
         "time_chunk_offset_ptr": time_chunk_offset_ptr,
+        "query_start_loc": query_start_loc_scaled,
         "query_start_loc_out": query_start_loc_out,
         "num_programs": num_programs,
     }

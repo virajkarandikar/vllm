@@ -744,6 +744,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
                 and spec.num_speculative_blocks == one_spec.num_speculative_blocks
                 for spec in kv_cache_specs.values()
             )
+        elif isinstance(one_spec, FastConformerConvSpec):
+            # All FastConformerConvSpec layers are considered uniform type
+            # as long as they have the same block_size (checked above)
+            return all(
+                isinstance(spec, FastConformerConvSpec)
+                for spec in kv_cache_specs.values()
+            )
         else:
             # NOTE(Chen): Please add new branches for new KV cache spec types.
             raise NotImplementedError(
