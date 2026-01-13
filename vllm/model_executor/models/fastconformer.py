@@ -531,8 +531,8 @@ class FastConformerCTC(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        self.preprocessor.load_weights(weights)
         nemo = {name: tensor for name, tensor in weights}
+        self.preprocessor.load_weights(nemo)
 
         loaded_pairs: list[tuple[str, str]] = []
         skipped: list[tuple[str, str]] = []
