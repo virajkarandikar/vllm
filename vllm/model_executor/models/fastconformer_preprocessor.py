@@ -510,7 +510,6 @@ class ConvSubsampling(nn.Module):
         return x
 
 
-@support_torch_compile
 class FastConformerPreprocessor(nn.Module):
     """
     FastConformer preprocessor modules - combines mel spectrogram extraction
@@ -558,9 +557,8 @@ class FastConformerPreprocessor(nn.Module):
         emb = self.pre_encode(mel)  # frames/8 x 512
         return emb
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+    def load_weights(self, nemo: dict[str, torch.Tensor]):
         """Load weights from FastConformer checkpoint."""
-        nemo = {name: tensor for name, tensor in weights}
 
         # Initialize mel spectrogram STFT basis and filterbank
         self.mel_spec.init_stft_basis()
