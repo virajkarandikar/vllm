@@ -23,11 +23,11 @@ from vllm.v1.attention.backends.fastconformer_conv import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.attention.backends.abstract import AttentionBackend
-from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.v1.attention.backends.fastconformer_rpe_attention import (
     FastConformerRPEBackend,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
+from vllm.model_executor.models.fastconformer_preprocessor import FastConformerPreprocessor
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
 )
@@ -256,7 +256,6 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
         # TODO: is there a less hacky way to do this?
         self.left_shape = self.left_ctx * 32
 
-        self.prefix = prefix
         self.cache_config = cache_config
         self.kv_cache = [torch.tensor([])]
         self.dtype = dtype
@@ -390,7 +389,10 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
-            block_size=self.cache_config.block_size,
+            # block_size=self.cache_config.block_size,
+            # WARNING: when caching is enabled, block size be the same across all layers.
+            # for conv we need only 1 though.
+            block_size=1,
             shape=(self.left_shape, self.d_model),
             dtype=self.dtype,
         )
@@ -478,13 +480,17 @@ class FastConformerCTC(nn.Module):
         self.config = config
 
         self.d_model = config.d_model
+        self.xscale = math.sqrt(self.d_model)
         self.dtype = vllm_config.model_config.dtype
 
         att_window = int(config.att_left_ctx + config.att_right_ctx)
         assert att_window > 0, "att_window must be positive"
 
         self.prefix = prefix
-
+        self.preprocessor = FastConformerPreprocessor(
+            vllm_config=vllm_config,
+            prefix=prefix,
+        )
         self.blocks = nn.ModuleList([
             ConformerBlock(
                 d_model=self.d_model,
@@ -503,36 +509,17 @@ class FastConformerCTC(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         raise Exception("not applicable for this model")
 
-    def _forward_attn_only(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.blocks[0].attn(x)
-        return x
-    
-    def _forward_conv_only(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.blocks[0].conv(x)
-        return x
-
     def forward(
         self,
         positions: torch.Tensor,
         input_ids: Optional[torch.Tensor] = None,            # unused
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        proc_melspec: Optional[torch.Tensor] = None,
+        audio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        assert proc_melspec is not None, "proc_melspec must be provided as [T, F]"
-        x = proc_melspec
-        assert x.dim() == 2, f"expected [T, F], got shape {tuple(x.shape)}"
-
-        # used in tests
-        if self.config.attn_only:
-            return self._forward_attn_only(x)
-        if self.config.conv_only:
-            return self._forward_conv_only(x)
-
-        xscale = math.sqrt(self.d_model)
-        x = (x * xscale)
-
-        for _, blk in enumerate(self.blocks):
+        emb = self.preprocessor(audio)
+        x = emb * self.xscale
+        for blk in self.blocks:
             x = blk(x)
         return x, x
 
@@ -544,6 +531,7 @@ class FastConformerCTC(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        self.preprocessor.load_weights(weights)
         nemo = {name: tensor for name, tensor in weights}
 
         loaded_pairs: list[tuple[str, str]] = []

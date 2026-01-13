@@ -1,479 +1,616 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Implements fastconformer preprocessing module: mel-spectrogram extraction and subsampling.
+We don't implement pre-emphasis here, this has to be done externally.
+There are differences from NeMo implementation to ensure proper streaming support:
+    * STFT is non-centered
+    * Subsampling in NeMo is uneven, it pads frequency with (2, 1). That results
+    in 80 frequency bins been downsampled to 11 instead of 10.
+    We correctly pad (1, 0), but to ensure same dimension, we pre-pad 80 to 88.
 
-# Adapted from https://github.com/vllm-project/vllm/blob/94d8ec8d2bcb4ec55e33022b313c7e978edf05e1/vllm/model_executor/models/bamba.py
-# Copyright 2024 HuggingFace Inc. team. All rights reserved.
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+Overall downsampling is x1280 (160 hop-length and x8 subsampling), so audio can be fed
+in chunks of 1280 samples. Similar to FastConformer, multi-frame prefill stage does not
+work with CUDA graphs enabled.
+"""
 
-import os
-import tempfile
-import tarfile
+from typing import Optional, Iterable
 
+import librosa
 import torch
 import torch.nn as nn
-import librosa
-import torch.nn.functional as F
-import soundfile
-import resampy
+import numpy as np
+import math
 
-from typing import Union
+from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
+from vllm.attention.backends.abstract import AttentionBackend
+from vllm.v1.attention.backends.varlen_chunk import (
+    get_varlen_chunk_backend,
+    VarlenChunkMetadata,
+)
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.custom_op import CustomOp
+from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
+from vllm.model_executor.layers.conv import depthwise_strided_conv2d_cached, stft_cached
+from vllm.forward_context import get_forward_context
+from vllm.sequence import IntermediateTensors
+from vllm.utils import direct_register_custom_op
+from vllm.compilation.decorators import support_torch_compile
 
 
-class FilterbankFeatures(nn.Module):
-    """Minimal Mel Spectrogram feature extractor."""
+LOG_ZERO_GUARD_VALUE = 5.960464477539063e-08
+SAMPLE_RATE = 16000
+FASTCONFORMER_CACHE_PAGE_SIZE = 256 * 512
+
+
+@CustomOp.register("mel_spec_layer")
+class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
+    """
+    Extracts mel spectrogram from the audio
+
+    Processes (Samples,) -> (Frames, Frequencies)
+    For cached inference feed in chuks of `hop_length * N`
+    """
 
     def __init__(
         self,
-        sample_rate=16000,
-        n_window_size=400,
-        n_window_stride=160,
+        time_factor: int,
+        prefix: str,
+        cache_config: CacheConfig,
+        dtype: torch.dtype,
+        window_length=400,
+        hop_length=160,
         n_fft=512,
-        nfilt=80,
-        preemph=0.97,
-        log_zero_guard_value=5.960464477539063e-08,
         mag_power=2.0,
+        n_filt=80,
+        sample_rate=SAMPLE_RATE,
+        **kwargs,
     ):
         super().__init__()
-
-        self.win_length = n_window_size
-        self.hop_length = n_window_stride
         self.n_fft = n_fft
-        self.preemph = preemph
-        self.log_zero_guard_value = log_zero_guard_value
-        self.mag_power = mag_power
+        self.hop_length = hop_length
+        self.mag_power = float(mag_power)
+        self.n_filt = n_filt
+        self.freq_bins = n_fft // 2 + 1
+        self.cache_len = n_fft - window_length
+        self.window_length = window_length
+        self.sample_rate = sample_rate
 
-        # Hann window
-        window_tensor = torch.hann_window(self.win_length, periodic=False)
-        self.register_buffer("window", window_tensor)
+        # WARNING! stft requires 1d cache. cache pages should have the same size across layers.
+        # we have to use a cache that corresponds to the rest of FastConformer layers.
+        self.pad_cache_len = FASTCONFORMER_CACHE_PAGE_SIZE
+        assert self.pad_cache_len >= self.cache_len
+        self.log_zero_guard_value = LOG_ZERO_GUARD_VALUE
 
-        # Mel filterbank
-        highfreq = sample_rate / 2
-        filterbanks = torch.tensor(
-            librosa.filters.mel(
-                sr=sample_rate,
-                n_fft=self.n_fft,
-                n_mels=nfilt,
-                fmin=0,
-                fmax=highfreq,
-                norm="slaney",
-            ),
-            dtype=torch.float,
-        ).unsqueeze(0)
-        self.register_buffer("fb", filterbanks)
+        # definitions used by vllm layer with cache
+        self.time_factor = time_factor
+        self.cache_config = cache_config
+        self.kv_cache = [torch.tensor([])]
+        self.dtype = dtype
+        self.prefix = prefix
+        compilation = get_current_vllm_config().compilation_config
+        if prefix in compilation.static_forward_context:
+            raise ValueError(f"duplicate layer name: {prefix}")
+        compilation.static_forward_context[prefix] = self
 
-    def get_left_context_size(self) -> int:
-        """
-        In order to run streaming inference, we need to overlap this many samples,
-        with the previous input.
-        """
-        return self.n_fft - self.hop_length
-
-    @torch.no_grad()
-    def forward(self, x):
-        """
-        Args:
-            x: Input waveform [batch_size, time]
-            There are assumptions about x for now:
-                * batch_size=1, since we plan to run preprocessing for each request independently.
-                Based on this assumption we keep streaming buffer as (1, buf_size)
-                * `time` is always bigger than buf_size. Typically we would be feeding
-                n_window_stride * 8 or more.
-
-        Returns:
-            features: Mel spectrogram [batch_size, n_mels, time]
-        """
-        # Preemphasis: x[t] = x[t] - preemph * x[t-1]
-        x = torch.cat(
-            (x[:, 0].unsqueeze(1), x[:, 1:] - self.preemph * x[:, :-1]), dim=1
+        # STFT basis functions and mel filterbank - initialized as parameters
+        # so they are properly moved to CUDA during model loading.
+        # Actual values are computed in load_weights().
+        self.wsin = nn.Parameter(
+            torch.zeros(self.freq_bins, n_fft, dtype=dtype),
+            requires_grad=False,
+        )
+        self.wcos = nn.Parameter(
+            torch.zeros(self.freq_bins, n_fft, dtype=dtype),
+            requires_grad=False,
+        )
+        self.fb = nn.Parameter(
+            torch.zeros(self.freq_bins, n_filt, dtype=dtype),
+            requires_grad=False,
         )
 
-        # change `center=False` so there is no padding on the left and right,
-        # so its possible to implement streaming stft extraction
-        with torch.amp.autocast(x.device.type, enabled=False):
-            x = torch.stft(
-                x,
+    def init_stft_basis(self):
+        """Compute STFT basis functions and mel filterbank.
+
+        Called during load_weights() after model is on device.
+        """
+        # Prepare windowed basis functions
+        window = np.hanning(self.window_length).astype(np.float32)
+        pad_left = (self.n_fft - self.window_length) // 2
+        pad_right = self.n_fft - self.window_length - pad_left
+        window_centered = np.pad(window, (pad_left, pad_right), mode="constant")
+
+        s = np.arange(0, self.n_fft, dtype=np.float32)
+        wsin = np.zeros((self.freq_bins, self.n_fft), dtype=np.float32)
+        wcos = np.zeros((self.freq_bins, self.n_fft), dtype=np.float32)
+        for k in range(self.freq_bins):
+            wsin[k, :] = np.sin(2 * np.pi * k * s / self.n_fft) * window_centered
+            wcos[k, :] = np.cos(2 * np.pi * k * s / self.n_fft) * window_centered
+
+        self.wsin.data.copy_(torch.from_numpy(wsin).to(dtype=self.dtype))
+        self.wcos.data.copy_(torch.from_numpy(wcos).to(dtype=self.dtype))
+
+        # Mel filterbank
+        filterbanks = torch.tensor(
+            librosa.filters.mel(
+                sr=self.sample_rate,
                 n_fft=self.n_fft,
-                hop_length=self.hop_length,
-                win_length=self.win_length,
-                center=False,
-                window=self.window.to(dtype=torch.float, device=x.device),
-                return_complex=True,
+                n_mels=self.n_filt,
+                fmin=0,
+                fmax=self.sample_rate / 2,
+                norm="slaney",
+            ),
+            dtype=self.dtype,
+        ).transpose(
+            0, 1
+        )  # freq_bins x n_filt
+        self.fb.data.copy_(filterbanks)
+
+    def forward(self, audio: torch.Tensor) -> torch.Tensor:
+        return torch.ops.vllm.mel_spec_layer(
+            audio,
+            self.prefix,
+        )
+
+    def forward_cuda(self, audio: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            audio: (Samples,) packed audio to extract melspec from.
+            For proper streaming, the audio should be divisible by hop_length.
+        Returns:
+            melspec: (Frames, Frequencies), where Frames = Samples // hop_length
+        """
+        assert audio.dim() == 1, "audio should be 1D tensor"
+        assert (
+            audio.shape[0] >= self.hop_length
+        ), "audio should be at least one hop_length long"
+
+        seq_len = audio.shape[0]
+        out_seq_len = seq_len // self.hop_length
+
+        fctx = get_forward_context()
+        attn_meta_all = fctx.attn_metadata
+
+        if attn_meta_all is None:
+            # profile run, return zeros with correct output shape
+            return torch.zeros(
+                (out_seq_len, self.n_filt),
+                dtype=audio.dtype,
+                device=audio.device,
             )
 
-        # Convert complex to magnitude
-        x = torch.view_as_real(x)
-        x = torch.sqrt(x.pow(2).sum(-1))
+        x = audio.contiguous()
+        out = torch.empty(
+            (out_seq_len, self.n_fft // 2 + 1), device=x.device, dtype=x.dtype
+        )
+        attn_metadata: VarlenChunkMetadata = attn_meta_all[self.prefix]
+        block_table = attn_metadata.block_table_tensor
+        page_indices = block_table[:, 0]
 
-        # Apply power
-        x = x.pow(self.mag_power)
+        # Cache store: (num_blocks, samples)
+        # Only self.cache_len is used, rest is ignored
+        store = self.kv_cache[fctx.virtual_engine]
+        stft_cached(
+            x,
+            self.wcos,  # real
+            self.wsin,  # imag
+            out,
+            store,
+            attn_metadata.query_start_loc,
+            page_indices,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            block_frames=attn_metadata.kernel_block_size,
+            metadata=attn_metadata,
+        )
 
-        # Apply mel filterbank
-        with torch.amp.autocast(x.device.type, enabled=False):
-            x = torch.matmul(self.fb.to(x.dtype), x)
-
-        # Apply log
+        # compute mel spec
+        x = torch.matmul(out, self.fb)
         x = torch.log(x + self.log_zero_guard_value)
 
         return x
 
+    def get_attn_backend(self) -> AttentionBackend:
+        # kernel_block_size=16 for STFT (16 frames per program)
+        return get_varlen_chunk_backend(
+            self.time_factor, self.hop_length, kernel_block_size=16
+        )
 
-class CausalConv2D(nn.Conv2d):
+    def get_kv_cache_spec(self) -> KVCacheSpec:
+        return FastConformerConvSpec(
+            block_size=1,
+            shape=(self.pad_cache_len,),
+            dtype=self.dtype,
+        )
+
+
+def mel_spec_fwd(
+    audio: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    return self.forward_cuda(audio=audio)
+
+
+def mel_spec_fwd_fake(
+    audio: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    # output shape: (frames_num, freq_bins)
+    samples_num = audio.shape[0]
+    frames_num = samples_num // self.hop_length
+    return torch.zeros(
+        (frames_num, self.n_filt),
+        dtype=audio.dtype,
+        device=audio.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="mel_spec_layer",
+    op_func=mel_spec_fwd,
+    fake_impl=mel_spec_fwd_fake,
+)
+
+
+KERNEL_SIZE = 3
+STRIDE = 2
+
+
+@CustomOp.register("conv2d_layer")
+class Conv2dLayer(CustomOp, AttentionLayerBase):
     """
-    A causal version of nn.Conv2d. It pads across frequency axis the same way the padding
-    is implemented in nemo code, there is no padding across time axis.
-    Instead we would feed extra left context that comes from the streaming buffer.
+    Cached depthwise strided 2D convolution layer with kernel=3, stride=2.
+
+    Processes (T, Freq, Channels) -> (T/2, Freq/2, Channels).
+    Maintains cache for causal streaming over time dimension.
     """
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        stride: int = 1,
-        padding: Union[str, int] = 0,
-        dilation: int = 1,
-        groups: int = 1,
-        bias: bool = True,
-        padding_mode: str = "zeros",
-        device=None,
-        dtype=None,
-    ) -> None:
-        assert not padding, "padding should be set to 0 or None for CausalConv2D."
-        self._left_padding = kernel_size - 1
-        self._right_padding = stride - 1
-        padding = 0
-        super(CausalConv2D, self).__init__(
-            in_channels,
-            out_channels,
-            kernel_size,
-            stride,
-            padding,
-            dilation,
-            groups,
-            bias,
-            padding_mode,
-            device,
-            dtype,
+        time_factor: int,
+        prefix: str,
+        cache_config: CacheConfig,
+        dtype: torch.dtype,
+        channels: int,
+        freq: int,
+        kernel_size: int = KERNEL_SIZE,
+        stride: int = STRIDE,
+    ):
+        super().__init__()
+
+        self.prefix = prefix
+        self.channels = channels
+        self.freq = freq
+        self.time_factor = time_factor
+
+        # Fixed kernel parameters for causal_conv2d_k3s2
+        assert (
+            KERNEL_SIZE == kernel_size
+        ), f"conv2d is only implemented for kernel_size={KERNEL_SIZE}"
+        self.kernel_size = kernel_size
+        assert STRIDE == stride, f"conv2d is only implemented for stride={STRIDE}"
+        self.stride = stride
+        # WARNING! Cache page sizes have to be uniform in fastconformer.
+        # We pad cache across frequency dimension to correspond in size to attention page size: 256 * 512
+        self.padded_freq = FASTCONFORMER_CACHE_PAGE_SIZE // self.channels
+
+        # Depthwise conv weight: (kH, kW, C) for custom kernel
+        self.conv_weight = nn.Parameter(
+            torch.zeros(self.kernel_size, self.kernel_size, self.channels),
+            requires_grad=False,
+        )
+        self.conv_bias = nn.Parameter(
+            torch.zeros(self.channels),
+            requires_grad=False,
         )
 
-    def forward(
-        self,
-        x,  # B x CH x T x F
-    ):
-        # pad only frequencies
-        before = x.shape
-        x = F.pad(x, pad=(self._left_padding, self._right_padding))
-        print(f">>> causal conv2d padding {before} -> {x.shape}", flush=True)
-        before = x.shape
-        x = super().forward(x)
-        print(f">>> causal conv2d conv {before} -> {x.shape}", flush=True)
-        return x
+        self.cache_config = cache_config
+        self.kv_cache = [torch.tensor([])]
+        self.dtype = dtype
+
+        compilation = get_current_vllm_config().compilation_config
+        if prefix in compilation.static_forward_context:
+            raise ValueError(f"duplicate layer name: {prefix}")
+        compilation.static_forward_context[prefix] = self
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.ops.vllm.conv2d_layer(
+            hidden_states,
+            self.prefix,
+        )
+
+    def forward_cuda(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: (T, Freq, Channels) input tensor
+        Returns:
+            output: (T/2, Freq/2, Channels)
+        """
+        assert hidden_states.dim() == 3, "forward expects 3D tensor (T, F, C)"
+        assert hidden_states.shape[1] == self.freq
+        assert hidden_states.shape[2] == self.channels
+
+        seq_len = hidden_states.shape[0]
+        out_seq_len = seq_len // 2
+        out_freq = self.freq // 2
+
+        fctx = get_forward_context()
+        attn_meta_all = fctx.attn_metadata
+
+        if attn_meta_all is None:
+            # Profile run - return zeros with correct output shape
+            return torch.zeros(
+                (out_seq_len, out_freq, self.channels),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+        x = hidden_states.contiguous()
+
+        attn_metadata: VarlenChunkMetadata = attn_meta_all[self.prefix]
+        block_table = attn_metadata.block_table_tensor
+        page_indices = block_table[:, 0]
+
+        # Cache store: (num_blocks, padded_freq, channels)
+        # Only [:, :freq, :] is used; padding ensures uniform page sizes
+        store = self.kv_cache[fctx.virtual_engine]
+
+        query_start_loc = attn_metadata.query_start_loc
+
+        # True if cache has valid data (decode), False for first call (prefill)
+        has_initial_state = torch.ones(
+            page_indices.size(0), dtype=torch.bool, device=x.device
+        )
+
+        out = torch.empty(
+            (out_seq_len, out_freq, self.channels), device=x.device, dtype=x.dtype
+        )
+
+        depthwise_strided_conv2d_cached(
+            x,
+            self.conv_weight,
+            self.conv_bias,
+            out,
+            store,
+            query_start_loc,
+            page_indices,
+            has_initial_state,
+            metadata=attn_metadata,
+        )
+        return out
+
+    def get_attn_backend(self) -> AttentionBackend:
+        # kernel_block_size=64 for conv2d (64 output time steps per program)
+        return get_varlen_chunk_backend(
+            self.time_factor, self.stride, kernel_block_size=16
+        )
+
+    def get_kv_cache_spec(self) -> KVCacheSpec:
+        return FastConformerConvSpec(
+            block_size=1,
+            shape=(self.padded_freq, self.channels),
+            dtype=self.dtype,
+        )
+
+
+def conv2d_fwd(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    forward_context = get_forward_context()
+    self = forward_context.no_compile_layers[layer_name]
+    return self.forward_cuda(hidden_states=hidden_states)
+
+
+def conv2d_fwd_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    # Output shape after stride=2: (seq_len/2, freq/2, channels)
+    seq_len, freq, channels = hidden_states.shape
+    return torch.zeros(
+        (seq_len // 2, freq // 2, channels),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+
+
+direct_register_custom_op(
+    op_name="conv2d_layer",
+    op_func=conv2d_fwd,
+    fake_impl=conv2d_fwd_fake,
+)
 
 
 class ConvSubsampling(nn.Module):
     """
-    Minimal ConvSubsampling for dw_striding, causal mode.
-    Configuration: subsampling_factor=8, feat_in=80, feat_out=512, conv_channels=256
+    FastConformer convolutional subsampling: 8x time reduction, 80->11 freq.
+
+    Stack: Conv(3x3,s=2) -> ReLU -> [Conv -> Linear -> ReLU] x2 -> Linear
     """
 
-    def __init__(self, feat_in=80, feat_out=512, conv_channels=256):
-        super(ConvSubsampling, self).__init__()
+    def __init__(
+        self,
+        time_factor: int,
+        prefix: str,
+        cache_config: CacheConfig,
+        dtype: torch.dtype,
+        n_filt: int = 80,
+        channels: int = 256,
+        out_dim: int = 512,
+        **kwargs,
+    ):
+        super().__init__()
+        self.channels = channels
+        # pad frequency axis by 1 * time_factor
+        # to match dimensions in NeMo implementation
+        self.freq_padding = time_factor
+        # dimensionality across frequency axis after padding
+        cur_freq = n_filt + time_factor
 
-        # Fixed parameters for the specific configuration
-        self.subsampling_factor = 8
-        self._sampling_num = 3  # log2(8)
-        self._stride = 2
-        self._kernel_size = 3
-        self._ceil_mode = False
-        self._left_padding = self._kernel_size - 1  # 2
-        self._right_padding = self._stride - 1  # 1
-        self._feat_in = feat_in
-        self._feat_out = feat_out
-        self._conv_channels = conv_channels
-
-        # Build conv layers
         layers = []
-        activation = nn.ReLU(inplace=True)
+        activation = torch.nn.ReLU(inplace=True)
 
-        # Layer 0: First causal conv (1 -> 256 channels)
+        # First conv layer
         layers.append(
-            CausalConv2D(
-                in_channels=1,
-                out_channels=conv_channels,
-                kernel_size=self._kernel_size,
-                stride=self._stride,
-                padding=None,
+            Conv2dLayer(
+                time_factor,
+                prefix=f"{prefix}.conv.0",
+                cache_config=cache_config,
+                dtype=dtype,
+                channels=channels,
+                freq=cur_freq,
             )
         )
         layers.append(activation)
+        # reduce dimensionality across time and frequency by stride=2
+        cur_freq = cur_freq // 2
+        time_factor = time_factor // 2
 
-        # Layers 2-7: Two iterations of (depthwise + pointwise + activation)
-        for _ in range(self._sampling_num - 1):
-            # Depthwise conv
+        # Two more conv layers, each followed by pointwise conv
+        for i in range(int(math.log2(time_factor))):
             layers.append(
-                CausalConv2D(
-                    in_channels=conv_channels,
-                    out_channels=conv_channels,
-                    kernel_size=self._kernel_size,
-                    stride=self._stride,
-                    padding=None,
-                    groups=conv_channels,
+                Conv2dLayer(
+                    time_factor,
+                    prefix=f"{prefix}.conv.{i+1}",
+                    cache_config=cache_config,
+                    dtype=dtype,
+                    channels=channels,
+                    freq=cur_freq,
                 )
             )
-            # Pointwise conv
-            layers.append(
-                nn.Conv2d(
-                    in_channels=conv_channels,
-                    out_channels=conv_channels,
-                    kernel_size=1,
-                    stride=1,
-                    padding=0,
-                    groups=1,
-                )
-            )
+            cur_freq = cur_freq // 2
+            time_factor = time_factor // 2
+            layers.append(torch.nn.Linear(channels, channels))
             layers.append(activation)
 
         self.conv = nn.ModuleList(layers)
+        self.out = nn.Linear(channels * cur_freq, out_dim)
 
-        # hard code the size across frequency axis after convolutions
-        # this assumes `feat_in == 80`
-        out_length = 11
-        self.out = nn.Linear(conv_channels * out_length, feat_out)
-
-    def get_left_context_size(self) -> int:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Computes how many frames of left context will be sliced off
-        by the convolutional stack
+        Input: (T_target * Factor, Freq) flattened mel features
+        Output: (T_target, out_dim)
         """
-        resolution = 1
-        total_left_context = 0
-        for _ in range(self._sampling_num):
-            total_left_context += (self._kernel_size - 1) * resolution
-            resolution *= self._stride
-        return total_left_context
+        # Pad frequency: 80 + 8 = 88 -> 44 -> 22 -> 11
+        x = torch.nn.functional.pad(x, (self.freq_padding, 0))
+        # Expand channels: mimic 1->256 conv
+        x = x.unsqueeze(2).repeat(1, 1, self.channels).contiguous()
 
-    def forward(self, x):
-        """
-        Args:
-            x: [B, F, T]
-        Returns:
-            [B, T, feat_out]
-        """
-        # Transpose and add channel dimension: [B, F, T] -> [B, 1, T, F]
-        x = x.transpose(1, 2).unsqueeze(1)
+        # Apply conv stack
+        for layer in self.conv:
+            x = layer(x)
 
-        # Apply convolutions
-        for conv in self.conv:
-            x = conv(x)
-        # Flatten and project: [B, C, T, F] -> [B, T, C*F] -> [B, T, feat_out]
-        b, _, t, _ = x.size()
-        x = self.out(x.transpose(1, 2).reshape(b, t, -1))
-
+        # Final projection: (T, 11, 256) -> (T, 11*256) -> (T, 512)
+        x = self.out(x.transpose(2, 1).flatten(start_dim=1))
         return x
 
 
+@support_torch_compile
 class FastConformerPreprocessor(nn.Module):
     """
-    A preprocessor for the fastconformer model.
-    It consists of a filterbank features extractor and a convolutional subsampler.
+    FastConformer preprocessor modules - combines mel spectrogram extraction
+    and convolutional subsampling
     """
 
-    def __init__(self):
-        super(FastConformerPreprocessor, self).__init__()
-        self.filterbank_features = FilterbankFeatures()
-        self.pre_encode = ConvSubsampling()
-
-        # compute how much of the left context is needed to do streaming inference
-        self.buffer_size = self.filterbank_features.get_left_context_size()
-        self.buffer_size += (
-            self.pre_encode.get_left_context_size()
-            * self.filterbank_features.hop_length
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        # dictionary with all subsampling configuration
+        subsampling_conf = vllm_config.model_config.hf_config.subsampling
+        hop_length = subsampling_conf.get("hop_length", 160)
+        subsampling_factor = subsampling_conf.get("subsampling_factor", 8)
+        self.mel_spec = MelSpectrogramLayer(
+            time_factor=hop_length * subsampling_factor,
+            prefix=f"{prefix}.mel_spec.0",
+            cache_config=vllm_config.cache_config,
+            dtype=vllm_config.model_config.dtype,
+            **subsampling_conf,
         )
-        # create a streaming buffer
-        self.streaming_buffer = torch.zeros(
-            1, self.buffer_size, device=torch.device("cuda")
+        self.pre_encode = ConvSubsampling(
+            time_factor=subsampling_factor,
+            prefix=prefix,
+            cache_config=vllm_config.cache_config,
+            dtype=vllm_config.model_config.dtype,
+            **subsampling_conf,
         )
 
-        # CUDA graph members (initialized when capture_cuda_graph is called)
-        self.cuda_graph = None
-        self.static_input = None
-        self.static_output = None
-
-    def forward(self, x, buffer):
-        # Concatenate buffer to the left of input
-        x = torch.cat([buffer, x], dim=1)
-
-        mel = self.filterbank_features(x)
-        feat = self.pre_encode(mel)
-
-        # Update buffer with rightmost samples from the concatenated input
-        # Store for next iteration BEFORE any processing
-        buffer.copy_(x[:, -self.buffer_size :])
-
-        return feat
-
-    def capture_cuda_graph(self):
+    def forward(
+        self,
+        audio: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        Captures a CUDA graph for inputs of shape (1, 160*8).
-        This should be called after moving the model to CUDA.
-        The captured graph can then be replayed using forward_cuda_graph().
-        """
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available. Cannot capture CUDA graph.")
-
-        # Create static tensors for the specific input shape
-        input_size = 160 * 8  # 1280 samples, corresponds to single frame of output
-        self.static_input = torch.zeros(1, input_size, device="cuda")
-
-        # Create CUDA graph
-        self.cuda_graph = torch.cuda.CUDAGraph()
-
-        # Warm-up: run the model a few times before capturing the graph
-        for _ in range(3):
-            _ = self.forward(self.static_input, self.streaming_buffer)
-
-        # Capture the graph
-        with torch.cuda.graph(self.cuda_graph):
-            self.static_output = self.forward(self.static_input, self.streaming_buffer)
-
-        print("CUDA graph captured successfully for input shape (1, 1280)")
-
-    def forward_cuda_graph(self, x):
-        """
-        Replays the captured CUDA graph for inputs of shape (1, 160*8).
-
         Args:
-            x: Input tensor of shape (1, 1280)
-
+            audio: (T_target, factor) tensor,
+            where factor = 8 (subsampling factor) * 160 (hop length)
         Returns:
-            Output features from the preprocessor
-
-        Note: The input must have the same shape (1, 1280) as used during capture.
+            x: (T_target, 512) output
         """
-        if self.cuda_graph is None:
-            raise RuntimeError(
-                "CUDA graph not captured. Call capture_cuda_graph() first."
-            )
+        mel = self.mel_spec(audio.view(-1))  # frames x freq_bins
+        emb = self.pre_encode(mel)  # frames/8 x 512
+        return emb
 
-        if x.shape != (1, 160 * 8):
-            raise ValueError(f"Input shape must be (1, 1280), got {x.shape}")
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        """Load weights from FastConformer checkpoint."""
+        nemo = {name: tensor for name, tensor in weights}
 
-        # Copy input data into the static input tensor
-        self.static_input.copy_(x)
+        # Initialize mel spectrogram STFT basis and filterbank
+        self.mel_spec.init_stft_basis()
 
-        # Replay the graph
-        self.cuda_graph.replay()
+        # Depthwise conv layers: (C, 1, kH, kW) -> (kH, kW, C) with flip
+        self.pre_encode.conv[0].conv_weight.data.copy_(
+            nemo["encoder.pre_encode.conv.0.weight"]
+            .squeeze(1)
+            .permute(1, 2, 0)
+            .flip(1)
+            .flip(0)
+            .contiguous()
+        )
+        self.pre_encode.conv[2].conv_weight.data.copy_(
+            nemo["encoder.pre_encode.conv.2.weight"]
+            .squeeze(1)
+            .permute(1, 2, 0)
+            .flip(1)
+            .flip(0)
+        )
+        self.pre_encode.conv[5].conv_weight.data.copy_(
+            nemo["encoder.pre_encode.conv.5.weight"]
+            .squeeze(1)
+            .permute(1, 2, 0)
+            .flip(1)
+            .flip(0)
+        )
 
-        # Return the output directly, carefull its just an address to static tensor
-        # copy if storing into a list
-        return self.static_output
+        # Pointwise conv (1x1): (out, in, 1, 1) -> (out, in)
+        self.pre_encode.conv[3].weight.data.copy_(
+            nemo["encoder.pre_encode.conv.3.weight"].squeeze(-1).squeeze(-1)
+        )
+        self.pre_encode.conv[3].bias.data.copy_(nemo["encoder.pre_encode.conv.3.bias"])
 
-    def load_weights_from_nemo(self, model_path: str):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with tarfile.open(model_path, "r:") as tar:
-                tar.extractall(tmpdir)
+        self.pre_encode.conv[6].weight.data.copy_(
+            nemo["encoder.pre_encode.conv.6.weight"].squeeze(-1).squeeze(-1)
+        )
+        self.pre_encode.conv[6].bias.data.copy_(nemo["encoder.pre_encode.conv.6.bias"])
 
-            weights_path = os.path.join(tmpdir, "model_weights.ckpt")
-            state_dict = torch.load(
-                weights_path, map_location="cpu", weights_only=False
-            )
-            pre_enc_weights = {
-                k[len("encoder.pre_encode.") :]: v
-                for k, v in state_dict.items()
-                if k.startswith("encoder.pre_encode.")
-            }
-            # load this weigths for pre encode,
-            # filterbank weights are non-trainable and are re-created in the constructor
-            self.pre_encode.load_state_dict(pre_enc_weights, strict=True)
+        # Conv biases
+        self.pre_encode.conv[0].conv_bias.data.copy_(
+            nemo["encoder.pre_encode.conv.0.bias"]
+        )
+        self.pre_encode.conv[2].conv_bias.data.copy_(
+            nemo["encoder.pre_encode.conv.2.bias"]
+        )
+        self.pre_encode.conv[5].conv_bias.data.copy_(
+            nemo["encoder.pre_encode.conv.5.bias"]
+        )
 
-
-def get_original_feats(model_path: str, audio: torch.Tensor) -> torch.Tensor:
-    """
-    Extracts preprocessed features using the nemo code.
-    This is used to check that the standalone streaming implementation is actually correct.
-    """
-    from nemo.collections.asr.models import EncDecHybridRNNTCTCBPEModel
-
-    orig_model = EncDecHybridRNNTCTCBPEModel.restore_from(model_path, strict=False)
-    audio_len = torch.tensor([audio.shape[1]], device=audio.device)
-    mel, mel_len = orig_model.preprocessor(input_signal=audio, length=audio_len)
-    # mel has shape (B x F x T), need to transpose before pre encoder
-    # this transposition is in conformer_encoder forward code
-    mel = torch.transpose(mel, 1, 2)  # [B, T, F]
-    emb, _ = orig_model.encoder.pre_encode(x=mel, lengths=mel_len)
-    return emb
-
-
-def main():
-    """
-    Here we show how use FastConformerPreprocessor and also compare
-    it with original preprocessing from nemo.
-
-    We run nemo code on entire chunk.
-    Then run `FastConformerPreprocessor` incrementally, frame by frame.
-    Results are compared to verify that streaming implementation of conformer
-    preprocessor is correct.
-    """
-    model_path = "stt_en_fastconformer_hybrid_large_streaming_80ms.nemo"
-
-    y, sr = soundfile.read("pred.wav", dtype="float32", always_2d=True)
-    if sr != 16000:
-        # Resample to 16000 Hz if needed
-        y = resampy.resample(y.T, sr, 16000).T
-        sr = 16000
-    test_audio = torch.from_numpy(y.T).contiguous().cuda()  # shape [channels, samples]
-
-    # run nemo code on the entire chunk
-    orig_feats = get_original_feats(model_path, test_audio)
-    print(
-        f"Nemo fastconformer produced {orig_feats.shape} features from {test_audio.shape} test audio"
-    )
-    torch.save(orig_feats, "orig_feats.pt")
-
-    # now run `FastConformerPreprocessor` incrementally
-    preprocessor = FastConformerPreprocessor().cuda()
-    preprocessor.load_weights_from_nemo(model_path)
-    preprocessor.capture_cuda_graph()
-
-    res = preprocessor(test_audio, preprocessor.streaming_buffer)
-    torch.save(res, "orig_feats.pt")
-    preprocessor.streaming_buffer.zero_()
-
-    outputs = []
-    start = 0
-    prefill_steps = 15
-    # run context phase (16 frames) in eager mode
-    context_len = 160 * prefill_steps * 8
-    chunk = test_audio[:, start : start + context_len]
-    start += context_len
-    feats = preprocessor(chunk, preprocessor.streaming_buffer)
-    outputs.append(feats)
-    # now generate frame by frame of 20 steps
-    step = 160 * 8
-    generations_steps = 30
-    for _ in range(generations_steps):
-        chunk = test_audio[:, start : start + step]
-        start += step
-        feats = preprocessor.forward_cuda_graph(chunk)
-        outputs.append(feats.clone())
-    res = torch.cat(outputs, dim=1)
-    print(
-        f"FastConformerPreprocessor produced {res.shape} features, expected ({prefill_steps} context + {generations_steps} incremental steps)"
-    )
-    torch.save(res, "fastconformer_feats.pt")
-
-
-if __name__ == "__main__":
-    main()
+        # Output projection
+        self.pre_encode.out.weight.data.copy_(nemo["encoder.pre_encode.out.weight"])
+        self.pre_encode.out.bias.data.copy_(nemo["encoder.pre_encode.out.bias"])
