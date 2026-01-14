@@ -92,23 +92,6 @@ class RelPosSelfAttention(nn.Module):
             attn_backend=FastConformerRPEBackend,
         )
 
-        # 2. config for flash-attention
-        # used in `_forward_flash_window`
-        # self.attn = Attention(
-        #     num_heads=self.h,
-        #     head_size=self.dh,
-        #     scale=self.dh ** -0.5,
-        #     num_kv_heads=self.h,
-        #     cache_config=CacheConfig(
-        #         sliding_window=self.window,
-        #         cache_dtype="auto",
-        #         block_size=cache_config.block_size,
-        #         calculate_kv_scales=False,
-        #     ),
-        #     prefix=self.prefix,
-        #     attn_backend=FlashAttentionBackend,
-        # )
-
         self._k_scale = torch.tensor(1.0, dtype=torch.float32)
         self._v_scale = torch.tensor(1.0, dtype=torch.float32)
         self._q_scale = torch.tensor(1.0, dtype=torch.float32)
@@ -137,100 +120,9 @@ class RelPosSelfAttention(nn.Module):
         q, k, v = qkv.split(D, dim=-1)
         return q, k, v
 
-    def _forward_ref(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        H, Dh = self.h, self.dh
-        assert D == H * Dh
-
-        q, k, v = self._fused_qkv_projection(x)
-        q = q.view(B, T, H, Dh).transpose(1, 2).contiguous()
-        k = k.view(B, T, H, Dh).transpose(1, 2).contiguous()
-        v = v.view(B, T, H, Dh).transpose(1, 2).contiguous()
-
-        device, idtype = x.device, x.dtype
-        pos_idx = torch.arange(T - 1, -T, -1, device=device)[:T]
-        div = torch.exp(torch.arange(0, D, 2, device=device, dtype=torch.float32)
-                        * (-math.log(10000.0) / D))
-        sin = torch.sin(pos_idx[:, None].to(torch.float32) * div[None, :])
-        cos = torch.cos(pos_idx[:, None].to(torch.float32) * div[None, :])
-        pos = torch.zeros(T, D, device=device, dtype=torch.float32)
-        pos[:, 0::2] = sin
-        pos[:, 1::2] = cos
-
-        p = self.linear_pos(pos.to(idtype)).view(T, H, Dh).permute(1, 0, 2).contiguous()
-        p = p.unsqueeze(0).expand(B, -1, -1, -1)
-
-        q_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
-        q_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)
-
-        scores_ac = torch.matmul(q_u, k.transpose(-2, -1))  # [B,H,T,T]
-
-        raw_bd = torch.matmul(q_v, p.transpose(-2, -1))     # [B,H,T,T]
-        b, h, qlen, pos_len = raw_bd.size()
-        bd = F.pad(raw_bd, (1, 0))
-        bd = bd.view(b, h, pos_len + 1, qlen)[:, :, 1:].view(b, h, qlen, pos_len)
-        scores_bd = bd
-
-        scores = (scores_ac + scores_bd) * (Dh ** -0.5)
-
-        causal = torch.ones(T, T, device=device, dtype=torch.bool).triu(1)
-        scores = scores.masked_fill(causal.view(1, 1, T, T), float("-inf"))
-
-        W = int(self.window)
-        if W > 0 and W < T:
-            idx = torch.arange(T, device=device)
-            q_idx = idx.view(1, 1, T, 1)
-            k_idx = idx.view(1, 1, 1, T)
-            allowed = (k_idx <= q_idx) & ((q_idx - k_idx) <= W)
-            scores = scores.masked_fill(~allowed, float("-inf"))
-
-        scores32 = scores.to(torch.float32)
-        scores32 = scores32 - torch.amax(scores32, dim=-1, keepdim=True)
-        probs = torch.softmax(scores32, dim=-1).to(idtype)
-
-        ctx = torch.matmul(probs, v).transpose(1, 2).contiguous().view(B, T, D)
-        return self.o_proj(ctx)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # NOTE: this is the current state of the possible attention implementations we have for fastconformer.
-        # feel free to delete this comment and unused implementations once we decide on the preferred implementation.
-        # 1. `_forward_sdpa`: use sdpa attention with no kv-cache
-        # - produces incorrect logits, used for benchmarking purposes
-        # 2. `_forward_sdpa_2`: use sdpa attention with custom windowed kv-cache
-        # - produces correct logits and marginally slower than flash-attention implementation
-        # 3. `_forward_flash_window`: use flash attention with windowed kv-cache
-        # - produces incorrect logits used for benchmarking purposes
-        # - **important**: only supports bf16/fp16, not float32. other attn implementations support float32.
-        # 4. `_forward_ref`: a reference implementation to help with debugging
-        # - produces correct prefill logits but incorrect decode logits
-        return self._forward_sdpa_2(x)
-
-    def _forward_flash_window(self, x: torch.Tensor) -> torch.Tensor:
-        q, k, v = self._fused_qkv_projection(x)
-        attn_output = self.attn(q, k, v)
-        return self.o_proj(attn_output)
-
-    def _forward_sdpa(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        H, Dh = self.h, self.dh
-
-        q, k, v = self._fused_qkv_projection(x)
-        q = q.view(B, T, H, Dh)
-        k = k.view(B, T, H, Dh)
-        v = v.view(B, T, H, Dh)
-
-        q = q.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
-        k = k.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
-        v = v.permute(0, 2, 1, 3).reshape(B * H, T, Dh)
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=True
-        )
-        attn_output = attn_output.view(B, H, T, Dh).permute(0, 2, 1, 3).contiguous().view(B, T, D)
-        out = self.o_proj(attn_output)
-        return out
-
-    def _forward_sdpa_2(self, x: torch.Tensor) -> torch.Tensor:
+        # NOTE(vklimkov): clean up possible attention implementations for RPE.
+        # see git history for more details.
         q, k, v = self._fused_qkv_projection(x)
         attn_output = self.attn(q, k, v)
         return self.o_proj(attn_output)
