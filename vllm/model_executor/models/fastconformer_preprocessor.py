@@ -27,6 +27,10 @@ from vllm.v1.attention.backends.varlen_chunk import (
     get_varlen_chunk_backend,
     VarlenChunkMetadata,
 )
+from vllm.v1.attention.backends.fastconformer_conv import (
+    FastConformerConvBackend,
+    FastConformerConvMetadata,
+)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.custom_op import CustomOp
 from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
@@ -182,7 +186,7 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
         out = torch.empty(
             (out_seq_len, self.n_fft // 2 + 1), device=x.device, dtype=x.dtype
         )
-        attn_metadata: VarlenChunkMetadata = attn_meta_all[self.prefix]
+        attn_metadata: FastConformerConvMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
@@ -199,7 +203,10 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
             page_indices,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
-            block_frames=attn_metadata.kernel_block_size,
+            # time_factor converts query_start_loc to sample positions
+            time_factor=self.time_factor,
+            # output_divisor converts samples to frames (= hop_length)
+            output_divisor=self.hop_length,
             metadata=attn_metadata,
         )
 
@@ -210,10 +217,9 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
         return x
 
     def get_attn_backend(self) -> AttentionBackend:
-        # kernel_block_size=16 for STFT (16 frames per program)
-        return get_varlen_chunk_backend(
-            self.time_factor, self.hop_length, kernel_block_size=16
-        )
+        # Use FastConformerConvBackend - STFT kernel handles time_factor and
+        # output_divisor internally, no need for pre-computed output positions
+        return FastConformerConvBackend
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
