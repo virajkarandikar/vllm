@@ -7306,8 +7306,25 @@ class GPUModelRunner(
                     )
 
                 elif isinstance(kv_cache_spec, FastConformerConvSpec):
+                    # Get per-layer spec from the module since layers with
+                    # same page_size but different shapes are grouped together.
+                    # The group's kv_cache_spec uses the first layer's shape,
+                    # but each layer needs its own shape for proper reshaping.
+                    layer_module = self.compilation_config.static_forward_context.get(
+                        layer_name
+                    )
+                    if layer_module is not None and hasattr(
+                        layer_module, "get_kv_cache_spec"
+                    ):
+                        per_layer_spec = layer_module.get_kv_cache_spec()
+                        layer_shape = per_layer_spec.shape
+                    else:
+                        # Fallback to group spec shape if module not found
+                        layer_shape = kv_cache_spec.shape
+
+                    dtype = kv_cache_spec.dtype
                     raw_tensor = kv_cache_raw_tensors[layer_name]
-                    kv_cache_shape = (num_blocks, *kv_cache_spec.shape)
+                    kv_cache_shape = (num_blocks, *layer_shape)
                     kv_caches[layer_name] = (
                         raw_tensor.view(kv_cache_spec.dtype).view(kv_cache_shape)
                     )

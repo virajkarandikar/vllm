@@ -615,9 +615,17 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             model_version=model_version_set.pop(),
         )
 
-@dataclass(frozen=True)
+
+@dataclass(frozen=True, eq=False)
 class FastConformerConvSpec(KVCacheSpec):
-    shape: tuple[int ,...]
+    """
+    KV cache spec for FastConformer conv/stft layers.
+    
+    Layers with the same page_size_bytes are considered equal for grouping,
+    even if they have different shapes. This allows conv1d, conv2d, and stft
+    layers to share a single cache group when their total cache sizes match.
+    """
+    shape: tuple[int, ...]
     dtype: torch.dtype
 
     @property
@@ -627,6 +635,47 @@ class FastConformerConvSpec(KVCacheSpec):
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+    def __hash__(self) -> int:
+        # Hash by block_size, page_size_bytes, and dtype - not shape
+        # This allows layers with same cache size but different shapes
+        # to be grouped together
+        return hash((self.block_size, self.page_size_bytes, self.dtype))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, FastConformerConvSpec):
+            return False
+        # Equal if same block_size, page_size_bytes, and dtype
+        return (
+            self.block_size == other.block_size
+            and self.page_size_bytes == other.page_size_bytes
+            and self.dtype == other.dtype
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        """
+        Merge FastConformerConvSpec layers with same page_size but different shapes.
+        Returns a spec using the shape from the first layer (arbitrary choice,
+        since all have the same page_size_bytes).
+        """
+        assert all(isinstance(spec, FastConformerConvSpec) for spec in specs), (
+            "All specs must be FastConformerConvSpec"
+        )
+        assert all(spec.page_size_bytes == specs[0].page_size_bytes for spec in specs), (
+            "All FastConformerConvSpec layers in the same group must have "
+            "the same page_size_bytes"
+        )
+        assert all(spec.block_size == specs[0].block_size for spec in specs), (
+            "All FastConformerConvSpec layers in the same group must have "
+            "the same block_size"
+        )
+        assert all(spec.dtype == specs[0].dtype for spec in specs), (
+            "All FastConformerConvSpec layers in the same group must have "
+            "the same dtype"
+        )
+        # Return a copy of the first spec (shape is preserved for that layer)
+        return copy.deepcopy(specs[0])
 
 
 @dataclass(frozen=True)
