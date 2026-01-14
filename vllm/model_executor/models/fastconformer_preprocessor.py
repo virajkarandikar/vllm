@@ -23,10 +23,6 @@ import math
 
 from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
 from vllm.attention.backends.abstract import AttentionBackend
-from vllm.v1.attention.backends.varlen_chunk import (
-    get_varlen_chunk_backend,
-    VarlenChunkMetadata,
-)
 from vllm.v1.attention.backends.fastconformer_conv import (
     FastConformerConvBackend,
     FastConformerConvMetadata,
@@ -357,7 +353,7 @@ class Conv2dLayer(CustomOp, AttentionLayerBase):
 
         x = hidden_states.contiguous()
 
-        attn_metadata: VarlenChunkMetadata = attn_meta_all[self.prefix]
+        attn_metadata: FastConformerConvMetadata = attn_meta_all[self.prefix]
         block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
@@ -385,15 +381,16 @@ class Conv2dLayer(CustomOp, AttentionLayerBase):
             query_start_loc,
             page_indices,
             has_initial_state,
+            time_factor=self.time_factor,
+            output_divisor=self.stride,
             metadata=attn_metadata,
         )
         return out
 
     def get_attn_backend(self) -> AttentionBackend:
-        # kernel_block_size=64 for conv2d (64 output time steps per program)
-        return get_varlen_chunk_backend(
-            self.time_factor, self.stride, kernel_block_size=16
-        )
+        # Use FastConformerConvBackend - kernel handles time_factor and
+        # output_divisor internally, same metadata type for all kernels
+        return FastConformerConvBackend
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
