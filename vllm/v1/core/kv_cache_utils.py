@@ -1138,18 +1138,30 @@ def _get_kv_cache_groups_uniform_page_size(
     # is the minimum number of layers among all attention types. Need a better
     # strategy if we want to support more complex patterns (e.g., 20 full + 30
     # sw, where the group size should be 10).
-    min_num_layers = min([len(layers) for layers in same_type_layers.values()])
-    group_size = min_num_layers
-    max_num_layers = max([len(layers) for layers in same_type_layers.values()])
-    if max_num_layers < min_num_layers * 1.5:
-        # If the number of layers is not much larger than the minimum number of
-        # layers, use the maximum number of layers as the group size to avoid
-        # too many padding layers. A typical example is gpt-oss-20b + eagle,
-        # with 12 sw + 13 full. We pad it to (13 sw, 13 full) instead of
-        # (12 sw, 24 full). 1.5 is a heuristic to avoid too many padding
-        # layers while accommodating speculative decoding drafters that add
-        # extra layers to one attention type.
-        group_size = max_num_layers
+    # HACK(vklimkov): Add additional logic that handles uneven case, for ex.
+    # fastconformer has 17 attn layers and 21 conv layers. Here it makes sense
+    # to pad to 21. This logic checks what is better: to pad to min or to max.
+    def compute_total_padding(group_size: int) -> int:
+        total = 0
+        for layers in same_type_layers.values():
+            remainder = len(layers) % group_size
+            if remainder != 0:
+                total += group_size - remainder
+        return total
+
+    layer_counts = [len(layers) for layers in same_type_layers.values()]
+    min_group_size = min(layer_counts)
+    max_group_size = max(layer_counts)
+
+    padding_with_min = compute_total_padding(min_group_size)
+    padding_with_max = compute_total_padding(max_group_size)
+
+    # Prefer max (fewer groups) when padding is equal or less
+    if padding_with_max < padding_with_min:
+        group_size = max_group_size
+    else:
+        # original approach to pad to min number of layers per group
+        group_size = min_group_size
     grouped_layers = []
     for layers in same_type_layers.values():
         num_padding_layers = group_size - len(layers) % group_size
