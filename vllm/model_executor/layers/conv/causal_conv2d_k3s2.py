@@ -11,6 +11,15 @@ import numpy as np
 # - Uses cache_indices to map sequences to cache lines
 # - Uses has_initial_state to determine whether to read from cache
 # - Updates cache with final state after processing
+#
+# Uses FastConformerConvMetadata-compatible inputs:
+# - query_start_loc: cumulative positions in base units
+# - batch_ptr / token_chunk_offset_ptr: program ID to (seq, chunk) mapping
+# - TIME_FACTOR: multiply query_start_loc to get input time positions
+# - OUTPUT_DIVISOR: divide input time positions to get output time positions (= stride)
+
+PAD_SLOT_ID = -1
+
 
 @triton.jit
 def depthwise_strided_conv2d_cached_kernel(
@@ -23,12 +32,11 @@ def depthwise_strided_conv2d_cached_kernel(
     conv_state_ptr,     # cache: (num_cache_lines, freq_len, channels) - stores last odd time values
     cache_indices_ptr,  # (batch,) int32 - maps sequence to cache line index
     has_initial_state_ptr,  # (batch,) bool - whether to use cached state
-    # Sequence mapping (computed on CPU, passed to kernel)
+    # Sequence mapping (from FastConformerConvMetadata)
     batch_ptr,          # (num_programs,) maps program_id -> sequence index
-    time_chunk_offset_ptr,  # (num_programs,) maps program_id -> chunk index within sequence
+    token_chunk_offset_ptr,  # (num_programs,) maps program_id -> chunk index
     # Sequence boundaries
-    query_start_loc_in_ptr,   # (batch+1,) cumulative input time positions
-    query_start_loc_out_ptr,  # (batch+1,) cumulative output time positions
+    query_start_loc_ptr,   # (batch+1,) cumulative positions in base units
     # Dimensions
     FREQ_LEN: tl.constexpr,
     TOTAL_CHANNELS: tl.constexpr,
@@ -40,12 +48,22 @@ def depthwise_strided_conv2d_cached_kernel(
     # Block sizes
     BLOCK_CHANNELS: tl.constexpr,
     BLOCK_TIME: tl.constexpr,  # Number of output time steps per chunk
+    # Position scaling (like STFT)
+    TIME_FACTOR: tl.constexpr,  # Multiply query_start_loc to get input time positions
+    OUTPUT_DIVISOR: tl.constexpr,  # Divide input time to get output time (= stride)
+    # Padding handling
+    pad_slot_id: tl.constexpr,
+    USE_PAD_SLOT: tl.constexpr,
 ):
     """
     Varlen depthwise strided 2D conv with cache support for step-by-step execution.
     
+    Uses FastConformerConvMetadata-compatible inputs:
+    - query_start_loc in base units, scaled by TIME_FACTOR to get input time positions
+    - Output time positions computed as input_time // OUTPUT_DIVISOR
+    
     Grid: (num_programs, freq_out, channel_blocks)
-    - program_id(0): sequence/chunk program (from batch_ptr/time_chunk_offset_ptr)
+    - program_id(0): sequence/chunk program (from batch_ptr/token_chunk_offset_ptr)
     - program_id(1): output frequency index  
     - program_id(2): channel block index
     
@@ -57,11 +75,17 @@ def depthwise_strided_conv2d_cached_kernel(
     # ==========================================================================
     # Step 1: Map program_id to (sequence_idx, chunk_offset)
     # ==========================================================================
-    idx_seq = tl.load(batch_ptr + tl.program_id(0)).to(tl.int64)
-    chunk_offset = tl.load(time_chunk_offset_ptr + tl.program_id(0))
+    prog_id = tl.program_id(0)
+    idx_seq = tl.load(batch_ptr + prog_id).to(tl.int64)
+    chunk_offset = tl.load(token_chunk_offset_ptr + prog_id)
     
     f_out = tl.program_id(1)  # Output frequency index
     pid_ch = tl.program_id(2)  # Channel block index
+    
+    # Skip padding slots
+    if USE_PAD_SLOT:
+        if idx_seq == pad_slot_id:
+            return
     
     idx_ch = pid_ch * BLOCK_CHANNELS + tl.arange(0, BLOCK_CHANNELS)
     mask_ch = idx_ch < TOTAL_CHANNELS
@@ -71,12 +95,24 @@ def depthwise_strided_conv2d_cached_kernel(
     # ==========================================================================
     cache_idx = tl.load(cache_indices_ptr + idx_seq).to(tl.int64)
     
+    if USE_PAD_SLOT:
+        if cache_idx == pad_slot_id:
+            return
+    
     # ==========================================================================
-    # Step 3: Locate this sequence in the packed input/output
+    # Step 3: Get sequence boundaries using TIME_FACTOR and OUTPUT_DIVISOR
     # ==========================================================================
-    seq_start_in = tl.load(query_start_loc_in_ptr + idx_seq)
-    seq_start_out = tl.load(query_start_loc_out_ptr + idx_seq)
-    seq_end_out = tl.load(query_start_loc_out_ptr + idx_seq + 1)
+    # Load base positions and scale by TIME_FACTOR to get input time positions
+    base_start = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+    base_end = tl.load(query_start_loc_ptr + idx_seq + 1).to(tl.int64)
+    
+    seq_start_in = base_start * TIME_FACTOR
+    seq_end_in = base_end * TIME_FACTOR
+    seq_time_in = seq_end_in - seq_start_in
+    
+    # Compute output positions from input positions using OUTPUT_DIVISOR
+    seq_start_out = seq_start_in // OUTPUT_DIVISOR
+    seq_end_out = seq_end_in // OUTPUT_DIVISOR
     seq_time_out = seq_end_out - seq_start_out
     
     # ==========================================================================
@@ -239,45 +275,52 @@ def depthwise_strided_conv2d_cached_kernel(
             last_x_odd_lo, mask=mask_ch & valid_f_lo
         )
 
+
 def depthwise_strided_conv2d_cached(
     x: torch.Tensor,                    # (cu_time_in, freq, channels) - packed sequences
     w: torch.Tensor,                    # (3, 3, channels)
     bias: torch.Tensor,                 # (channels,)
     out: torch.Tensor,                  # (cu_time_out, freq//2, channels) - pre-allocated output
     conv_state: torch.Tensor,           # (num_cache_lines, freq, channels) - cache
-    query_start_loc: torch.Tensor,      # (batch+1,) cumulative input time positions
+    query_start_loc: torch.Tensor,      # (batch+1,) cumulative positions in base units
     cache_indices: torch.Tensor,        # (batch,) maps sequence to cache line
     has_initial_state: torch.Tensor,    # (batch,) bool - whether to use cached state
     block_ch: int = 256,
-    block_t: int = 16,  # Can be overridden by metadata.kernel_block_size
-    metadata=None,                      # Optional: provides pre-computed batch_ptr, etc.
+    block_t: int = 8,  # Match FastConformer's BLOCK_M for consistency
+    time_factor: int = 1,   # Multiply query_start_loc to get input time positions
+    output_divisor: int = 2,  # Divide input time to get output time (= stride)
+    pad_slot_id: int = PAD_SLOT_ID,
+    metadata=None,                      # Optional: FastConformerConvMetadata-compatible
 ) -> torch.Tensor:
     """
     Varlen depthwise strided 2D convolution with cache support.
     
-    Similar to causal_conv1d_fn, this supports step-by-step execution where:
-    - conv_state stores temporal history from previous tokens
-    - cache_indices maps each sequence to its cache line
-    - has_initial_state indicates whether to read from cache
+    Compatible with FastConformerConvMetadata:
+    - Uses batch_ptr and token_chunk_offset_ptr from metadata
+    - Applies time_factor and output_divisor to compute positions in-kernel
     
-    If metadata is provided, uses pre-computed batch_ptr/time_chunk_offset_ptr from it
-    (no CPU blocking). Otherwise computes on the fly (CPU blocking - not for CUDA graphs).
+    Position computation:
+    - input_time = query_start_loc * time_factor
+    - output_time = input_time // output_divisor
     
     Args:
         x: Packed input tensor (cu_time_in, freq, channels)
         w: Kernel weights (3, 3, channels)
         bias: Bias (channels,)
         out: Pre-allocated output tensor (cu_time_out, freq//2, channels)
-        conv_state: Cache tensor (num_cache_lines, freq, channels)
+        conv_state: Cache tensor (num_cache_lines, padded_freq, channels)
                    Stores the last processed odd time step values.
                    Updated in-place after processing.
-        query_start_loc: Cumulative sequence boundaries (batch+1,)
+        query_start_loc: Cumulative positions in base units (batch+1,)
         cache_indices: Maps each sequence to cache line (batch,)
         has_initial_state: Whether to use cached state (batch,) bool
         block_ch: Channel block size
-        block_t: Time block size (overridden by metadata.kernel_block_size if provided)
-        metadata: Optional metadata with pre-computed batch_ptr, time_chunk_offset_ptr,
-                  query_start_loc_out, num_programs, kernel_block_size (for CUDA graph compatibility)
+        block_t: Time block size (default 8, matches FastConformer BLOCK_M)
+        time_factor: Multiplier for query_start_loc to get input time positions
+        output_divisor: Divisor for input time to get output time (= stride)
+        pad_slot_id: Padding slot ID for skipping invalid sequences
+        metadata: Optional FastConformerConvMetadata with pre-computed batch_ptr,
+                  token_chunk_offset_ptr, nums_dict (for CUDA graph compatibility)
     
     Returns:
         Output tensor (cu_time_out, freq//2, channels)
@@ -289,39 +332,61 @@ def depthwise_strided_conv2d_cached(
     assert conv_state.shape[1] >= freq_len, "conv_state frequency dimension must be >= freq_len"
     assert conv_state.shape[2] == channels, "conv_state channels dimension must be == channels"
     
-    # Get batch_ptr, time_chunk_offset_ptr, query_start_loc_out from metadata or compute
+    # Get batch_ptr, token_chunk_offset_ptr from metadata or compute on the fly
     if metadata is not None:
-        # Use pre-computed values from metadata (no CPU blocking)
+        # Use pre-computed values from FastConformerConvMetadata (no CPU blocking)
         batch_ptr = metadata.batch_ptr
-        time_chunk_offset_ptr = metadata.time_chunk_offset_ptr
-        query_start_loc_out = metadata.query_start_loc_out
-        num_programs = metadata.num_programs
+        token_chunk_offset_ptr = metadata.token_chunk_offset_ptr
+        
+        # Get num_programs from nums_dict if available
+        if hasattr(metadata, 'nums_dict') and metadata.nums_dict is not None:
+            if block_t in metadata.nums_dict:
+                num_programs = metadata.nums_dict[block_t]['tot']
+            else:
+                # Fall back to the first available block size
+                first_key = next(iter(metadata.nums_dict.keys()))
+                num_programs = metadata.nums_dict[first_key]['mlist_len']
+        elif hasattr(metadata, 'num_programs') and metadata.num_programs is not None:
+            num_programs = metadata.num_programs
+        else:
+            # Count non-padding entries in batch_ptr
+            num_programs = (batch_ptr != pad_slot_id).sum().item()
     else:
         # Compute on the fly (CPU blocking - not safe for CUDA graphs)
         query_start_loc_cpu = query_start_loc.cpu()
-        seqlens_in = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-        seqlens_out = seqlens_in // 2
+        
+        # Scale by time_factor to get input time lengths
+        seqlens_in = (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]) * time_factor
+        
+        # Output lengths = input lengths // output_divisor
+        seqlens_out = seqlens_in // output_divisor
         
         batch_size = len(seqlens_in)
         
-        query_start_loc_out_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
-        query_start_loc_out_cpu[1:] = torch.cumsum(seqlens_out, dim=0)
+        total_out_frames = seqlens_out.sum().item()
         
-        # Build program mapping (use ceiling division)
+        if total_out_frames == 0:
+            return out
+        
+        # Build program mapping: each program handles block_t output frames
+        # Use ceiling division to ensure all output frames are covered
         batch_list = []
         chunk_offset_list = []
         
         for seq_idx, seq_out_len in enumerate(seqlens_out.numpy()):
             seq_out_len = int(seq_out_len)
             num_chunks = (seq_out_len + block_t - 1) // block_t if seq_out_len > 0 else 1
-            batch_list.extend([seq_idx] * num_chunks)
-            chunk_offset_list.extend(range(num_chunks))
+            if num_chunks > 0:
+                batch_list.extend([seq_idx] * num_chunks)
+                chunk_offset_list.extend(range(num_chunks))
         
         num_programs = len(batch_list)
         
+        if num_programs == 0:
+            return out
+        
         batch_ptr = torch.tensor(batch_list, dtype=torch.int32, device=x.device)
-        time_chunk_offset_ptr = torch.tensor(chunk_offset_list, dtype=torch.int32, device=x.device)
-        query_start_loc_out = query_start_loc_out_cpu.to(x.device)
+        token_chunk_offset_ptr = torch.tensor(chunk_offset_list, dtype=torch.int32, device=x.device)
     
     # Get strides
     stride_state_seq, stride_state_freq, stride_state_ch = conv_state.stride()
@@ -332,8 +397,8 @@ def depthwise_strided_conv2d_cached(
     depthwise_strided_conv2d_cached_kernel[grid](
         x, w, bias, out,
         conv_state, cache_indices, has_initial_state,
-        batch_ptr, time_chunk_offset_ptr,
-        query_start_loc, query_start_loc_out,
+        batch_ptr, token_chunk_offset_ptr,
+        query_start_loc,
         FREQ_LEN=freq_len,
         TOTAL_CHANNELS=channels,
         num_cache_lines=conv_state.shape[0],
@@ -342,6 +407,10 @@ def depthwise_strided_conv2d_cached(
         stride_state_ch=stride_state_ch,
         BLOCK_CHANNELS=block_ch,
         BLOCK_TIME=block_t,
+        TIME_FACTOR=time_factor,
+        OUTPUT_DIVISOR=output_divisor,
+        pad_slot_id=pad_slot_id,
+        USE_PAD_SLOT=pad_slot_id is not None,
     )
     
     return out
