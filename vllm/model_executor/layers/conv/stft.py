@@ -18,8 +18,15 @@ import numpy as np
 #
 # For proper streaming, input lengths should be divisible by hop_length.
 # This ensures clean frame boundaries: num_frames = seq_len // hop_length
+#
+# This kernel uses FastConformerConvMetadata-compatible inputs:
+# - query_start_loc: cumulative positions in base units
+# - batch_ptr / token_chunk_offset_ptr: program ID to (seq, chunk) mapping
+# - TIME_FACTOR: multiply query_start_loc to get sample positions
+# - OUTPUT_DIVISOR: divide sample positions to get frame positions (= hop_length)
 
 PAD_SLOT_ID = -1
+
 
 @triton.jit
 def stft_cached_kernel(
@@ -30,12 +37,11 @@ def stft_cached_kernel(
     # Cache pointers
     stft_state_ptr,         # Cache: (num_cache_lines, CACHE_LEN) - stores last N_FFT-HOP samples
     cache_indices_ptr,      # (batch,) int32 - maps sequence to cache line index
-    # Sequence mapping (computed on CPU, passed to kernel)
+    # Sequence mapping (from FastConformerConvMetadata)
     batch_ptr,              # (num_programs,) maps program_id -> sequence index
     time_chunk_offset_ptr,  # (num_programs,) maps program_id -> chunk index
     # Sequence boundaries
-    query_start_loc_ptr,     # (batch+1,) cumulative sample positions
-    query_start_loc_out_ptr, # (batch+1,) cumulative frame positions
+    query_start_loc_ptr,    # (batch+1,) cumulative positions in base units
     # Strides
     stride_rf, stride_rn,
     stride_cache_seq, stride_cache_sample,
@@ -48,11 +54,17 @@ def stft_cached_kernel(
     MAG_POWER: tl.constexpr,
     BLOCK_F: tl.constexpr,
     BLOCK_FRAMES: tl.constexpr,  # Number of frames per chunk (like BLOCK_TIME in conv2d)
+    TIME_FACTOR: tl.constexpr,  # Multiply query_start_loc to get sample positions
+    OUTPUT_DIVISOR: tl.constexpr,  # Divide sample positions to get frame positions
     pad_slot_id: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
 ):
     """
     Varlen STFT magnitude kernel with cache support for streaming execution.
+    
+    Uses FastConformerConvMetadata-compatible inputs:
+    - query_start_loc in base units, scaled by TIME_FACTOR to get sample positions
+    - Frame positions computed as sample_positions // OUTPUT_DIVISOR
     
     Grid: (num_programs, freq_blocks)
     - program_id(0): sequence/chunk program (from batch_ptr/time_chunk_offset_ptr)
@@ -93,14 +105,19 @@ def stft_cached_kernel(
             return
     
     # ==========================================================================
-    # Step 3: Get sequence boundaries
+    # Step 3: Get sequence boundaries using TIME_FACTOR and OUTPUT_DIVISOR
     # ==========================================================================
-    seq_sample_start = tl.load(query_start_loc_ptr + idx_seq)
-    seq_sample_end = tl.load(query_start_loc_ptr + idx_seq + 1)
+    # Load base positions and scale by TIME_FACTOR to get sample positions
+    base_start = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
+    base_end = tl.load(query_start_loc_ptr + idx_seq + 1).to(tl.int64)
+    
+    seq_sample_start = base_start * TIME_FACTOR
+    seq_sample_end = base_end * TIME_FACTOR
     seq_len = seq_sample_end - seq_sample_start
     
-    seq_frame_start = tl.load(query_start_loc_out_ptr + idx_seq)
-    seq_frame_end = tl.load(query_start_loc_out_ptr + idx_seq + 1)
+    # Compute frame positions from sample positions using OUTPUT_DIVISOR
+    seq_frame_start = seq_sample_start // OUTPUT_DIVISOR
+    seq_frame_end = seq_sample_end // OUTPUT_DIVISOR
     seq_num_frames = seq_frame_end - seq_frame_start
     
     # ==========================================================================
@@ -275,28 +292,36 @@ def stft_cached(
     w_imag: torch.Tensor,               # (n_freqs, n_fft) - imaginary basis
     out: torch.Tensor,                  # (total_frames, n_freqs) - pre-allocated output
     stft_state: torch.Tensor,           # (num_cache_lines, cache_len) - cache
-    query_start_loc: torch.Tensor,      # (batch+1,) cumulative sample positions
+    query_start_loc: torch.Tensor,      # (batch+1,) cumulative positions in base units
     cache_indices: torch.Tensor,        # (batch,) maps sequence to cache line
     n_fft: int,
     hop_length: int,
     mag_power: float = 2.0,
     pad_slot_id: int = PAD_SLOT_ID,
     block_f: int = 32,
-    block_frames: int = 16,  # Can be overridden by metadata
-    metadata=None,                      # Optional: provides pre-computed batch_ptr, etc.
+    block_frames: int = 8,  # Default matches FastConformer's BLOCK_M
+    time_factor: int = 1,   # Multiply query_start_loc to get sample positions
+    output_divisor: int = 1,  # Divide sample positions to get frame positions
+    metadata=None,                      # Optional: FastConformerConvMetadata-compatible
 ) -> torch.Tensor:
     """
     Varlen STFT magnitude with cache support for streaming.
     
-    Simplified version that ALWAYS uses cache:
-    - stft_state stores the last (n_fft - hop_length) samples from previous chunk
-    - cache_indices maps each sequence to its cache line
-    - Initialize cache to zeros before first call (gives zero-padding effect)
+    Compatible with FastConformerConvMetadata:
+    - Uses batch_ptr and token_chunk_offset_ptr from metadata
+    - Applies time_factor and output_divisor to compute positions
     
-    Each program processes kernel_block_size (or block_frames) consecutive frames.
+    Position computation:
+    - sample_position = query_start_loc * time_factor
+    - frame_position = sample_position // output_divisor
     
-    For proper streaming, input lengths should be divisible by hop_length.
-    This ensures: num_frames = seq_len // hop_length
+    For typical STFT usage where query_start_loc is in samples:
+    - time_factor = 1
+    - output_divisor = hop_length
+    
+    For FastConformer where query_start_loc is in tokens:
+    - time_factor = samples_per_token (e.g., hop_length if tokens = frames)
+    - output_divisor = hop_length
     
     Args:
         x: Packed input samples (total_samples,)
@@ -306,16 +331,18 @@ def stft_cached(
         stft_state: Cache tensor (num_cache_lines, cache_len) where cache_len = n_fft - hop_length
                    Stores the last samples from previous chunk. Updated in-place after processing.
                    Initialize to zeros before first call.
-        query_start_loc: Cumulative sample positions (batch+1,)
+        query_start_loc: Cumulative positions in base units (batch+1,)
         cache_indices: Maps each sequence to cache line (batch,)
         n_fft: FFT size
         hop_length: Hop length between frames
         mag_power: Power for magnitude (1.0 = magnitude, 2.0 = power spectrum)
         pad_slot_id: Padding slot ID for skipping invalid sequences
         block_f: Frequency block size
-        block_frames: Number of frames per chunk (default 16, overridden by metadata)
-        metadata: Optional metadata with pre-computed batch_ptr, time_chunk_offset_ptr,
-                  query_start_loc_out, num_programs, kernel_block_size (for CUDA graph compatibility)
+        block_frames: Number of frames per chunk (default 8, matches FastConformer BLOCK_M)
+        time_factor: Multiplier for query_start_loc to get sample positions
+        output_divisor: Divisor for sample positions to get frame positions
+        metadata: Optional FastConformerConvMetadata with pre-computed batch_ptr, 
+                  token_chunk_offset_ptr, and optionally nums_dict for CUDA graph compatibility
     
     Returns:
         Output tensor (total_frames, n_freqs)
@@ -323,28 +350,40 @@ def stft_cached(
     n_freqs = w_real.shape[0]
     cache_len = n_fft - hop_length
     
-    # Get batch_ptr, time_chunk_offset_ptr, query_start_loc_out from metadata or compute
+    # Get batch_ptr and time_chunk_offset_ptr from metadata or compute
     if metadata is not None:
-        # Use pre-computed values from metadata (no CPU blocking)
+        # Use pre-computed values from FastConformerConvMetadata (no CPU blocking)
         batch_ptr = metadata.batch_ptr
-        time_chunk_offset_ptr = metadata.time_chunk_offset_ptr
-        query_start_loc_out = metadata.query_start_loc_out
-        num_programs = metadata.num_programs
+        time_chunk_offset_ptr = metadata.token_chunk_offset_ptr
+        
+        # Get num_programs from metadata if available
+        if hasattr(metadata, 'nums_dict') and metadata.nums_dict is not None:
+            # FastConformerConvMetadata stores this in nums_dict[BLOCK_M]
+            if block_frames in metadata.nums_dict:
+                num_programs = metadata.nums_dict[block_frames]['tot']
+            else:
+                # Fall back to the first available block size
+                first_key = next(iter(metadata.nums_dict.keys()))
+                num_programs = metadata.nums_dict[first_key]['mlist_len']
+        elif hasattr(metadata, 'num_programs'):
+            num_programs = metadata.num_programs
+        else:
+            # Count non-padding entries in batch_ptr
+            num_programs = (batch_ptr != pad_slot_id).sum().item()
     else:
         # Compute on the fly (CPU blocking - not safe for CUDA graphs)
         query_start_loc_cpu = query_start_loc.cpu()
-        seqlens_samples = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        
+        # Scale by time_factor to get sample lengths
+        seqlens_samples = (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]) * time_factor
         
         batch_size = len(seqlens_samples)
         
-        # Number of frames per sequence (cache always used):
-        # num_frames = seq_len // hop_length
-        seqlens_frames = seqlens_samples // hop_length
+        # Number of frames per sequence:
+        # num_frames = (seq_len_samples) // output_divisor
+        seqlens_frames = seqlens_samples // output_divisor
         
-        # Build output query_start_loc
-        query_start_loc_out_cpu = torch.zeros(batch_size + 1, dtype=torch.int32)
-        query_start_loc_out_cpu[1:] = torch.cumsum(seqlens_frames, dim=0)
-        total_frames = query_start_loc_out_cpu[-1].item()
+        total_frames = seqlens_frames.sum().item()
         
         if total_frames == 0:
             return out
@@ -368,7 +407,6 @@ def stft_cached(
         
         batch_ptr = torch.tensor(batch_list, dtype=torch.int32, device=x.device)
         time_chunk_offset_ptr = torch.tensor(chunk_offset_list, dtype=torch.int32, device=x.device)
-        query_start_loc_out = query_start_loc_out_cpu.to(x.device)
     
     # Get strides
     stride_cache_seq, stride_cache_sample = stft_state.stride()
@@ -384,7 +422,7 @@ def stft_cached(
         x, w_real, w_imag, out,
         stft_state, cache_indices,
         batch_ptr, time_chunk_offset_ptr,
-        query_start_loc, query_start_loc_out,
+        query_start_loc,
         w_real.stride(0), w_real.stride(1),
         stride_cache_seq, stride_cache_sample,
         NUM_FREQS=n_freqs,
@@ -395,6 +433,8 @@ def stft_cached(
         MAG_POWER=mag_power,
         BLOCK_F=block_f,
         BLOCK_FRAMES=block_frames,
+        TIME_FACTOR=time_factor,
+        OUTPUT_DIVISOR=output_divisor,
         pad_slot_id=pad_slot_id,
         USE_PAD_SLOT=pad_slot_id is not None,
     )
