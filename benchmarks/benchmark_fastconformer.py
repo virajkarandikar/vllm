@@ -231,6 +231,16 @@ async def main():
         description="vLLM FastConformer Benchmarking Script"
     )
     parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Whether to run with torch profiler",
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Whether to skip warmup",
+    )
+    parser.add_argument(
         "-c",
         "--concurrency",
         type=int,
@@ -292,7 +302,6 @@ async def main():
     parser.add_argument(
         "--enforce-eager",
         action="store_true",
-        default=True,
         help="Enforce eager mode (disable CUDA graphs)",
     )
     args = parser.parse_args()
@@ -321,6 +330,8 @@ async def main():
 
     # 2. Create Engine
     engine = AsyncLLM.from_engine_args(engine_args)
+    if args.profile:
+        await engine.start_profile()
 
     # 3. Create Sampling Params
     # max_tokens should be at least num_frames to allow all outputs
@@ -330,7 +341,10 @@ async def main():
     )
 
     # Run warmup and then actual benchmark
-    for run, num_requests in enumerate([3 * args.concurrency, args.num_requests]):
+    warmup_num = 0 if args.no_warmup else 3 * args.concurrency 
+    for run, num_requests in enumerate([warmup_num, args.num_requests]):
+        if num_requests == 0:
+            continue
         metrics = init_metrics(num_requests)
 
         run_name = "Warmup" if run == 0 else "Benchmark"
@@ -361,6 +375,8 @@ async def main():
         print(f"{run_name} finished. Total time: {total_time:.2f}s")
 
         if run > 0:
+            if args.profile:
+                await engine.stop_profile()
             # Calculate and print final metrics
             calculate_and_print_metrics(metrics, total_time, args)
 
