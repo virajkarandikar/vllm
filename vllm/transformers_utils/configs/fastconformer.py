@@ -15,6 +15,9 @@ class FastConformerCTCConfig(PretrainedConfig):
         subsampling: dict = None,
         att_left_ctx: int = 70,
         att_right_ctx: int = 1,
+        use_bias: bool = True,
+        norm_type: str = "batch_norm",
+        xscale: bool = True,
         ctc: dict = None,
         blank_id: int = 0,
         vocab_size: int = 1024,
@@ -32,19 +35,14 @@ class FastConformerCTCConfig(PretrainedConfig):
         self.subsampling = subsampling if subsampling is not None else {}
         self.att_left_ctx = att_left_ctx
         self.att_right_ctx = att_right_ctx
+        self.use_bias = use_bias
+        self.norm_type = norm_type
+        self.xscale = xscale
         self.ctc = ctc if ctc is not None else {}
         self.blank_id = blank_id
         self.vocab_size = vocab_size
         self.frontend = frontend if frontend is not None else {}
         self.tokenizer = tokenizer if tokenizer is not None else {}
         self.notes = notes
-
-        # TODO: temporary flags for layer-specific correctness checks
-        self.attn_only = False
-        self.conv_only = False
-        if "attn_only" in kwargs:
-            self.attn_only = kwargs["attn_only"]
-        if "conv_only" in kwargs:
-            self.conv_only = kwargs["conv_only"]
 
         super().__init__(**kwargs)

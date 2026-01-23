@@ -38,12 +38,12 @@ import math
 
 class ConformerFFN(nn.Module):
     """Conformer FeedForward module."""
-    def __init__(self, d_model: int, ff_mult: int = 4):
+    def __init__(self, d_model: int, ff_mult: int = 4, use_bias: bool = True):
         super().__init__()
         d_ff = ff_mult * d_model
-        self.linear1 = nn.Linear(d_model, d_ff, bias=True)
+        self.linear1 = nn.Linear(d_model, d_ff, bias=use_bias)
         self.activation = nn.SiLU()
-        self.linear2 = nn.Linear(d_ff, d_model, bias=True)
+        self.linear2 = nn.Linear(d_ff, d_model, bias=use_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear1(x)
@@ -53,7 +53,7 @@ class ConformerFFN(nn.Module):
 
 
 class RelPosSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, window: int,
+    def __init__(self, d_model: int, num_heads: int, window: int, use_bias: bool,
                  cache_config: CacheConfig, scheduler_config: SchedulerConfig, prefix: str):
         super().__init__()
         assert d_model % num_heads == 0
@@ -63,10 +63,11 @@ class RelPosSelfAttention(nn.Module):
         self.prefix = prefix
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
         
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.o_proj = nn.Linear(d_model, d_model)
+        self.use_bias = use_bias
+        self.q_proj = nn.Linear(d_model, d_model, bias=self.use_bias)
+        self.k_proj = nn.Linear(d_model, d_model, bias=self.use_bias)
+        self.v_proj = nn.Linear(d_model, d_model, bias=self.use_bias)
+        self.o_proj = nn.Linear(d_model, d_model, bias=self.use_bias)
 
         self.linear_pos = nn.Linear(d_model, d_model, bias=False)
         self.pos_bias_u = nn.Parameter(torch.zeros(self.h, self.dh))
@@ -106,10 +107,13 @@ class RelPosSelfAttention(nn.Module):
             "qkv_weight",
             torch.empty(3 * d_model, d_model, dtype=self.q_proj.weight.dtype)
         )
-        self.register_buffer(
-            "qkv_bias",
-            torch.empty(3 * d_model, dtype=self.q_proj.weight.dtype)
-        )
+        if self.use_bias:
+            self.register_buffer(
+                "qkv_bias",
+                torch.empty(3 * d_model, dtype=self.q_proj.weight.dtype)
+            )
+        else:
+            self.qkv_bias = None
         self._qkv_fused_ready: bool = False
 
 
@@ -129,16 +133,23 @@ class RelPosSelfAttention(nn.Module):
 
 @CustomOp.register("fastconformer_conv_module")
 class ConformerConvModule(CustomOp, AttentionLayerBase):
-    def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig, dtype: torch.dtype):
+    def __init__(self, d_model: int, k: int, use_bias: bool, norm_type: str,prefix: str, cache_config: CacheConfig, dtype: torch.dtype):
         super().__init__()
         assert k % 2 == 1
         self.prefix = prefix
+        self.use_bias = use_bias
 
-        self.pw1 = nn.Conv1d(d_model, 2 * d_model, 1)
-        self.dw  = nn.Conv1d(d_model, d_model, k, padding=(k-1)//2, groups=d_model)
-        self.bn  = nn.BatchNorm1d(d_model)
+        self.pw1 = nn.Conv1d(d_model, 2 * d_model, 1, bias=self.use_bias)
+        self.dw  = nn.Conv1d(d_model, d_model, k, padding=(k-1)//2, groups=d_model, bias=self.use_bias)
+        self.norm_type = norm_type
+        if norm_type == "batch_norm":
+            self.bn  = nn.BatchNorm1d(d_model)
+        elif norm_type == "layer_norm":
+            self.bn  = nn.LayerNorm(d_model)
+        else:
+            raise ValueError(f"Invalid norm type: {norm_type}")
         self.activation = nn.SiLU()
-        self.pw2 = nn.Conv1d(d_model, d_model, 1)
+        self.pw2 = nn.Conv1d(d_model, d_model, 1, bias=self.use_bias)
 
         self.d_model = d_model
         self.k = int(k)
@@ -181,7 +192,13 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
         if not isinstance(attn_meta_all, dict):
             # dummy path: plain conv
             y_dw = self.dw(pre_dw)
-            y_dw = self.bn(y_dw)
+            if self.norm_type == "batch_norm":
+                y_dw = self.bn(y_dw)
+            elif self.norm_type == "layer_norm":
+                y_dw = y_dw.transpose(1, 2)  # B D T -> B T D
+                y_dw = self.bn(y_dw)
+                y_dw = y_dw.transpose(1, 2)  # B T D -> B D T
+
             y_dw = F.silu(y_dw)
             y = self.pw2(y_dw)
             out = y.transpose(1, 2)   # [B, T, D]
@@ -212,7 +229,14 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
             dilation=1,
             groups=D,
         )[:, :, -T:]
-        y_dw = self.bn(y_dw)
+
+        if self.norm_type == "batch_norm":
+            y_dw = self.bn(y_dw)
+        elif self.norm_type == "layer_norm":
+            y_dw = y_dw.transpose(1, 2)  # B D T -> B T D
+            y_dw = self.bn(y_dw)
+            y_dw = y_dw.transpose(1, 2)  # B T D -> B D T
+
         y_dw = F.silu(y_dw)
         y = self.pw2(y_dw).transpose(1, 2)                        # [B, T, D]
 
@@ -230,7 +254,7 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
         assert D == self.d_model
 
         w1 = self.pw1.weight.squeeze(-1)   # [2D, D]
-        b1 = self.pw1.bias                 # [2D]
+        b1 = self.pw1.bias                 # [2D] or None
         y_pw1 = F.linear(hidden_states, w1, b1)        # [T, 2D]
         a, b = y_pw1.chunk(2, dim=-1)      # [T, D], [T, D]
         pre_dw = a * torch.sigmoid(b)      # GLU -> [T, D]
@@ -243,7 +267,7 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
 
         K = self.dw.weight.size(2)
         conv_weights = self.dw.weight.view(D, K)
-        conv_bias = self.dw.bias
+        conv_bias = self.dw.bias  #  could be None
         pre_dw_2d = pre_dw.transpose(0, 1)
 
         attn_metadata: FastConformerConvMetadata = attn_meta_all[self.prefix]
@@ -254,11 +278,12 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
         conv_state = store.contiguous().transpose(1, 2)
 
         query_start_loc = attn_metadata.query_start_loc
+
         has_initial_state = torch.ones(
             page_indices.size(0), dtype=torch.bool, device=pre_dw_2d.device
         )
 
-        y_dw_2d = causal_conv1d_fn(
+        y_dw_2d = causal_conv1d_fn(  # dim x cu_seq_len
             pre_dw_2d,
             conv_weights,
             conv_bias,
@@ -269,7 +294,14 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
             activation=None,
             metadata=attn_metadata,
         )
-        y_bn = self.bn(y_dw_2d.unsqueeze(0)).squeeze(0)
+
+        if self.norm_type == "batch_norm":
+            y_bn = self.bn(y_dw_2d.unsqueeze(0)).squeeze(0)
+        elif self.norm_type == "layer_norm":
+            # need to transpose dim x seq -> seq x dim
+            y_dw_2d = y_dw_2d.transpose(0, 1)  # seq x dim
+            y_bn = self.bn(y_dw_2d).transpose(0, 1)  # dim x seq
+
         y_act = F.silu(y_bn)
         w2 = self.pw2.weight.squeeze(-1)
         b2 = self.pw2.bias
@@ -321,6 +353,8 @@ class ConformerBlock(nn.Module):
         k_conv: int,
         ff_mult: int,
         attn_window: int,
+        use_bias: bool,
+        norm_type: str,
         cache_config: CacheConfig,
         scheduler_config: SchedulerConfig,
         dtype: torch.dtype,
@@ -328,13 +362,13 @@ class ConformerBlock(nn.Module):
     ):
         super().__init__()
         self.ln_ff1 = nn.LayerNorm(d_model)
-        self.ff1 = ConformerFFN(d_model, ff_mult)
+        self.ff1 = ConformerFFN(d_model, ff_mult, use_bias=use_bias)
         self.ln_attn = nn.LayerNorm(d_model)
-        self.attn = RelPosSelfAttention(d_model, n_heads, attn_window, cache_config, scheduler_config, prefix=f"{prefix}.attn")
+        self.attn = RelPosSelfAttention(d_model, n_heads, attn_window, use_bias, cache_config, scheduler_config, prefix=f"{prefix}.attn")
         self.ln_conv = nn.LayerNorm(d_model)
-        self.conv = ConformerConvModule(d_model, k_conv, prefix=f"{prefix}.conv", cache_config=cache_config, dtype=dtype)
+        self.conv = ConformerConvModule(d_model, k_conv, use_bias, norm_type, prefix=f"{prefix}.conv", cache_config=cache_config, dtype=dtype)
         self.ln_ff2 = nn.LayerNorm(d_model)
-        self.ff2 = ConformerFFN(d_model, ff_mult)
+        self.ff2 = ConformerFFN(d_model, ff_mult, use_bias=use_bias)
         self.ln_out = nn.LayerNorm(d_model)
         self.fc_factor = 0.5
         self.prefix = prefix
@@ -371,8 +405,8 @@ class FastConformerCTC(nn.Module):
         config: FastConformerCTCConfig = vllm_config.model_config.hf_config
         self.config = config
 
-        self.d_model = config.d_model
-        self.xscale = math.sqrt(self.d_model)
+        self.d_model = self.config.d_model
+        self.xscale = math.sqrt(self.d_model) if self.config.xscale else None
         self.dtype = vllm_config.model_config.dtype
 
         att_window = int(config.att_left_ctx + config.att_right_ctx)
@@ -390,6 +424,8 @@ class FastConformerCTC(nn.Module):
                 k_conv=config.k_conv,
                 ff_mult=config.ff_mult,
                 attn_window=att_window,
+                use_bias=config.use_bias,
+                norm_type=config.norm_type,
                 cache_config=vllm_config.cache_config,
                 scheduler_config=vllm_config.scheduler_config,
                 dtype=self.dtype,
@@ -409,8 +445,9 @@ class FastConformerCTC(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        emb = self.preprocessor(audio)
-        x = emb * self.xscale
+        x = self.preprocessor(audio)
+        if self.xscale:
+            x = x * self.xscale
         for blk in self.blocks:
             x = blk(x)
         return x, x
@@ -498,14 +535,22 @@ class FastConformerCTC(nn.Module):
                 (f"{base}.conv.pointwise_conv1.bias",   blk.conv.pw1.bias,   f"blocks.{i}.conv.pw1.bias"),
                 (f"{base}.conv.depthwise_conv.weight",  blk.conv.dw.weight,  f"blocks.{i}.conv.dw.weight"),
                 (f"{base}.conv.depthwise_conv.bias",    blk.conv.dw.bias,    f"blocks.{i}.conv.dw.bias"),
-                (f"{base}.conv.batch_norm.weight",      blk.conv.bn.weight,  f"blocks.{i}.conv.bn.weight"),
-                (f"{base}.conv.batch_norm.bias",        blk.conv.bn.bias,    f"blocks.{i}.conv.bn.bias"),
-                (f"{base}.conv.batch_norm.running_mean", blk.conv.bn.running_mean, f"blocks.{i}.conv.bn.running_mean"),
-                (f"{base}.conv.batch_norm.running_var",  blk.conv.bn.running_var,  f"blocks.{i}.conv.bn.running_var"),
-                (f"{base}.conv.batch_norm.num_batches_tracked", blk.conv.bn.num_batches_tracked, f"blocks.{i}.conv.bn.num_batches_tracked"),
                 (f"{base}.conv.pointwise_conv2.weight", blk.conv.pw2.weight, f"blocks.{i}.conv.pw2.weight"),
                 (f"{base}.conv.pointwise_conv2.bias",   blk.conv.pw2.bias,   f"blocks.{i}.conv.pw2.bias"),
             ]
+            if blk.conv.norm_type == "batch_norm":
+                conv.extend([
+                    (f"{base}.conv.batch_norm.weight",      blk.conv.bn.weight,  f"blocks.{i}.conv.bn.weight"),
+                    (f"{base}.conv.batch_norm.bias",        blk.conv.bn.bias,    f"blocks.{i}.conv.bn.bias"),
+                    (f"{base}.conv.batch_norm.running_mean", blk.conv.bn.running_mean, f"blocks.{i}.conv.bn.running_mean"),
+                    (f"{base}.conv.batch_norm.running_var",  blk.conv.bn.running_var,  f"blocks.{i}.conv.bn.running_var"),
+                    (f"{base}.conv.batch_norm.num_batches_tracked", blk.conv.bn.num_batches_tracked, f"blocks.{i}.conv.bn.num_batches_tracked"),
+                ])
+            elif blk.conv.norm_type == "layer_norm":
+                conv.extend([
+                    (f"{base}.conv.batch_norm.weight",      blk.conv.bn.weight,  f"blocks.{i}.conv.bn.weight"),
+                    (f"{base}.conv.batch_norm.bias",        blk.conv.bn.bias,    f"blocks.{i}.conv.bn.bias"),
+                ])
             for n_src, p_dst, n_dst in conv:
                 if n_src in nemo:
                     copy_(p_dst, nemo[n_src], n_dst, n_src)
@@ -527,13 +572,14 @@ class FastConformerCTC(nn.Module):
                     attn_mod.k_proj.weight,
                     attn_mod.v_proj.weight,
                 ], dim=0)
-                b_cat = torch.cat([
-                    attn_mod.q_proj.bias,
-                    attn_mod.k_proj.bias,
-                    attn_mod.v_proj.bias,
-                ], dim=0)
                 attn_mod.qkv_weight.copy_(w_cat)
-                attn_mod.qkv_bias.copy_(b_cat)
+                if attn_mod.use_bias:
+                    b_cat = torch.cat([
+                        attn_mod.q_proj.bias,
+                        attn_mod.k_proj.bias,
+                        attn_mod.v_proj.bias,
+                    ], dim=0)
+                    attn_mod.qkv_bias.copy_(b_cat)
                 attn_mod._qkv_fused_ready = True
 
         loaded_src = {src for (src, _) in loaded_pairs}

@@ -39,7 +39,7 @@ from vllm.compilation.decorators import support_torch_compile
 
 LOG_ZERO_GUARD_VALUE = 5.960464477539063e-08
 SAMPLE_RATE = 16000
-FASTCONFORMER_CACHE_PAGE_SIZE = 256 * 512
+FASTCONFORMER_CACHE_PAGE_SIZE = 256 * 1024
 
 
 @CustomOp.register("mel_spec_layer")
@@ -61,7 +61,7 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
         hop_length=160,
         n_fft=512,
         mag_power=2.0,
-        n_filt=80,
+        n_filt=128,
         sample_rate=SAMPLE_RATE,
         **kwargs,
     ):
@@ -254,7 +254,7 @@ def mel_spec_fwd_fake(
 direct_register_custom_op(
     op_name="mel_spec_layer",
     op_func=mel_spec_fwd,
-    fake_impl=mel_spec_fwd_fake,
+    fake_impl=mel_spec_fwd,
 )
 
 
@@ -333,8 +333,8 @@ class Conv2dLayer(CustomOp, AttentionLayerBase):
             output: (T/2, Freq/2, Channels)
         """
         assert hidden_states.dim() == 3, "forward expects 3D tensor (T, F, C)"
-        assert hidden_states.shape[1] == self.freq
-        assert hidden_states.shape[2] == self.channels
+        assert hidden_states.shape[1] == self.freq, f"freq expected {self.freq} but got {hidden_states.shape[1]}"
+        assert hidden_states.shape[2] == self.channels, f"channels expected {self.channels} but got {hidden_states.shape[2]}"
 
         seq_len = hidden_states.shape[0]
         out_seq_len = seq_len // 2
@@ -442,9 +442,9 @@ class ConvSubsampling(nn.Module):
         prefix: str,
         cache_config: CacheConfig,
         dtype: torch.dtype,
-        n_filt: int = 80,
+        n_filt: int = 128,
         channels: int = 256,
-        out_dim: int = 512,
+        out_dim: int = 1024,
         **kwargs,
     ):
         super().__init__()
@@ -499,7 +499,7 @@ class ConvSubsampling(nn.Module):
         Input: (T_target * Factor, Freq) flattened mel features
         Output: (T_target, out_dim)
         """
-        # Pad frequency: 80 + 8 = 88 -> 44 -> 22 -> 11
+        # Pad frequency: 128 + 8 = 136 -> .. -> 17
         x = torch.nn.functional.pad(x, (self.freq_padding, 0))
         # Expand channels: mimic 1->256 conv
         x = x.unsqueeze(2).repeat(1, 1, self.channels).contiguous()
