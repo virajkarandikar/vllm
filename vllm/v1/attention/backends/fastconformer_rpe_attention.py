@@ -304,7 +304,7 @@ def _launch_fc_fused_cache_triton(
     Dh = query.shape[2]
     block_size = int(attn_metadata.block_size)
     bt_width = attn_metadata.block_table.shape[1]
-    W = 71
+    W = 70
     Kcap = W + 1
     TWO_WP1 = 2 * W + 1
 
@@ -549,7 +549,7 @@ class FastConformerRPEImpl(AttentionImpl):
             layer._v_scale,
         )
         N_live = int(attn_metadata.num_actual_tokens)
-        W = 71
+        W = 70
         rel = self._get_rel_proj(query.device, query.dtype, W)
 
         _launch_fc_fused_cache_triton(
