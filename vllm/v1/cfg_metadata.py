@@ -24,24 +24,23 @@ class CFGMetadata:
 
     This metadata enables:
     1. Zeroing out embeddings for unconditional requests during prefill
+       (uses uncond_token_mask)
     2. Combining cond/uncond logits using the guidance scale formula
+       (uses cond_logits_indices, uncond_logits_indices, guidance_scales)
 
     All tensors are pre-allocated to support CUDA graphs. The `num_cfg_pairs`
     field indicates how many entries in the tensors are valid.
+
+    For prefill: logits indices point to the last token of each request's
+    prefill chunk (careful with chunked prefill - only the final chunk
+    produces samplable logits).
+
+    For decode: each request has one token, and its index in the packed
+    tensor is what goes in the metadata.
     """
 
     # Number of valid CFG pairs in this batch (rest of tensors may be padding)
     num_cfg_pairs: int
-
-    # Pre-allocated tensor of shape (max_num_reqs,) containing the batch
-    # indices of conditional requests for each CFG pair
-    # Only first `num_cfg_pairs` entries are valid
-    cond_req_indices: torch.Tensor
-
-    # Pre-allocated tensor of shape (max_num_reqs,) containing the batch
-    # indices of unconditional requests for each CFG pair
-    # Only first `num_cfg_pairs` entries are valid
-    uncond_req_indices: torch.Tensor
 
     # Pre-allocated tensor of shape (max_num_reqs,) containing guidance
     # scale for each CFG pair
@@ -55,6 +54,21 @@ class CFGMetadata:
 
     # Number of valid tokens in uncond_token_mask
     num_tokens: int = 0
+
+    # ---- Token-level indices for CFG logits application ----
+    # These are token positions in the packed logits tensor (seq_len, vocab_size)
+    # for the sampling position of each CFG pair.
+    # Used by apply_cfg_logits kernel.
+
+    # Pre-allocated tensor of shape (max_num_reqs,) containing the token
+    # indices (in packed logits) for conditional requests' sampling positions
+    # Only first `num_cfg_pairs` entries are valid
+    cond_logits_indices: torch.Tensor
+
+    # Pre-allocated tensor of shape (max_num_reqs,) containing the token
+    # indices (in packed logits) for unconditional requests' sampling positions
+    # Only first `num_cfg_pairs` entries are valid
+    uncond_logits_indices: torch.Tensor
 
 
 class CFGBuffers:
@@ -77,12 +91,6 @@ class CFGBuffers:
         self.device = device
 
         # GPU tensors (pre-allocated for CUDA graphs)
-        self.cond_req_indices = torch.zeros(
-            max_num_reqs, dtype=torch.int32, device=device
-        )
-        self.uncond_req_indices = torch.zeros(
-            max_num_reqs, dtype=torch.int32, device=device
-        )
         self.guidance_scales = torch.ones(
             max_num_reqs, dtype=torch.float32, device=device
         )
@@ -90,18 +98,27 @@ class CFGBuffers:
             max_num_tokens, dtype=torch.bool, device=device
         )
 
+        # Token-level indices for CFG logits application
+        # These store the token positions in packed logits for sampling
+        self.cond_logits_indices = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+        self.uncond_logits_indices = torch.zeros(
+            max_num_reqs, dtype=torch.int32, device=device
+        )
+
         # CPU tensors for building metadata (pinned for fast H2D transfer)
-        self.cond_req_indices_cpu = torch.zeros(
-            max_num_reqs, dtype=torch.int32, pin_memory=pin_memory
-        )
-        self.uncond_req_indices_cpu = torch.zeros(
-            max_num_reqs, dtype=torch.int32, pin_memory=pin_memory
-        )
         self.guidance_scales_cpu = torch.ones(
             max_num_reqs, dtype=torch.float32, pin_memory=pin_memory
         )
         self.uncond_token_mask_cpu = torch.zeros(
             max_num_tokens, dtype=torch.bool, pin_memory=pin_memory
+        )
+        self.cond_logits_indices_cpu = torch.zeros(
+            max_num_reqs, dtype=torch.int32, pin_memory=pin_memory
+        )
+        self.uncond_logits_indices_cpu = torch.zeros(
+            max_num_reqs, dtype=torch.int32, pin_memory=pin_memory
         )
 
         # Current valid count
@@ -111,21 +128,32 @@ class CFGBuffers:
     def reset(self) -> None:
         """Reset the buffers for a new batch."""
         self.num_cfg_pairs = 0
-        self.num_tokens = 0
         # Zero out the mask (important for correctness)
         if self.num_tokens > 0:
             self.uncond_token_mask_cpu[: self.num_tokens].zero_()
+        self.num_tokens = 0
 
     def add_cfg_pair(
         self,
-        cond_req_idx: int,
-        uncond_req_idx: int,
+        cond_logits_idx: int,
+        uncond_logits_idx: int,
         guidance_scale: float,
     ) -> None:
-        """Add a CFG pair to the buffers."""
+        """Add a CFG pair to the buffers.
+
+        Args:
+            cond_logits_idx: Token index (in packed logits) for conditional
+                            request's sampling position. For prefill, this is
+                            the last token of the prefill chunk. For decode,
+                            this is the single token's position in the packed
+                            tensor.
+            uncond_logits_idx: Token index (in packed logits) for unconditional
+                              request's sampling position.
+            guidance_scale: Guidance scale for this CFG pair.
+        """
         idx = self.num_cfg_pairs
-        self.cond_req_indices_cpu[idx] = cond_req_idx
-        self.uncond_req_indices_cpu[idx] = uncond_req_idx
+        self.cond_logits_indices_cpu[idx] = cond_logits_idx
+        self.uncond_logits_indices_cpu[idx] = uncond_logits_idx
         self.guidance_scales_cpu[idx] = guidance_scale
         self.num_cfg_pairs += 1
 
@@ -138,14 +166,14 @@ class CFGBuffers:
         """Copy CPU buffers to GPU (async, non-blocking)."""
         if self.num_cfg_pairs > 0:
             n = self.num_cfg_pairs
-            self.cond_req_indices[:n].copy_(
-                self.cond_req_indices_cpu[:n], non_blocking=True
-            )
-            self.uncond_req_indices[:n].copy_(
-                self.uncond_req_indices_cpu[:n], non_blocking=True
-            )
             self.guidance_scales[:n].copy_(
                 self.guidance_scales_cpu[:n], non_blocking=True
+            )
+            self.cond_logits_indices[:n].copy_(
+                self.cond_logits_indices_cpu[:n], non_blocking=True
+            )
+            self.uncond_logits_indices[:n].copy_(
+                self.uncond_logits_indices_cpu[:n], non_blocking=True
             )
         if self.num_tokens > 0:
             self.uncond_token_mask[: self.num_tokens].copy_(
@@ -162,9 +190,9 @@ class CFGBuffers:
 
         return CFGMetadata(
             num_cfg_pairs=self.num_cfg_pairs,
-            cond_req_indices=self.cond_req_indices,
-            uncond_req_indices=self.uncond_req_indices,
             guidance_scales=self.guidance_scales,
             uncond_token_mask=self.uncond_token_mask,
             num_tokens=self.num_tokens,
+            cond_logits_indices=self.cond_logits_indices,
+            uncond_logits_indices=self.uncond_logits_indices,
         )

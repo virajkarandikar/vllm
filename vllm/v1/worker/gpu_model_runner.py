@@ -2771,26 +2771,45 @@ class GPUModelRunner(
             if guidance_scale is None:
                 continue
 
-            # Add this CFG pair
-            self.cfg_buffers.add_cfg_pair(
-                cond_req_idx=i,
-                uncond_req_idx=uncond_idx,
-                guidance_scale=guidance_scale,
+            # CFG pairs are processed in lockstep - cond and uncond have the
+            # same prompt length and are scheduled together. Check stage using
+            # the cond request (uncond is identical).
+            num_prompt = req_state.num_prompt_tokens
+            num_computed = req_state.num_computed_tokens
+            num_scheduled = int(
+                query_start_loc_cpu[i + 1].item()
+                - query_start_loc_cpu[i].item()
+            )
+            is_prefill = num_computed < num_prompt
+
+            # Mark unconditional tokens for embedding zeroing during prefill.
+            # This applies to ALL prefill chunks, not just the final one.
+            if is_prefill:
+                start_token = int(query_start_loc_cpu[uncond_idx].item())
+                end_token = int(query_start_loc_cpu[uncond_idx + 1].item())
+                self.cfg_buffers.set_uncond_token_range(start_token, end_token)
+
+            # For CFG logits application, we only add the pair when at the
+            # final sampling position:
+            # - Decode: always samples (num_computed >= num_prompt)
+            # - Prefill: only final chunk samples (num_computed + num_scheduled >= num_prompt)
+            is_final_chunk = (
+                not is_prefill
+                or (num_computed + num_scheduled >= num_prompt)
             )
 
-            # Mark unconditional tokens for embedding zeroing - only during prefill.
-            # During decode, we don't zero embeddings since they're already
-            # computed and we just need to combine logits.
-            # Check if uncond request is in prefill: num_computed < num_prompt
-            uncond_req_state = self.requests.get(uncond_req_id)
-            if uncond_req_state is not None:
-                num_prompt = uncond_req_state.num_prompt_tokens
-                num_computed = self.input_batch.num_computed_tokens_cpu[uncond_idx]
-                is_prefill = num_computed < num_prompt
-                if is_prefill:
-                    start_token = int(query_start_loc_cpu[uncond_idx].item())
-                    end_token = int(query_start_loc_cpu[uncond_idx + 1].item())
-                    self.cfg_buffers.set_uncond_token_range(start_token, end_token)
+            if is_final_chunk:
+                # Compute token-level logits indices for CFG application.
+                # logits_indices[req_idx] = query_start_loc[req_idx + 1] - 1
+                # This is the last token of each request's chunk (sampling position).
+                cond_logits_idx = int(query_start_loc_cpu[i + 1].item()) - 1
+                uncond_logits_idx = int(query_start_loc_cpu[uncond_idx + 1].item()) - 1
+
+                self.cfg_buffers.add_cfg_pair(
+                    cond_logits_idx=cond_logits_idx,
+                    uncond_logits_idx=uncond_logits_idx,
+                    guidance_scale=guidance_scale,
+                )
 
         # If no CFG pairs found, return None
         if self.cfg_buffers.num_cfg_pairs == 0:

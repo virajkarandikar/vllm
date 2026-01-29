@@ -3,14 +3,138 @@
 """
 Triton kernels for Classifier Free Guidance (CFG) operations.
 
-These kernels are optimized for setting unconditional prefill embeddings
-to a null embedding value, which is a key step in CFG inference.
+These kernels are optimized for:
+1. Setting unconditional prefill embeddings to a null embedding value
+2. Applying CFG formula to logits: x = x_cond + scale * (x_cond - x_uncond)
+
 Designed for CUDA graph compatibility with pre-allocated tensors.
 """
 
 import torch
 
 from vllm.triton_utils import tl, triton
+
+
+@triton.jit
+def _apply_cfg_logits_kernel(
+    logits_ptr,
+    cond_indices_ptr,
+    uncond_indices_ptr,
+    scales_ptr,
+    num_pairs,
+    vocab_size,
+    stride_batch,
+    stride_vocab,
+    BLOCK_VOCAB: tl.constexpr,
+):
+    """
+    Apply CFG formula in-place to conditional logits.
+
+    For each CFG pair:
+        logits[cond_idx] = logits[cond_idx] + scale * (logits[cond_idx] - logits[uncond_idx])
+
+    Grid: (num_pairs, cdiv(vocab_size, BLOCK_VOCAB))
+
+    Args:
+        logits_ptr: Pointer to logits tensor of shape (num_reqs, vocab_size)
+        cond_indices_ptr: Pointer to tensor of conditional request indices
+        uncond_indices_ptr: Pointer to tensor of unconditional request indices
+        scales_ptr: Pointer to tensor of guidance scales per pair
+        num_pairs: Number of valid CFG pairs to process
+        vocab_size: Vocabulary size
+        stride_batch: Stride along batch dimension
+        stride_vocab: Stride along vocab dimension
+        BLOCK_VOCAB: Block size for vocabulary dimension
+    """
+    pid_pair = tl.program_id(0)
+    pid_vocab = tl.program_id(1)
+
+    # Early exit for padding pairs
+    if pid_pair >= num_pairs:
+        return
+
+    # Load indices and scale for this pair
+    cond_idx = tl.load(cond_indices_ptr + pid_pair)
+    uncond_idx = tl.load(uncond_indices_ptr + pid_pair)
+    scale = tl.load(scales_ptr + pid_pair)
+
+    # Compute vocab offsets for this block
+    vocab_offsets = pid_vocab * BLOCK_VOCAB + tl.arange(0, BLOCK_VOCAB)
+    vocab_mask = vocab_offsets < vocab_size
+
+    # Compute pointers to logits
+    cond_ptrs = logits_ptr + cond_idx * stride_batch + vocab_offsets * stride_vocab
+    uncond_ptrs = logits_ptr + uncond_idx * stride_batch + vocab_offsets * stride_vocab
+
+    # Load logits and cast to float32 for numerical stability
+    cond_logits = tl.load(cond_ptrs, mask=vocab_mask, other=0.0).to(tl.float32)
+    uncond_logits = tl.load(uncond_ptrs, mask=vocab_mask, other=0.0).to(tl.float32)
+
+    # Apply CFG: x = x_cond + scale * (x_cond - x_uncond)
+    result = cond_logits + scale * (cond_logits - uncond_logits)
+
+    # Store back to conditional position (in-place, auto-converts to target dtype)
+    tl.store(cond_ptrs, result, mask=vocab_mask)
+
+
+def apply_cfg_logits(
+    logits: torch.Tensor,
+    cond_logits_indices: torch.Tensor,
+    uncond_logits_indices: torch.Tensor,
+    guidance_scales: torch.Tensor,
+    num_cfg_pairs: int,
+) -> None:
+    """
+    Apply CFG formula to logits in-place for decode/sampling positions.
+
+    Formula: logits[cond] = logits[cond] + scale * (logits[cond] - logits[uncond])
+
+    This modifies the conditional logits in-place, combining them with the
+    unconditional logits using the guidance scale. After this operation,
+    only the conditional logits should be used for sampling.
+
+    Designed for CUDA graph compatibility - all tensors should be pre-allocated.
+
+    Args:
+        logits: Tensor of shape (seq_len, vocab_size) containing packed logits.
+                This is a flattened tensor where prefill and generation tokens
+                are concatenated. Modified in-place at conditional positions.
+        cond_logits_indices: Pre-allocated tensor of shape (max_num_reqs,)
+                            containing the token indices (in packed logits)
+                            for conditional requests' sampling positions.
+                            Only first `num_cfg_pairs` entries are valid.
+        uncond_logits_indices: Pre-allocated tensor of shape (max_num_reqs,)
+                              containing the token indices (in packed logits)
+                              for unconditional requests' sampling positions.
+                              Only first `num_cfg_pairs` entries are valid.
+        guidance_scales: Pre-allocated tensor of shape (max_num_reqs,) containing
+                        guidance scale for each CFG pair.
+                        Only first `num_cfg_pairs` entries are valid.
+        num_cfg_pairs: Number of valid CFG pairs to process.
+    """
+    if num_cfg_pairs == 0:
+        return
+
+    vocab_size = logits.shape[1]
+
+    BLOCK_VOCAB = 1024
+
+    grid = (
+        num_cfg_pairs,
+        triton.cdiv(vocab_size, BLOCK_VOCAB),
+    )
+
+    _apply_cfg_logits_kernel[grid](
+        logits,
+        cond_logits_indices,
+        uncond_logits_indices,
+        guidance_scales,
+        num_cfg_pairs,
+        vocab_size,
+        logits.stride(0),
+        logits.stride(1),
+        BLOCK_VOCAB=BLOCK_VOCAB,
+    )
 
 
 @triton.jit
