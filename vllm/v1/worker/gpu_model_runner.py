@@ -191,6 +191,8 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 )
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
+from vllm.v1.cfg_metadata import CFGBuffers, CFGMetadata
+from vllm.v1.request import CFG_UNCOND_SUFFIX
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -843,6 +845,15 @@ class GPUModelRunner(
         # (e.g., KV sharing, encoder-only attention), but not in the
         # KVCacheConfig of the scheduler.
         self.runner_only_attn_layers: set[str] = set()
+
+        # CFG (Classifier Free Guidance) pre-allocated buffers.
+        # TODO: extra memory even if noone uses cfg. add option to disable?
+        self.cfg_buffers = CFGBuffers(
+            max_num_reqs=self.max_num_reqs,
+            max_num_tokens=self.max_num_tokens,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
@@ -2701,6 +2712,95 @@ class GPUModelRunner(
         )
         return common_prefix_len if use_cascade else 0
 
+    def _prepare_cfg_metadata(
+        self,
+        scheduler_output: "SchedulerOutput",
+        query_start_loc_cpu: torch.Tensor,
+        num_tokens: int,
+    ) -> Optional[CFGMetadata]:
+        """
+        Build CFG metadata from the current batch.
+
+        This method identifies CFG pairs (conditional + unconditional requests)
+        and populates the pre-allocated CFG buffers with the necessary indices
+        and masks for:
+        1. Zeroing unconditional embeddings during prefill
+        2. Combining cond/uncond logits using the guidance scale formula
+
+        The buffers are CUDA graph compatible - fixed size tensors populated
+        each step with the valid count tracked separately.
+
+        Args:
+            scheduler_output: The scheduler output for this step
+            query_start_loc_cpu: CPU tensor of shape (num_reqs + 1,) with
+                cumulative token counts for each request
+            num_tokens: Total number of tokens in this batch
+
+        Returns:
+            CFGMetadata if there are CFG pairs, None otherwise
+        """
+        # Reset buffers for new batch
+        self.cfg_buffers.reset()
+        self.cfg_buffers.num_tokens = num_tokens
+
+        # Find all CFG pairs in the batch
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids[:num_reqs]
+
+        # Build a map from request ID to batch index
+        req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
+
+        for i, req_id in enumerate(req_ids):
+            # Skip unconditional requests (they are paired with conditional)
+            if req_id.endswith(CFG_UNCOND_SUFFIX):
+                continue
+
+            # Check if this request has a CFG unconditional pair
+            uncond_req_id = f"{req_id}{CFG_UNCOND_SUFFIX}"
+            if uncond_req_id not in req_id_to_idx:
+                continue
+
+            uncond_idx = req_id_to_idx[uncond_req_id]
+
+            # Get guidance scale from the cached request state
+            req_state = self.requests.get(req_id)
+            if req_state is None or req_state.sampling_params is None:
+                continue
+
+            guidance_scale = req_state.sampling_params.guidance_scale
+            if guidance_scale is None:
+                continue
+
+            # Add this CFG pair
+            self.cfg_buffers.add_cfg_pair(
+                cond_req_idx=i,
+                uncond_req_idx=uncond_idx,
+                guidance_scale=guidance_scale,
+            )
+
+            # Mark unconditional tokens for embedding zeroing - only during prefill.
+            # During decode, we don't zero embeddings since they're already
+            # computed and we just need to combine logits.
+            # Check if uncond request is in prefill: num_computed < num_prompt
+            uncond_req_state = self.requests.get(uncond_req_id)
+            if uncond_req_state is not None:
+                num_prompt = uncond_req_state.num_prompt_tokens
+                num_computed = self.input_batch.num_computed_tokens_cpu[uncond_idx]
+                is_prefill = num_computed < num_prompt
+                if is_prefill:
+                    start_token = int(query_start_loc_cpu[uncond_idx].item())
+                    end_token = int(query_start_loc_cpu[uncond_idx + 1].item())
+                    self.cfg_buffers.set_uncond_token_range(start_token, end_token)
+
+        # If no CFG pairs found, return None
+        if self.cfg_buffers.num_cfg_pairs == 0:
+            return None
+
+        # Sync buffers to GPU
+        self.cfg_buffers.sync_to_gpu()
+
+        return self.cfg_buffers.get_metadata()
+
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
         mrope_pos_ptr = 0
         for index, req_id in enumerate(self.input_batch.req_ids):
@@ -4146,6 +4246,16 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            # Prepare CFG (Classifier Free Guidance) metadata if applicable.
+            # This identifies cond/uncond pairs and builds masks for:
+            # 1. Zeroing uncond embeddings during prefill
+            # 2. Combining cond/uncond logits with guidance scale
+            cfg_metadata = self._prepare_cfg_metadata(
+                scheduler_output,
+                self.query_start_loc.cpu[:self.input_batch.num_reqs + 1],
+                scheduler_output.total_num_scheduled_tokens,
+            )
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4316,6 +4426,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                cfg_metadata=cfg_metadata,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
