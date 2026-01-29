@@ -33,7 +33,7 @@ def _apply_cfg_logits_kernel(
     For each CFG pair:
         logits[cond_idx] = logits[cond_idx] + scale * (logits[cond_idx] - logits[uncond_idx])
 
-    Grid: (num_pairs, cdiv(vocab_size, BLOCK_VOCAB))
+    Grid: (max(1, num_pairs), cdiv(vocab_size, BLOCK_VOCAB))
 
     Args:
         logits_ptr: Pointer to logits tensor of shape (num_reqs, vocab_size)
@@ -49,7 +49,7 @@ def _apply_cfg_logits_kernel(
     pid_pair = tl.program_id(0)
     pid_vocab = tl.program_id(1)
 
-    # Early exit for padding pairs
+    # Early exit for padding pairs (handles num_pairs=0 case during CUDA graph capture)
     if pid_pair >= num_pairs:
         return
 
@@ -93,7 +93,10 @@ def apply_cfg_logits(
     unconditional logits using the guidance scale. After this operation,
     only the conditional logits should be used for sampling.
 
-    Designed for CUDA graph compatibility - all tensors should be pre-allocated.
+    Designed for CUDA graph compatibility:
+    - Grid uses max(1, num_cfg_pairs) to ensure kernel is always launched
+    - When num_cfg_pairs=0, one block is launched but exits immediately
+    - Full parallelism preserved: each block handles one pair
 
     Args:
         logits: Tensor of shape (seq_len, vocab_size) containing packed logits.
@@ -112,15 +115,14 @@ def apply_cfg_logits(
                         Only first `num_cfg_pairs` entries are valid.
         num_cfg_pairs: Number of valid CFG pairs to process.
     """
-    if num_cfg_pairs == 0:
-        return
-
     vocab_size = logits.shape[1]
 
     BLOCK_VOCAB = 1024
 
+    # Use max(1, num_cfg_pairs) to ensure kernel is always launched for CUDA graphs
+    # When num_cfg_pairs=0, the single block will exit immediately via bounds check
     grid = (
-        num_cfg_pairs,
+        max(1, num_cfg_pairs),
         triton.cdiv(vocab_size, BLOCK_VOCAB),
     )
 
@@ -156,6 +158,8 @@ def _set_uncond_embeddings_kernel(
     For each token where mask[seq_idx] == True, the entire embedding
     row is set to the null_emb values.
 
+    Grid: (max(1, cdiv(num_tokens, BLOCK_SEQ)), cdiv(dim, BLOCK_DIM))
+
     Args:
         embeddings_ptr: Pointer to embeddings tensor of shape (seq_len, dim)
         null_emb_ptr: Pointer to null embedding tensor of shape (dim,)
@@ -176,7 +180,7 @@ def _set_uncond_embeddings_kernel(
     seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
     dim_offsets = pid_dim * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
 
-    # Mask for valid positions
+    # Mask for valid positions (handles num_tokens=0 case during CUDA graph capture)
     seq_mask = seq_offsets < num_tokens
     dim_mask = dim_offsets < dim
 
@@ -225,7 +229,10 @@ def set_uncond_embeddings(
     to set embeddings for unconditional requests to a learned null embedding,
     which represents the unconditional path.
 
-    Designed for CUDA graph compatibility - all tensors should be pre-allocated.
+    Designed for CUDA graph compatibility:
+    - Grid uses max(1, cdiv(num_tokens, BLOCK_SEQ)) to ensure kernel is always launched
+    - When num_tokens=0, one block is launched but seq_mask is all False (no stores)
+    - Full parallelism preserved: each block handles a chunk of tokens
 
     Args:
         embeddings: Tensor of shape (seq_len, dim) containing token embeddings.
@@ -238,16 +245,15 @@ def set_uncond_embeddings(
                           CUDA graphs.
         num_tokens: Number of valid tokens to process.
     """
-    if num_tokens == 0:
-        return
-
     dim = embeddings.shape[1]
 
     BLOCK_SEQ = 32
     BLOCK_DIM = 128
 
+    # Use max(1, ...) to ensure kernel is always launched for CUDA graphs
+    # When num_tokens=0, the single seq block will have seq_mask all False (no stores)
     grid = (
-        triton.cdiv(num_tokens, BLOCK_SEQ),
+        max(1, triton.cdiv(num_tokens, BLOCK_SEQ)),
         triton.cdiv(dim, BLOCK_DIM),
     )
 
