@@ -6082,6 +6082,17 @@ class GPUModelRunner(
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_padded
 
+            # For CFG: provide dummy metadata during profiling/dummy runs.
+            # When guidance is enabled, model expects cfg_metadata in forward
+            # context. We provide empty metadata (num_cfg_pairs=0) which causes
+            # CFG kernels to early-exit.
+            cfg_metadata = None
+            if self.enable_guidance and self.cfg_buffers is not None:
+                self.cfg_buffers.reset()
+                self.cfg_buffers.num_tokens = num_tokens
+                self.cfg_buffers.sync_to_gpu()
+                cfg_metadata = self.cfg_buffers.get_metadata()
+
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),
                 set_forward_context(
@@ -6093,6 +6104,7 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    cfg_metadata=cfg_metadata,
                 ),
             ):
                 outputs = self.model(
