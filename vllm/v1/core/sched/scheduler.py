@@ -98,6 +98,10 @@ class Scheduler(SchedulerInterface):
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
         self.await_inputs = vllm_config.model_config.custom_input_specs is not None
+        # CFG (Classifier Free Guidance) support - check if model enables it
+        self.enable_guidance = getattr(
+            vllm_config.model_config.hf_config, "enable_guidance", False
+        )
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -489,7 +493,15 @@ class Scheduler(SchedulerInterface):
             )
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-            num_new_tokens = min(num_new_tokens, token_budget)
+
+            # Check for CFG pair early - we need to reserve budget for both
+            # cond and uncond requests when computing the chunk size
+            cfg_uncond = self.cfg_pairs.get(request.request_id)
+
+            # For CFG pairs, divide budget by 2 so both cond and uncond fit
+            num_new_tokens = min(
+                num_new_tokens, token_budget // (2 if cfg_uncond else 1)
+            )
 
             # Make sure the input position does not exceed the max model len.
             # This is necessary when using spec decoding.
@@ -523,10 +535,6 @@ class Scheduler(SchedulerInterface):
                     request, num_new_tokens
                 )
 
-            # Check for CFG pair - we need to ensure budget for both cond and uncond
-            cfg_uncond = self.cfg_pairs.get(request.request_id)
-            tokens_required = num_new_tokens * 2 if cfg_uncond else num_new_tokens
-
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
@@ -542,12 +550,6 @@ class Scheduler(SchedulerInterface):
                 # NOTE(woosuk): Here, by doing `continue` instead of `break`,
                 # we do not strictly follow the FCFS scheduling policy and
                 # allow the lower-priority requests to be scheduled.
-                req_index += 1
-                continue
-
-            # CFG: Check upfront if we have token budget for both cond and uncond
-            if tokens_required > token_budget:
-                # Not enough token budget for CFG pair, skip to next request
                 req_index += 1
                 continue
 
@@ -2176,6 +2178,13 @@ class Scheduler(SchedulerInterface):
             and request.sampling_params.guidance_scale is not None
             and not request.is_cfg_unconditional  # Don't clone the clone
         ):
+            # Validate that guidance is enabled in model config
+            if not self.enable_guidance:
+                raise ValueError(
+                    "guidance_scale is set but the model does not support "
+                    "guidance. Set enable_guidance=True in the model config "
+                    "to enable Classifier Free Guidance (CFG)."
+                )
             uncond_request = request.create_cfg_unconditional_clone()
             self.cfg_pairs[request.request_id] = uncond_request
             # Also add to requests dict for lookup purposes
