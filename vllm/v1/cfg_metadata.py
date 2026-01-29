@@ -38,9 +38,6 @@ class CFGMetadata:
     tensor is what goes in the metadata.
     """
 
-    # Number of valid CFG pairs in this batch (rest of tensors may be padding)
-    num_cfg_pairs: int
-
     # Pre-allocated tensor of shape (max_num_reqs,) containing guidance
     # scale for each CFG pair
     # Only first `num_cfg_pairs` entries are valid
@@ -50,9 +47,6 @@ class CFGMetadata:
     # True for tokens belonging to unconditional requests
     # Used to zero embeddings during prefill
     uncond_token_mask: torch.Tensor
-
-    # Number of valid tokens in uncond_token_mask
-    num_tokens: int = 0
 
     # ---- Token-level indices for CFG logits application ----
     # These are token positions in the packed logits tensor (seq_len, vocab_size)
@@ -68,6 +62,12 @@ class CFGMetadata:
     # indices (in packed logits) for unconditional requests' sampling positions
     # Only first `num_cfg_pairs` entries are valid
     uncond_logits_indices: torch.Tensor
+
+    # Number of valid CFG pairs in this batch (rest of tensors may be padding)
+    num_cfg_pairs: int = 0
+
+    # Number of valid tokens in uncond_token_mask. Used to zero embeddings during prefill.
+    num_tokens: int = 0
 
 
 class CFGBuffers:
@@ -187,10 +187,10 @@ class CFGBuffers:
         This is required for CUDA graph compatibility.
         """
         return CFGMetadata(
-            num_cfg_pairs=self.num_cfg_pairs,
             guidance_scales=self.guidance_scales,
             uncond_token_mask=self.uncond_token_mask,
-            num_tokens=self.num_tokens,
             cond_logits_indices=self.cond_logits_indices,
             uncond_logits_indices=self.uncond_logits_indices,
+            num_cfg_pairs=self.num_cfg_pairs,
+            num_tokens=self.num_tokens,
         )
