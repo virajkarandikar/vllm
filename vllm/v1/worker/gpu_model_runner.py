@@ -847,13 +847,20 @@ class GPUModelRunner(
         self.runner_only_attn_layers: set[str] = set()
 
         # CFG (Classifier Free Guidance) pre-allocated buffers.
-        # TODO: extra memory even if noone uses cfg. add option to disable?
-        self.cfg_buffers = CFGBuffers(
-            max_num_reqs=self.max_num_reqs,
-            max_num_tokens=self.max_num_tokens,
-            device=self.device,
-            pin_memory=self.pin_memory,
+        # Only allocate if the model supports guidance (e.g., EarTTS).
+        # This is required for CUDA graph compatibility - when guidance is
+        # enabled, metadata must always be prepared even if num_cfg_pairs=0.
+        self.enable_guidance = getattr(
+            self.model_config.hf_config, "enable_guidance", False
         )
+        self.cfg_buffers: Optional[CFGBuffers] = None
+        if self.enable_guidance:
+            self.cfg_buffers = CFGBuffers(
+                max_num_reqs=self.max_num_reqs,
+                max_num_tokens=self.max_num_tokens,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
@@ -2730,6 +2737,10 @@ class GPUModelRunner(
         The buffers are CUDA graph compatible - fixed size tensors populated
         each step with the valid count tracked separately.
 
+        When guidance is enabled (self.enable_guidance), this method always
+        returns valid metadata (possibly with num_cfg_pairs=0) to ensure
+        CUDA graph compatibility. When guidance is disabled, returns None.
+
         Args:
             scheduler_output: The scheduler output for this step
             query_start_loc_cpu: CPU tensor of shape (num_reqs + 1,) with
@@ -2737,8 +2748,14 @@ class GPUModelRunner(
             num_tokens: Total number of tokens in this batch
 
         Returns:
-            CFGMetadata if there are CFG pairs, None otherwise
+            CFGMetadata when guidance is enabled, None when disabled
         """
+        # If guidance is not enabled, skip CFG processing entirely
+        if not self.enable_guidance:
+            return None
+
+        assert self.cfg_buffers is not None
+
         # Reset buffers for new batch
         self.cfg_buffers.reset()
         self.cfg_buffers.num_tokens = num_tokens
@@ -2811,13 +2828,9 @@ class GPUModelRunner(
                     guidance_scale=guidance_scale,
                 )
 
-        # If no CFG pairs found, return None
-        if self.cfg_buffers.num_cfg_pairs == 0:
-            return None
-
-        # Sync buffers to GPU
+        # Always sync buffers and return metadata for CUDA graph compatibility.
+        # Even if num_cfg_pairs=0, we need consistent kernel calls.
         self.cfg_buffers.sync_to_gpu()
-
         return self.cfg_buffers.get_metadata()
 
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):

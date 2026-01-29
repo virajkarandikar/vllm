@@ -12,7 +12,6 @@ The metadata is designed for CUDA graph compatibility with pre-allocated tensors
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -180,14 +179,13 @@ class CFGBuffers:
                 self.uncond_token_mask_cpu[: self.num_tokens], non_blocking=True
             )
 
-    def get_metadata(self) -> Optional[CFGMetadata]:
+    def get_metadata(self) -> CFGMetadata:
         """Get CFGMetadata from the current buffer state.
 
-        Returns None if there are no CFG pairs.
+        Always returns valid metadata. If there are no CFG pairs,
+        num_cfg_pairs will be 0 and kernels will early-exit.
+        This is required for CUDA graph compatibility.
         """
-        if self.num_cfg_pairs == 0:
-            return None
-
         return CFGMetadata(
             num_cfg_pairs=self.num_cfg_pairs,
             guidance_scales=self.guidance_scales,
