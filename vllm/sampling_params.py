@@ -333,6 +333,13 @@ class SamplingParams(
     covered by earlier turns. Default 0 returns routing for all prompt
     tokens."""
 
+    # Classifier Free Guidance (CFG) parameters
+    guidance_scale: Optional[float] = None
+    """Scale for classifier-free guidance. When set, the model runs both
+    conditional and unconditional generation, and combines the logits using:
+    logits = uncond_logits + guidance_scale * (cond_logits - uncond_logits).
+    Typical values are 1.0-15.0. Set to None to disable CFG."""
+
     # Fields used for bad words
     bad_words: list[str] | None = None
     """Words that are not allowed to be generated. More precisely, only the
@@ -387,6 +394,7 @@ class SamplingParams(
         extra_args: dict[str, Any] | None = None,
         skip_clone: bool = False,
         repetition_detection: RepetitionDetectionParams | None = None,
+        guidance_scale: float | None = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -428,6 +436,7 @@ class SamplingParams(
             extra_args=extra_args,
             skip_clone=skip_clone,
             repetition_detection=repetition_detection,
+            guidance_scale=guidance_scale,
         )
 
     def __post_init__(self) -> None:
@@ -1037,6 +1046,7 @@ class SamplingParams(
             "spaces_between_special_tokens="
             f"{self.spaces_between_special_tokens}, "
             f"structured_outputs={self.structured_outputs}, "
+            f"guidance_scale={self.guidance_scale}, "
             f"extra_args={self.extra_args})"
         )
 
