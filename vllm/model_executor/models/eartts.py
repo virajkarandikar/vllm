@@ -19,6 +19,8 @@ from vllm.model_executor.models.gemma3 import Gemma3Model
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 from vllm.compilation.decorators import support_torch_compile
+from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.cfg_ops import apply_cfg_logits, set_uncond_embeddings
 
 from .utils import AutoWeightsLoader
 from .optimized_t5gemma import OptimizedT5GemmaEncoderModel
@@ -309,6 +311,7 @@ class EarTTSInputEmbedding(nn.Module):
         max_char_len = config.max_char_len
         backbone_type = config.emb_backbone_type
         backbone_config = config.emb_backbone_config
+        self.enable_guidance = config.enable_guidance
 
 
         # allows to embed acoustic tokens into a single embeddings
@@ -326,6 +329,8 @@ class EarTTSInputEmbedding(nn.Module):
             backbone_config=backbone_config,
         )
         self.bos_emb = nn.Parameter(torch.empty(hidden_size))
+        if self.enable_guidance:
+            self.null_emb = nn.Parameter(torch.empty(hidden_size))
 
         self.use_subword_flag_emb = config.use_subword_flag_emb
         pretrained_tokenizer_name = config.pretrained_tokenizer_name
@@ -374,6 +379,16 @@ class EarTTSInputEmbedding(nn.Module):
             text_emb = self.subword_flag_emb(text_emb, text_tokens)
         if self.use_bos_eos_emb:
             text_emb = self.bos_eos_emb(text_emb, text_tokens)
+        
+        if self.enable_guidance:
+            # nullify text embedding for uncond prefill tokens
+            cfg_metadata = get_forward_context().cfg_metadata
+            set_uncond_embeddings(
+                text_emb,
+                self.null_emb,
+                cfg_metadata.uncond_token_mask,
+                cfg_metadata.num_tokens
+            )
 
         # prepare total embedding by adding all components
         if self.use_gated_fusion_for_text_audio:
@@ -452,6 +467,7 @@ class MoGHead(nn.Module):
         top_p_or_k: Optional[float | int] = 1.0,
         min_log_std: float = -4.0,
         eps: float = 1e-6,
+        enable_guidance: bool = False,
     ):
         super().__init__()
         self.out_size = out_size
@@ -459,6 +475,7 @@ class MoGHead(nn.Module):
         self.num_predictions = num_predictions
         self.min_log_std = min_log_std
         self.top_p_or_k = top_p_or_k
+        self.enable_guidance = enable_guidance
 
         self.logits_processor = (
             TopPLogitsWarper(self.top_p_or_k)
@@ -521,6 +538,17 @@ class MoGHead(nn.Module):
         n, d = self.num_predictions, self.low_rank or self.out_size
 
         x = self.mlp_stack(x)
+
+        # NOTE: in NeMo it is applied not to logits but before projection
+        if self.enable_guidance:
+            cfg_metadata = get_forward_context().cfg_metadata
+            apply_cfg_logits(
+                x,
+                cfg_metadata.cond_logits_indices,
+                cfg_metadata.uncond_logits_indices,
+                cfg_metadata.guidance_scales,
+                cfg_metadata.num_cfg_pairs,
+            )
 
         logits = self.proj_logits(x)
 
@@ -603,6 +631,7 @@ class MaskGITSampler(nn.Module):
             top_p_or_k=self.config.top_p_or_k,
             min_log_std=self.config.mog_min_log_std,
             eps=self.config.mog_eps,
+            enable_guidance=self.config.enable_guidance,
         )
 
     def _depthsum_embedding(self, code: torch.Tensor) -> torch.Tensor:
@@ -783,6 +812,10 @@ class EarTTSForCausalLM(nn.Module):
         input_ids, positions, intermediate_tensors, inputs_embeds - not used,
         they are here for compatability with the way vllm model executed.
         """
+
+        #ctx = get_forward_context()
+        #cfg_metadata = ctx.cfg_metadata
+
         hidden_states, codes = self.model(
             input_ids=input_ids,
             positions=positions,

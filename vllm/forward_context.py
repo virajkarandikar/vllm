@@ -18,6 +18,7 @@ from vllm.v1.worker.ubatch_utils import UBatchSlices, is_second_ubatch_empty
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionMetadata
+    from vllm.v1.cfg_metadata import CFGMetadata
 
 logger = init_logger(__name__)
 
@@ -299,6 +300,9 @@ class ForwardContext:
 
     ubatch_slices: Optional[UBatchSlices] = None
 
+    # CFG (Classifier Free Guidance) metadata for combining cond/uncond logits
+    cfg_metadata: Optional["CFGMetadata"] = None
+
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), (
             f"Invalid cudagraph runtime mode: {self.cudagraph_runtime_mode}"
@@ -325,6 +329,7 @@ def create_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: Optional[BatchDescriptor] = None,
     ubatch_slices: Optional[UBatchSlices] = None,
+    cfg_metadata: Optional["CFGMetadata"] = None,
 ):
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -334,6 +339,7 @@ def create_forward_context(
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
+        cfg_metadata=cfg_metadata,
     )
 
 
@@ -362,6 +368,7 @@ def set_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: Optional[BatchDescriptor] = None,
     ubatch_slices: Optional[UBatchSlices] = None,
+    cfg_metadata: Optional["CFGMetadata"] = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -391,6 +398,7 @@ def set_forward_context(
         cudagraph_runtime_mode,
         batch_descriptor,
         ubatch_slices,
+        cfg_metadata,
     )
 
     try:

@@ -61,6 +61,7 @@ def main():
     # ======================
     # embedding module weights
     bos_emb = weights["tts_model.bos_emb"]
+    null_emb = weights["tts_model.null_emb"]
     embed_subwords_weight = torch.zeros(
         (vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device
     )
@@ -78,6 +79,7 @@ def main():
     # create weights for the embedding model that runs outside of the eartts
     embedding_module_weights = {}
     embedding_module_weights["bos_emb"] = bos_emb
+    embedding_module_weights["null_emb"] = null_emb
 
     # embedding transformer has a lot of weights
     for key, weight in weights.items():
@@ -170,6 +172,9 @@ def main():
     flat_config["use_subword_flag_emb"] = cfg.model.tts_config.use_subword_flag_emb
     flat_config["use_bos_eos_emb"] = cfg.model.tts_config.use_bos_eos_emb
     flat_config["use_gated_fusion_for_text_audio"] = cfg.model.tts_config.use_gated_fusion_for_text_audio
+    # hardcode enabling guidance so emb is created and application
+    # of cfg is captured into a cuda graph
+    flat_config["enable_guidance"] = True
 
     # configuring custom inputs/outputs
     flat_config["custom_input_specs"] = [

@@ -213,6 +213,13 @@ class SamplingParams(
     implementations, plugins, etc. Not used by any in-tree sampling
     implementations."""
 
+    # Classifier Free Guidance (CFG) parameters
+    guidance_scale: Optional[float] = None
+    """Scale for classifier-free guidance. When set, the model runs both
+    conditional and unconditional generation, and combines the logits using:
+    logits = uncond_logits + guidance_scale * (cond_logits - uncond_logits).
+    Typical values are 1.0-15.0. Set to None to disable CFG."""
+
     # Fields used for bad words
     bad_words: Optional[list[str]] = None
     """Words that are not allowed to be generated. More precisely, only the
@@ -256,6 +263,7 @@ class SamplingParams(
         logit_bias: Optional[Union[dict[int, float], dict[str, float]]] = None,
         allowed_token_ids: Optional[list[int]] = None,
         extra_args: Optional[dict[str, Any]] = None,
+        guidance_scale: Optional[float] = None,
     ) -> "SamplingParams":
         if logit_bias is not None:
             # Convert token_id to integer
@@ -307,6 +315,7 @@ class SamplingParams(
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
+            guidance_scale=guidance_scale,
         )
 
     def __post_init__(self) -> None:
@@ -611,6 +620,7 @@ class SamplingParams(
             f"{self.spaces_between_special_tokens}, "
             f"truncate_prompt_tokens={self.truncate_prompt_tokens}, "
             f"structured_outputs={self.structured_outputs}, "
+            f"guidance_scale={self.guidance_scale}, "
             f"extra_args={self.extra_args})"
         )
 

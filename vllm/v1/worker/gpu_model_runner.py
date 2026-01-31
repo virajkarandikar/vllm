@@ -129,6 +129,8 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.cfg_metadata import CFGBuffers, CFGMetadata
+from vllm.v1.request import CFG_UNCOND_SUFFIX
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -497,6 +499,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # (e.g., KV sharing, encoder-only attention), but not in the
         # KVCacheConfig of the scheduler.
         self.runner_only_attn_layers: set[str] = set()
+
+        # CFG (Classifier Free Guidance) pre-allocated buffers.
+        # Only allocate if the model supports guidance (e.g., EarTTS).
+        # This is required for CUDA graph compatibility - when guidance is
+        # enabled, metadata must always be prepared even if num_cfg_pairs=0.
+        self.enable_guidance = getattr(
+            self.model_config.hf_config, "enable_guidance", False
+        )
+        self.cfg_buffers: Optional[CFGBuffers] = None
+        if self.enable_guidance:
+            self.cfg_buffers = CFGBuffers(
+                max_num_reqs=self.max_num_reqs,
+                max_num_tokens=self.max_num_tokens,
+                device=self.device,
+                pin_memory=self.pin_memory,
+            )
 
         # Cached outputs.
         self._draft_token_ids: Optional[Union[list[list[int]], torch.Tensor]] = None
@@ -1550,6 +1568,120 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         return common_prefix_len if use_cascade else 0
 
+    def _prepare_cfg_metadata(
+        self,
+        scheduler_output: "SchedulerOutput",
+        query_start_loc_cpu: torch.Tensor,
+        num_tokens: int,
+    ) -> Optional[CFGMetadata]:
+        """
+        Build CFG metadata from the current batch.
+
+        This method identifies CFG pairs (conditional + unconditional requests)
+        and populates the pre-allocated CFG buffers with the necessary indices
+        and masks for:
+        1. Zeroing unconditional embeddings during prefill
+        2. Combining cond/uncond logits using the guidance scale formula
+
+        The buffers are CUDA graph compatible - fixed size tensors populated
+        each step with the valid count tracked separately.
+
+        When guidance is enabled (self.enable_guidance), this method always
+        returns valid metadata (possibly with num_cfg_pairs=0) to ensure
+        CUDA graph compatibility. When guidance is disabled, returns None.
+
+        Args:
+            scheduler_output: The scheduler output for this step
+            query_start_loc_cpu: CPU tensor of shape (num_reqs + 1,) with
+                cumulative token counts for each request
+            num_tokens: Total number of tokens in this batch
+
+        Returns:
+            CFGMetadata when guidance is enabled, None when disabled
+        """
+        # If guidance is not enabled, skip CFG processing entirely
+        if not self.enable_guidance:
+            return None
+
+        assert self.cfg_buffers is not None
+
+        # Reset buffers for new batch
+        self.cfg_buffers.reset()
+        self.cfg_buffers.num_tokens = num_tokens
+
+        # Find all CFG pairs in the batch
+        num_reqs = self.input_batch.num_reqs
+        req_ids = self.input_batch.req_ids[:num_reqs]
+
+        # Build a map from request ID to batch index
+        req_id_to_idx = {req_id: i for i, req_id in enumerate(req_ids)}
+
+        for i, req_id in enumerate(req_ids):
+            # Skip unconditional requests (they are paired with conditional)
+            if req_id.endswith(CFG_UNCOND_SUFFIX):
+                continue
+
+            # Check if this request has a CFG unconditional pair
+            uncond_req_id = f"{req_id}{CFG_UNCOND_SUFFIX}"
+            if uncond_req_id not in req_id_to_idx:
+                continue
+
+            uncond_idx = req_id_to_idx[uncond_req_id]
+
+            # Get guidance scale from the cached request state
+            req_state = self.requests.get(req_id)
+            if req_state is None or req_state.sampling_params is None:
+                continue
+
+            guidance_scale = req_state.sampling_params.guidance_scale
+            if guidance_scale is None:
+                continue
+
+            # CFG pairs are processed in lockstep - cond and uncond have the
+            # same prompt length and are scheduled together. Check stage using
+            # the cond request (uncond is identical).
+            num_prompt = req_state.num_prompt_tokens
+            num_computed = req_state.num_computed_tokens
+            num_scheduled = int(
+                query_start_loc_cpu[i + 1].item()
+                - query_start_loc_cpu[i].item()
+            )
+            is_prefill = num_computed < num_prompt
+
+            # Mark unconditional tokens for embedding zeroing during prefill.
+            # This applies to ALL prefill chunks, not just the final one.
+            if is_prefill:
+                start_token = int(query_start_loc_cpu[uncond_idx].item())
+                end_token = int(query_start_loc_cpu[uncond_idx + 1].item())
+                self.cfg_buffers.set_uncond_token_range(start_token, end_token)
+
+            # For CFG logits application, we only add the pair when at the
+            # final sampling position:
+            # - Decode: always samples (num_computed >= num_prompt)
+            # - Prefill: only final chunk samples (num_computed + num_scheduled >= num_prompt)
+            is_final_chunk = (
+                not is_prefill
+                or (num_computed + num_scheduled >= num_prompt)
+            )
+
+            if is_final_chunk:
+                # Compute token-level logits indices for CFG application.
+                # logits_indices[req_idx] = query_start_loc[req_idx + 1] - 1
+                # This is the last token of each request's chunk (sampling position).
+                cond_logits_idx = int(query_start_loc_cpu[i + 1].item()) - 1
+                uncond_logits_idx = int(query_start_loc_cpu[uncond_idx + 1].item()) - 1
+
+                self.cfg_buffers.add_cfg_pair(
+                    cond_logits_idx=cond_logits_idx,
+                    uncond_logits_idx=uncond_logits_idx,
+                    guidance_scale=guidance_scale,
+                )
+
+        # Always sync buffers and return metadata for CUDA graph compatibility.
+        # Even if num_cfg_pairs=0, we need consistent kernel calls.
+        self.cfg_buffers.sync_to_gpu()
+        return self.cfg_buffers.get_metadata()
+
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
         mrope_pos_ptr = 0
         for index, req_id in enumerate(self.input_batch.req_ids):
@@ -2562,6 +2694,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     use_cascade_attn,
                 ) = self._prepare_inputs(scheduler_output)
 
+                # Prepare CFG (Classifier Free Guidance) metadata if applicable.
+                # This identifies cond/uncond pairs and builds masks for:
+                # 1. Zeroing uncond embeddings during prefill
+                # 2. Combining cond/uncond logits with guidance scale
+                cfg_metadata = self._prepare_cfg_metadata(
+                    scheduler_output,
+                    self.query_start_loc.cpu[:self.input_batch.num_reqs + 1],
+                    scheduler_output.total_num_scheduled_tokens,
+                )
+
             (
                 num_scheduled_tokens,
                 num_input_tokens,
@@ -2616,6 +2758,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 batch_descriptor=batch_descriptor,
                 ubatch_slices=ubatch_slices,
+                cfg_metadata=cfg_metadata,
             ),
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -3581,6 +3724,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 if num_tokens_across_dp is not None:
                     num_tokens_across_dp[:] = num_tokens_after_padding
 
+            # For CFG: provide dummy metadata during profiling/dummy runs.
+            # When guidance is enabled, model expects cfg_metadata in forward
+            # context. We provide empty metadata (num_cfg_pairs=0) which causes
+            # CFG kernels to early-exit.
+            cfg_metadata = None
+            if self.enable_guidance and self.cfg_buffers is not None:
+                self.cfg_buffers.reset()
+                self.cfg_buffers.num_tokens = num_tokens
+                self.cfg_buffers.sync_to_gpu()
+                cfg_metadata = self.cfg_buffers.get_metadata()
+
             with (
                 self.maybe_randomize_inputs(input_ids),
                 set_forward_context(
@@ -3591,6 +3745,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
                     ubatch_slices=ubatch_slices,
+                    cfg_metadata=cfg_metadata,
                 ),
             ):
                 outputs = self.model(

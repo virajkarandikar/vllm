@@ -34,6 +34,7 @@ class EarTTSConfig(PretrainedConfig):
         mog_num_predictions: int = 1024,
         mog_min_log_std: float = -4.0,
         mog_eps: float = 1e-6,
+        enable_guidance: bool = False,
 
         # Gemma3-specific attributes required by Gemma3Model
         query_pre_attn_scalar: float = 256.0,  # Default attention scaling
@@ -87,6 +88,7 @@ class EarTTSConfig(PretrainedConfig):
         self.mog_num_predictions = mog_num_predictions
         self.mog_min_log_std = mog_min_log_std
         self.mog_eps = mog_eps
+        self.enable_guidance = enable_guidance
 
         # Gemma3-specific attributes
         self.query_pre_attn_scalar = query_pre_attn_scalar

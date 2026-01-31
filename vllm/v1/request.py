@@ -27,6 +27,14 @@ if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
 
+# Suffix appended to conditional request IDs to create unconditional request IDs
+CFG_UNCOND_SUFFIX = ":cfg_uncond"
+
+
+def get_cfg_uncond_request_id(cond_request_id: str) -> str:
+    """Get the unconditional request ID from a conditional request ID."""
+    return f"{cond_request_id}{CFG_UNCOND_SUFFIX}"
+
 
 class Request:
     def __init__(
@@ -47,6 +55,8 @@ class Request:
         priority: int = 0,
         trace_headers: Optional[Mapping[str, str]] = None,
         block_hasher: Optional[Callable[["Request"], list["BlockHash"]]] = None,
+        # CFG (Classifier Free Guidance) related field
+        is_cfg_unconditional: bool = False,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -132,9 +142,15 @@ class Request:
 
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Optional[Callable[[], list[BlockHash]]] = None
+        # Store the block_hasher for reuse (e.g., CFG cloning)
+        self._block_hasher = block_hasher
         if block_hasher is not None:
             self.get_hash_new_full_blocks = partial(block_hasher, self)
             self.block_hashes = self.get_hash_new_full_blocks()
+
+        # CFG (Classifier Free Guidance) related field
+        # True if this is the unconditional request in a CFG pair
+        self.is_cfg_unconditional = is_cfg_unconditional
 
     @classmethod
     def from_engine_core_request(
@@ -263,6 +279,54 @@ class Request:
     def has_custom_inputs(self) -> bool:
         """Check if custom inputs are ready."""
         return self.custom_inputs_ready
+
+    def create_cfg_unconditional_clone(self) -> "Request":
+        """Create an unconditional clone for CFG (Classifier Free Guidance).
+
+        This creates a paired request that shares input data (by reference)
+        with the original conditional request. The unconditional request
+        is used for CFG during inference.
+
+        The unconditional request ID is derived from this request's ID by
+        appending the CFG_UNCOND_SUFFIX. Use get_cfg_uncond_request_id() to
+        convert between the two.
+
+        Returns:
+            A new Request that is the unconditional pair of this request.
+        """
+        uncond_request_id = get_cfg_uncond_request_id(self.request_id)
+
+        # Create the unconditional clone sharing input data by reference
+        uncond_request = Request(
+            request_id=uncond_request_id,
+            # Share input data by reference (not copied)
+            prompt_token_ids=self.prompt_token_ids,
+            prompt_embeds=self.prompt_embeds,
+            custom_inputs=self.custom_inputs,
+            mm_features=self.mm_features,
+            # Copy sampling/pooling params (may need different settings later)
+            sampling_params=self.sampling_params,
+            pooling_params=self.pooling_params,
+            eos_token_id=self.eos_token_id,
+            client_index=self.client_index,
+            arrival_time=self.arrival_time,
+            lora_request=self.lora_request,
+            structured_output_request=None,  # Uncond doesn't need structured output
+            cache_salt=self.cache_salt,
+            priority=self.priority,
+            trace_headers=self.trace_headers,
+            # Reuse the same block_hasher from this request
+            block_hasher=self._block_hasher,
+            # CFG-specific field
+            is_cfg_unconditional=True,
+        )
+
+        # Sync custom inputs state
+        uncond_request.custom_inputs_ready = self.custom_inputs_ready
+        uncond_request.custom_inputs_num_consumed = self.custom_inputs_num_consumed
+
+        return uncond_request
+
 
 class RequestStatus(enum.IntEnum):
     """Status of a request."""
