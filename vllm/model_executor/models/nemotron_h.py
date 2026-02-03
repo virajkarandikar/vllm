@@ -560,6 +560,12 @@ class NemotronHModel(nn.Module, EagleModelMixin):
             config.hidden_size,
         )
 
+        self.embed_asr_tokens = VocabParallelEmbedding(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size
+        )
+
         self.has_moe = "E" in config.hybrid_override_pattern
 
         def get_layer(prefix: str):
@@ -586,8 +592,11 @@ class NemotronHModel(nn.Module, EagleModelMixin):
 
         self.norm_f = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
+    def embed_input_ids(self, input_ids: torch.Tensor, input_asr_ids: torch.Tensor | None = None) -> torch.Tensor:
+        emb = self.embed_tokens(input_ids)
+        if input_asr_ids is not None:
+            emb = emb + self.embed_asr_tokens(input_asr_ids)
+        return emb
 
     def forward(
         self,
@@ -595,12 +604,13 @@ class NemotronHModel(nn.Module, EagleModelMixin):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        input_asr_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.embed_input_ids(input_ids)
+                hidden_states = self.embed_input_ids(input_ids, input_asr_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
@@ -789,7 +799,14 @@ class NemotronHForCausalLM(
     is_non_gated_moe: bool = True
 
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_prefix={"backbone": "model"},
+        orig_to_new_prefix={
+            "backbone": "model",
+            "stt_model.llm": "model",
+            "stt_model.embed_tokens": "model.embed_tokens",
+            "stt_model.embed_asr_tokens": "model.embed_asr_tokens",
+            "stt_model.lm_head": "lm_head",
+            "stt_model.asr_head": "asr_head",
+        },
         orig_to_new_substr={"A_log": "A", "embeddings": "embed_tokens"},
     )
 
@@ -877,6 +894,13 @@ class NemotronHForCausalLM(
             quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
+        self.asr_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            padding_size=DEFAULT_VOCAB_PADDING_SIZE,
+            prefix=maybe_prefix(prefix, "asr_head"),
+        )
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
@@ -923,8 +947,8 @@ class NemotronHForCausalLM(
                 moe.n_redundant_experts = self.num_redundant_experts
                 moe.experts.update_expert_map()
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+    def embed_input_ids(self, input_ids: torch.Tensor, input_asr_ids: torch.Tensor | None = None) -> torch.Tensor:
+        return self.model.embed_input_ids(input_ids, input_asr_ids)
 
     def forward(
         self,
@@ -934,11 +958,14 @@ class NemotronHForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ):
+        inputs_embeds = kwargs.get("combined_embeds", None)
+        #input_asr_ids = kwargs.get("input_asr_ids", None) # currently not used
         hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
+            input_ids, positions, intermediate_tensors, inputs_embeds, input_asr_ids=None
         )
-
-        return hidden_states
+        asr_logits = self.logits_processor(self.asr_head, hidden_states)
+        asr_tokens = torch.argmax(asr_logits, dim=1) # sampling will be done outside the vllm model engine
+        return hidden_states, self.compute_logits(hidden_states), asr_tokens, asr_logits
 
     def compute_logits(
         self,
