@@ -592,7 +592,9 @@ class FastConformerCTC(nn.Module):
                 if n not in loaded_src:
                     print(f"  - {n}: {why}")
 
-        unused_model_params = sorted(set(model_params.keys()) - loaded_param_names)
+        # preprocessor is loaded separately
+        model_params_lst = [x for x in model_params.keys() if not x.startswith("preprocessor.")]
+        unused_model_params = sorted(set(model_params_lst) - loaded_param_names)
         if unused_model_params:
             print(f"[load_weights] Model params with NO checkpoint match ({len(unused_model_params)} shown first 40):")
             for n in unused_model_params[:40]:
