@@ -6601,8 +6601,7 @@ class GPUModelRunner(
             if self.is_pooling_model:
                 output = self._dummy_pooler_run(hidden_states)
             else:
-                # output = self._dummy_sampler_run(last_hidden_states)
-                output = None
+                output = self._dummy_sampler_run(last_hidden_states)
         else:
             output = None
         self._sync_device()
