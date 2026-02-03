@@ -6187,17 +6187,13 @@ class GPUModelRunner(
             self.eplb_step(is_dummy=True, is_profile=is_profile)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
-        # TODO: figure out what's going on here
-        # return hidden_states, hidden_states[logit_indices]
-        return hidden_states, hidden_states
+        return hidden_states, hidden_states[logit_indices]
 
     @torch.inference_mode()
     def _dummy_sampler_run(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        # TODO: figure out what's going on here
-        return None
         # The dummy hidden states may contain special values,
         # like `inf` or `nan`.
         # To avoid breaking the sampler, we use a random tensor here instead.
