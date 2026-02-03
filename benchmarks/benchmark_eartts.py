@@ -3,7 +3,7 @@ import asyncio
 import time
 import uuid
 import logging
-from typing import Dict, List, Any
+from typing import Dict, Any
 import numpy as np
 import torch
 
@@ -34,11 +34,8 @@ async def run_request(
     prompt_acoustic_tokens = torch.randint(
         0, 1024, (input_num_tokens, 31), dtype=torch.int32
     )
-    context_text_tokens = torch.randint(
-        0, 10000, (input_num_tokens,), dtype=torch.int32
-    )
-    context_token = context_text_tokens[-1:]  # 1
-    bos_mask = torch.zeros(input_num_tokens, dtype=torch.float16)
+    model_type = engine.vllm_config.model_config.dtype
+    bos_mask = torch.zeros(input_num_tokens, dtype=model_type)
     bos_mask[0] = 1.0
 
     # Prefill inputs: text_tokens and text_mask are masked (zeros) during prefill
@@ -46,16 +43,15 @@ async def run_request(
         "prompt_token_ids": [0] * input_num_tokens,
         "custom_inputs": {
             "acoustic_tokens": prompt_acoustic_tokens,
-            "context_text_tokens": context_text_tokens,
             "text_tokens": torch.zeros(input_num_tokens, dtype=torch.int32),
-            "text_mask": torch.zeros(input_num_tokens, dtype=torch.float16),
+            "text_mask": torch.zeros(input_num_tokens, dtype=model_type),
             "bos_mask": bos_mask,
         },
     }
 
     request_start_time = time.perf_counter()
     last_token_time = None
-    token_count = 0
+    token_idx = 0  # 0-indexed token position
 
     try:
         # Start the generation stream
@@ -65,39 +61,35 @@ async def run_request(
 
             # Get the acoustic tokens from custom_outputs
             acoustic_tokens = output.outputs[0].custom_outputs.get("acoustic_tokens")
-            token_count += 1
 
-            if last_token_time is not None:
-                # This is not the first token, record inter-token latency
+            # Track first 6 tokens (0-5) separately
+            if token_idx < 6:
+                token_latency = now - last_token_time if last_token_time else now - request_start_time
+                metrics["first_tokens"][token_idx].append(token_latency)
+            elif last_token_time is not None:
+                # Tokens 6+ go into regular ITL
                 itl = now - last_token_time
                 metrics["inter_token_latencies"].append(itl)
-            else:
-                # This is the first token, record time-to-first-token
-                ttft = now - request_start_time
-                metrics["ttft_latencies"].append(ttft)
 
             last_token_time = now
+            token_idx += 1
 
             # Check if the sequence has finished
-            # With dummy weights, this will trigger at sampling_params.max_tokens
             if output.finished:
                 break
             else:
                 # Prepare next decode step inputs
-                # Get the last predicted acoustic token
                 step_acoustic_tokens = acoustic_tokens[-1:]
                 current_text_token = torch.randint(0, 10000, (1,), dtype=torch.int32)
                 new_custom_inputs = {
                     "acoustic_tokens": step_acoustic_tokens,
-                    "context_text_tokens": context_token,
                     "text_tokens": current_text_token,
-                    "text_mask": torch.ones(1, dtype=torch.float16),
-                    "bos_mask": torch.zeros(1, dtype=torch.float16),
+                    "text_mask": torch.ones(1, dtype=model_type),
+                    "bos_mask": torch.zeros(1, dtype=model_type),
                 }
                 await engine.append_request(
                     request_id=request_id, custom_inputs=new_custom_inputs
                 )
-                context_token = current_text_token
 
         # After the loop finishes (sequence is done)
         request_end_time = time.perf_counter()
@@ -106,7 +98,7 @@ async def run_request(
         # Record final metrics for this request
         metrics["request_latencies"].append(request_latency)
         metrics["completed_sequences"] += 1
-        metrics["total_tokens"] += token_count
+        metrics["total_tokens"] += token_idx
 
     except Exception as e:
         print(f"Request {request_id} failed: {e}")
@@ -124,42 +116,27 @@ def calculate_and_print_metrics(
         print("Error: No sequences completed.")
         return
 
-    total_tokens = metrics["total_tokens"]
+    # First 6 tokens (0-5) - mean time for each position
+    print("\n--- First 6 Tokens (mean latency in ms) ---")
+    print(metrics["first_tokens"][0])
+    for i in range(6):
+        if metrics["first_tokens"][i]:
+            avg_ms = np.mean(metrics["first_tokens"][i]) * 1000
+            p95_ms = np.percentile(metrics["first_tokens"][i], 95) * 1000
+            print(f"  Token {i}: {avg_ms:.2f} ms (P95: {p95_ms:.2f} ms)")
 
-    avg_seq_per_sec = total_sequences / total_time
-    avg_token_per_sec = total_tokens / total_time
-    avg_seq_len = total_tokens / total_sequences
+    # Rest of tokens (6+) ITL
+    if metrics["inter_token_latencies"]:
+        avg_itl_ms = np.mean(metrics["inter_token_latencies"]) * 1000
+        p95_itl_ms = np.percentile(metrics["inter_token_latencies"], 95) * 1000
+        print(f"\n--- Tokens 6+ ITL ---")
+        print(f"  Average: {avg_itl_ms:.2f} ms (P95: {p95_itl_ms:.2f} ms)")
 
-    avg_seq_latency_s = np.mean(metrics["request_latencies"])
-    p95_seq_latency_s = np.percentile(metrics["request_latencies"], 95)
-
-    avg_ttft_ms = np.mean(metrics["ttft_latencies"]) * 1000
-    p95_ttft_ms = np.percentile(metrics["ttft_latencies"], 95) * 1000
-
-    avg_itl_ms = np.mean(metrics["inter_token_latencies"]) * 1000
-    p95_itl_ms = np.percentile(metrics["inter_token_latencies"], 95) * 1000
-
-    print("\n--- vLLM Benchmark Results ---")
-    print(f"Concurrency: {args.concurrency} workers")
-    print(f"Input Length: {args.input_len} tokens")
-    print(f"Output Length: {args.output_len} tokens")
-    print("---")
-    print(f"Total duration: {total_time:.2f} s")
-    print(f"Total completed sequences: {total_sequences}")
-    print(f"Total failed sequences: {metrics['failed_sequences']}")
-    print(f"Total tokens generated: {total_tokens}")
-    print(f"Average sequence length: {avg_seq_len:.2f} tokens")
-    print("--- Throughput ---")
-    print(f"Average sequences/sec: {avg_seq_per_sec:.2f}")
-    print(f"Average tokens/sec: {avg_token_per_sec:.2f}")
-    print("--- Latency ---")
-    print(f"Average sequence latency: {avg_seq_latency_s:.2f} s")
-    print(f"P95 sequence latency: {p95_seq_latency_s:.2f} s")
-    print(f"Average TTFT (Time-To-First-Token): {avg_ttft_ms:.2f} ms")
-    print(f"P95 TTFT: {p95_ttft_ms:.2f} ms")
-    print(f"Average ITL (Inter-Token Latency): {avg_itl_ms:.2f} ms")
-    print(f"P95 ITL: {p95_itl_ms:.2f} ms")
-    print("------------------------------")
+    # Average total time per request
+    avg_request_time = np.mean(metrics["request_latencies"])
+    p95_request_time = np.percentile(metrics["request_latencies"], 95)
+    print(f"\n--- Request Latency ---")
+    print(f"  Average: {avg_request_time:.2f} s (P95: {p95_request_time:.2f} s)")
 
 
 async def worker(
@@ -192,8 +169,8 @@ async def worker(
 def init_metrics(num_requests: int):
     return {
         "request_latencies": [],
-        "inter_token_latencies": [],
-        "ttft_latencies": [],
+        "inter_token_latencies": [],  # For tokens 6+
+        "first_tokens": [[] for _ in range(6)],  # Separate list for tokens 0-5
         "completed_sequences": 0,
         "failed_sequences": 0,
         "total_tokens": 0,
@@ -219,6 +196,13 @@ async def main():
         help="Total number of requests to send (M)",
     )
     parser.add_argument(
+        "-g", "--guidance-scale", type=float, default=None, help="Guidance scale"
+    )
+    parser.add_argument(
+        "-t", "--dtype", type=str, default="float32", help="dtype of the engine",
+        choices=["float32", "float16", "bfloat16"],
+    )
+    parser.add_argument(
         "-i", "--input-len", type=int, default=128, help="Constant size prompt length"
     )
     parser.add_argument(
@@ -235,42 +219,45 @@ async def main():
     )
     args = parser.parse_args()
 
-    print("Starting vLLM benchmark...")
-    print(f"Concurrency: {args.concurrency}, Num Requests: {args.num_requests}")
-    print(
-        f"Input: {args.input_len}, Output: {args.output_len}, Max Model Len: {args.max_model_len}"
-    )
+    print(f"Benchmark: concurrency={args.concurrency}, requests={args.num_requests}, in={args.input_len}, out={args.output_len}")
 
     # 1. Create Engine Args
+    max_num_batched_tokens = args.max_model_len * args.concurrency * 2
+    #if args.guidance_scale is not None:
+    #    max_num_batched_tokens = max_num_batched_tokens
     engine_args = AsyncEngineArgs(
         model="eartts_vllm_model",
-        dtype="float16",
-        max_model_len=args.max_model_len,
-        max_num_batched_tokens=args.max_model_len * args.concurrency,
+        dtype=args.dtype,
+        max_model_len=786,
+        #max_num_seqs=args.concurrency * 2,
+        max_num_batched_tokens=786 * 4 * 2,
         gpu_memory_utilization=args.gpu_mem,
         skip_tokenizer_init=True,  # Skip tokenizer since we're using embeddings directly
         load_format="dummy",  # <-- Use dummy weights as requested
         disable_log_stats=True,
+        enable_prefix_caching=False,
     )
 
     # 2. Create Engine
     engine = AsyncLLMEngine.from_engine_args(engine_args)
 
     # 3. Create Sampling Params
-    sampling_params = SamplingParams(
-        max_tokens=args.output_len,
-        stop_token_ids=[],  # Ensure no default stop tokens interfere
-        skip_sampling=True,
-    )
+    sampling_args = {
+        "max_tokens": args.output_len,
+        "stop_token_ids": [],  # Ensure no default stop tokens interfere
+        "skip_sampling": True,
+    }
+    if args.guidance_scale is not None:
+        sampling_args["guidance_scale"] = args.guidance_scale
+    sampling_params = SamplingParams(**sampling_args)
 
     # Shared metrics dictionary
     for run, num_requests in enumerate([3 * args.concurrency, args.num_requests]):
         metrics = init_metrics(num_requests)
 
         # --- Start Benchmark ---
-        print(
-            f"\nStarting {run} benchmark for {num_requests} requests... This may take a moment."
-        )
+        if run == 0:
+            print("Warmup...")
         start_time = time.perf_counter()
 
         # Create and start C worker tasks
@@ -296,8 +283,6 @@ async def main():
         # --- End Benchmark ---
 
         total_time = end_time - start_time
-
-        print(f"\nBenchmark finished. Total time: {total_time:.2f}s")
 
         if run > 0:
             # Calculate and print final metrics
