@@ -24,6 +24,7 @@ class FastConformerCTCConfig(PretrainedConfig):
         frontend: dict = None,
         tokenizer: dict = None,
         notes: str = "",
+        adapted_dimension: int | None = None,
         **kwargs
     ):
         self.hidden_size = hidden_size
@@ -44,5 +45,5 @@ class FastConformerCTCConfig(PretrainedConfig):
         self.frontend = frontend if frontend is not None else {}
         self.tokenizer = tokenizer if tokenizer is not None else {}
         self.notes = notes
-
+        self.adapted_dimension = adapted_dimension
         super().__init__(**kwargs)
