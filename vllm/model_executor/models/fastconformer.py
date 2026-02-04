@@ -433,6 +433,9 @@ class FastConformerCTC(nn.Module):
             )
             for i in range(config.n_layers)
         ])
+        self.adapter = None
+        if self.config.adapted_dimension is not None:
+            self.adapter = nn.Linear(self.d_model, self.config.adapted_dimension)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         raise Exception("not applicable for this model")
@@ -450,6 +453,8 @@ class FastConformerCTC(nn.Module):
             x = x * self.xscale
         for blk in self.blocks:
             x = blk(x)
+        if self.adapter is not None:
+            x = self.adapter(x)
         return x, x
 
     def compute_logits(
@@ -483,6 +488,12 @@ class FastConformerCTC(nn.Module):
                 dst_param.data.copy_(src)
             loaded_pairs.append((src_name, dst_name))
             loaded_param_names.add(dst_name)
+
+        if self.adapter is not None:
+            weight_name = "adapter.weight"
+            copy_(self.adapter.weight, nemo[weight_name], weight_name, weight_name)
+            bias_name = "adapter.bias"
+            copy_(self.adapter.bias, nemo[bias_name], bias_name, bias_name)
 
         for i, blk in enumerate(self.blocks):
             base = f"encoder.layers.{i}"
