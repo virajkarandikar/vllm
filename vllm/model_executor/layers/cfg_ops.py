@@ -216,6 +216,109 @@ def _set_uncond_embeddings_kernel(
     tl.store(emb_ptrs, null_emb_broadcast, mask=combined_mask)
 
 
+@triton.jit
+def _copy_columns_by_indices_kernel(
+    data_ptr,
+    src_indices_ptr,
+    dst_indices_ptr,
+    num_pairs,
+    num_rows,
+    stride_row,
+    stride_col,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """
+    Copy columns in a 2D tensor from source positions to destination positions.
+
+    For each valid pair i (i < num_pairs):
+        data[:, dst_indices[i]] = data[:, src_indices[i]]
+
+    Grid: (max(1, num_pairs), cdiv(num_rows, BLOCK_ROWS))
+
+    Args:
+        data_ptr: Pointer to 2D tensor of shape (num_rows, num_cols)
+        src_indices_ptr: Pointer to tensor of source column indices
+        dst_indices_ptr: Pointer to tensor of destination column indices
+        num_pairs: Number of valid pairs to process
+        num_rows: Number of rows in the data tensor
+        stride_row: Stride along the row dimension
+        stride_col: Stride along the column dimension
+        BLOCK_ROWS: Block size for the row dimension
+    """
+    pid_pair = tl.program_id(0)
+    pid_row = tl.program_id(1)
+
+    # Early exit for padding pairs (handles num_pairs=0 for CUDA graph capture)
+    if pid_pair >= num_pairs:
+        return
+
+    # Load source and destination column indices for this pair
+    src_col = tl.load(src_indices_ptr + pid_pair)
+    dst_col = tl.load(dst_indices_ptr + pid_pair)
+
+    # Compute row offsets for this block
+    row_offsets = pid_row * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_offsets < num_rows
+
+    # Compute pointers
+    src_ptrs = data_ptr + row_offsets * stride_row + src_col * stride_col
+    dst_ptrs = data_ptr + row_offsets * stride_row + dst_col * stride_col
+
+    # Load from source and store to destination
+    values = tl.load(src_ptrs, mask=row_mask)
+    tl.store(dst_ptrs, values, mask=row_mask)
+
+
+def copy_columns_by_indices(
+    data: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    num_pairs: int,
+) -> None:
+    """
+    Copy columns in a 2D tensor from source positions to destination
+    positions, in-place.
+
+    For each valid pair i (i < num_pairs):
+        data[:, dst_indices[i]] = data[:, src_indices[i]]
+
+    Designed for CUDA graph compatibility:
+    - Grid uses max(1, num_pairs) to ensure kernel is always launched
+    - When num_pairs=0, one block is launched but exits immediately
+    - Pre-allocated index tensors can be used at full size; only
+      the first ``num_pairs`` entries are read
+
+    Args:
+        data: Tensor of shape (num_rows, num_cols). Modified in-place.
+        src_indices: Pre-allocated tensor of shape (max_num_pairs,)
+                     containing source column indices.
+                     Only first ``num_pairs`` entries are used.
+        dst_indices: Pre-allocated tensor of shape (max_num_pairs,)
+                     containing destination column indices.
+                     Only first ``num_pairs`` entries are used.
+        num_pairs: Number of valid pairs to process.
+    """
+    num_rows = data.shape[0]
+
+    BLOCK_ROWS = 32
+
+    grid = (
+        max(1, num_pairs),
+        triton.cdiv(num_rows, BLOCK_ROWS),
+    )
+
+    _copy_columns_by_indices_kernel[grid](
+        data,
+        src_indices,
+        dst_indices,
+        num_pairs,
+        num_rows,
+        data.stride(0),
+        data.stride(1),
+        BLOCK_ROWS=BLOCK_ROWS,
+    )
+
+
 def set_uncond_embeddings(
     embeddings: torch.Tensor,
     null_emb: torch.Tensor,
