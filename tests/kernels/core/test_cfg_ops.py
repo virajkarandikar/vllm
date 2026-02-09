@@ -8,7 +8,11 @@ Run `pytest tests/kernels/core/test_cfg_ops.py`.
 import pytest
 import torch
 
-from vllm.model_executor.layers.cfg_ops import apply_cfg_logits, set_uncond_embeddings
+from vllm.model_executor.layers.cfg_ops import (
+    apply_cfg_logits,
+    copy_columns_by_indices,
+    set_uncond_embeddings,
+)
 from vllm.platforms import current_platform
 
 
@@ -473,3 +477,154 @@ def test_apply_cfg_logits_large_vocab():
         + 7.5 * (original_logits[0].float() - original_logits[2].float())
     ).to(dtype)
     torch.testing.assert_close(logits[0], expected, atol=1e-3, rtol=1e-3)
+
+
+# ============================================================================
+# Tests for copy_columns_by_indices kernel
+# ============================================================================
+
+
+@pytest.mark.parametrize("num_rows", [1, 8, 16, 33])
+@pytest.mark.parametrize("num_cols", [4, 32, 128])
+@pytest.mark.parametrize("dtype", [torch.long, torch.float16, torch.float32])
+def test_copy_columns_by_indices_basic(
+    num_rows: int, num_cols: int, dtype: torch.dtype
+):
+    """Test basic copy from source columns to destination columns."""
+    if not current_platform.is_cuda():
+        pytest.skip("CFG ops require CUDA")
+
+    num_pairs = 2
+
+    data = torch.arange(num_rows * num_cols, device="cuda", dtype=dtype).reshape(
+        num_rows, num_cols
+    )
+    original = data.clone()
+
+    # Copy column 1 → column 0, column 3 → column 2
+    src_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
+    dst_indices = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
+
+    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs)
+
+    # Verify copied columns
+    torch.testing.assert_close(data[:, 0], original[:, 1])
+    torch.testing.assert_close(data[:, 2], original[:, 3])
+
+    # Verify untouched columns
+    for c in range(num_cols):
+        if c not in (0, 2):
+            torch.testing.assert_close(data[:, c], original[:, c])
+
+
+def test_copy_columns_by_indices_no_pairs():
+    """Test with zero pairs (should be a no-op)."""
+    if not current_platform.is_cuda():
+        pytest.skip("CFG ops require CUDA")
+
+    data = torch.randn(8, 16, device="cuda")
+    original = data.clone()
+
+    # Pre-allocated buffers but zero pairs
+    src_indices = torch.zeros(32, dtype=torch.int32, device="cuda")
+    dst_indices = torch.zeros(32, dtype=torch.int32, device="cuda")
+
+    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs=0)
+
+    torch.testing.assert_close(data, original, atol=0, rtol=0)
+
+
+def test_copy_columns_by_indices_preallocated():
+    """Test with pre-allocated buffers larger than num_pairs (CUDA graph scenario)."""
+    if not current_platform.is_cuda():
+        pytest.skip("CFG ops require CUDA")
+
+    max_num_reqs = 1024
+    num_rows = 8  # num_quantizers
+    num_cols = 64  # batch size
+    num_pairs = 2
+
+    data = torch.randint(0, 1024, (num_rows, num_cols), device="cuda", dtype=torch.long)
+    original = data.clone()
+
+    # Pre-allocated buffers (as in CFGBuffers)
+    src_indices = torch.zeros(max_num_reqs, dtype=torch.int32, device="cuda")
+    dst_indices = torch.zeros(max_num_reqs, dtype=torch.int32, device="cuda")
+
+    # Set up 2 actual pairs: cond pos 0→uncond pos 1, cond pos 4→uncond pos 5
+    src_indices[0] = 0
+    dst_indices[0] = 1
+    src_indices[1] = 4
+    dst_indices[1] = 5
+
+    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs)
+
+    # Verify copied columns
+    torch.testing.assert_close(data[:, 1], original[:, 0])
+    torch.testing.assert_close(data[:, 5], original[:, 4])
+
+    # Verify all other columns untouched
+    for c in range(num_cols):
+        if c not in (1, 5):
+            torch.testing.assert_close(data[:, c], original[:, c])
+
+
+def test_copy_columns_by_indices_single_pair():
+    """Test with a single CFG pair."""
+    if not current_platform.is_cuda():
+        pytest.skip("CFG ops require CUDA")
+
+    num_rows = 8
+    num_cols = 16
+    data = torch.randn(num_rows, num_cols, device="cuda")
+    original = data.clone()
+
+    src_indices = torch.tensor([3], dtype=torch.int32, device="cuda")
+    dst_indices = torch.tensor([7], dtype=torch.int32, device="cuda")
+
+    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs=1)
+
+    torch.testing.assert_close(data[:, 7], original[:, 3])
+
+    for c in range(num_cols):
+        if c != 7:
+            torch.testing.assert_close(data[:, c], original[:, c])
+
+
+@pytest.mark.parametrize("num_pairs", [1, 2, 4])
+def test_copy_columns_by_indices_cfg_scenario(num_pairs: int):
+    """Test in a realistic CFG scenario (code tensor with quantizer codes)."""
+    if not current_platform.is_cuda():
+        pytest.skip("CFG ops require CUDA")
+
+    num_quantizers = 8
+    batch_size = num_pairs * 2 + 4  # some extra non-CFG requests
+    max_num_reqs = 1024
+
+    # Simulate code tensor: (num_quantizers, batch_size)
+    code = torch.randint(
+        0, 1024, (num_quantizers, batch_size), device="cuda", dtype=torch.long
+    )
+    original = code.clone()
+
+    # Pre-allocated index buffers
+    src_indices = torch.zeros(max_num_reqs, dtype=torch.int32, device="cuda")
+    dst_indices = torch.zeros(max_num_reqs, dtype=torch.int32, device="cuda")
+
+    # Set up pairs: cond at even positions, uncond at odd positions
+    for i in range(num_pairs):
+        src_indices[i] = i * 2      # cond position
+        dst_indices[i] = i * 2 + 1  # uncond position
+
+    copy_columns_by_indices(code, src_indices, dst_indices, num_pairs)
+
+    # Verify: uncond positions should now have cond codes
+    for i in range(num_pairs):
+        cond_pos = i * 2
+        uncond_pos = i * 2 + 1
+        torch.testing.assert_close(code[:, uncond_pos], original[:, cond_pos])
+
+    # Cond positions and other positions should be unchanged
+    for c in range(batch_size):
+        if c % 2 == 0 or c >= num_pairs * 2:
+            torch.testing.assert_close(code[:, c], original[:, c])

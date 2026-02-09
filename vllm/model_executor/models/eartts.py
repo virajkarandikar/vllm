@@ -20,7 +20,7 @@ from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
 from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import get_forward_context
-from vllm.model_executor.layers.cfg_ops import apply_cfg_logits, set_uncond_embeddings
+from vllm.model_executor.layers.cfg_ops import apply_cfg_logits, copy_columns_by_indices, set_uncond_embeddings
 
 from .utils import AutoWeightsLoader
 from .optimized_t5gemma import OptimizedT5GemmaEncoderModel
@@ -329,8 +329,8 @@ class EarTTSInputEmbedding(nn.Module):
             backbone_config=backbone_config,
         )
         self.bos_emb = nn.Parameter(torch.empty(hidden_size))
-        if self.enable_guidance:
-            self.null_emb = nn.Parameter(torch.empty(hidden_size))
+        # always have param created, so there is no problem loading the model
+        self.null_emb = nn.Parameter(torch.empty(hidden_size))
 
         self.use_subword_flag_emb = config.use_subword_flag_emb
         pretrained_tokenizer_name = config.pretrained_tokenizer_name
@@ -735,6 +735,19 @@ class MaskGITSampler(nn.Module):
                 + torch.exp(mog_logs) * torch.randn_like(mog_mu) * self.noise_scale
             )
             code = self._depthsum_encoding_step_reshaped(z, code, cnt, k)
+
+            if self.config.enable_guidance:
+                # next mog head iteration uses cond tokens as input, avoiding divergence
+                cfg_metadata = get_forward_context().cfg_metadata
+                if cfg_metadata is not None:
+                    copy_columns_by_indices(
+                        code,
+                        cfg_metadata.cond_logits_indices,
+                        cfg_metadata.uncond_logits_indices,
+                        cfg_metadata.num_cfg_pairs,
+                    )
+
+
             cnt += k
         return code.transpose(0, 1)  # BT x num_quantizers
 
