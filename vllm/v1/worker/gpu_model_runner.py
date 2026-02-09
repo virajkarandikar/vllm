@@ -2795,12 +2795,11 @@ class GPUModelRunner(
             )
             is_prefill = num_computed < num_prompt
 
-            # Mark unconditional tokens for embedding zeroing during prefill.
-            # This applies to ALL prefill chunks, not just the final one.
-            if is_prefill:
-                start_token = int(query_start_loc_cpu[uncond_idx].item())
-                end_token = int(query_start_loc_cpu[uncond_idx + 1].item())
-                self.cfg_buffers.set_uncond_token_range(start_token, end_token)
+            # Mark unconditional tokens for embedding zeroing.
+            # This applied to all prefill chunks.
+            start_token = int(query_start_loc_cpu[uncond_idx].item())
+            end_token = int(query_start_loc_cpu[uncond_idx + 1].item())
+            self.cfg_buffers.set_uncond_token_range(start_token, end_token)
 
             # For CFG logits application, we only add the pair when at the
             # final sampling position:

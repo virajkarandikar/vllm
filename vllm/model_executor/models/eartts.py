@@ -739,13 +739,12 @@ class MaskGITSampler(nn.Module):
             if self.config.enable_guidance:
                 # next mog head iteration uses cond tokens as input, avoiding divergence
                 cfg_metadata = get_forward_context().cfg_metadata
-                if cfg_metadata is not None:
-                    copy_columns_by_indices(
-                        code,
-                        cfg_metadata.cond_logits_indices,
-                        cfg_metadata.uncond_logits_indices,
-                        cfg_metadata.num_cfg_pairs,
-                    )
+                copy_columns_by_indices(
+                    code,
+                    cfg_metadata.cond_logits_indices,
+                    cfg_metadata.uncond_logits_indices,
+                    cfg_metadata.num_cfg_pairs,
+                )
 
 
             cnt += k
