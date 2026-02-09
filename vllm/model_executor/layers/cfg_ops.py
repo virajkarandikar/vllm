@@ -21,7 +21,7 @@ def _apply_cfg_logits_kernel(
     cond_indices_ptr,
     uncond_indices_ptr,
     scales_ptr,
-    num_pairs,
+    num_pairs_ptr,
     vocab_size,
     stride_batch,
     stride_vocab,
@@ -33,14 +33,16 @@ def _apply_cfg_logits_kernel(
     For each CFG pair:
         logits[cond_idx] = logits[cond_idx] + scale * (logits[cond_idx] - logits[uncond_idx])
 
-    Grid: (max(1, num_pairs), cdiv(vocab_size, BLOCK_VOCAB))
+    Grid: (max(1, max_num_pairs), cdiv(vocab_size, BLOCK_VOCAB))
 
     Args:
         logits_ptr: Pointer to logits tensor of shape (num_reqs, vocab_size)
         cond_indices_ptr: Pointer to tensor of conditional request indices
         uncond_indices_ptr: Pointer to tensor of unconditional request indices
         scales_ptr: Pointer to tensor of guidance scales per pair
-        num_pairs: Number of valid CFG pairs to process
+        num_pairs_ptr: Pointer to 1-element int32 tensor with number of valid
+                       CFG pairs. Stored as a tensor (not a scalar) so the
+                       value can be updated between CUDA graph replays.
         vocab_size: Vocabulary size
         stride_batch: Stride along batch dimension
         stride_vocab: Stride along vocab dimension
@@ -49,7 +51,9 @@ def _apply_cfg_logits_kernel(
     pid_pair = tl.program_id(0)
     pid_vocab = tl.program_id(1)
 
-    # Early exit for padding pairs (handles num_pairs=0 case during CUDA graph capture)
+    # Load num_pairs from GPU tensor (not a frozen scalar) for CUDA graph
+    # compatibility. The grid is sized to max_num_pairs; excess blocks exit.
+    num_pairs = tl.load(num_pairs_ptr)
     if pid_pair >= num_pairs:
         return
 
@@ -82,7 +86,8 @@ def apply_cfg_logits(
     cond_logits_indices: torch.Tensor,
     uncond_logits_indices: torch.Tensor,
     guidance_scales: torch.Tensor,
-    num_cfg_pairs: int,
+    num_cfg_pairs: torch.Tensor,
+    max_num_pairs: int = 0,
 ) -> None:
     """
     Apply CFG formula to logits in-place for decode/sampling positions.
@@ -94,9 +99,12 @@ def apply_cfg_logits(
     only the conditional logits should be used for sampling.
 
     Designed for CUDA graph compatibility:
-    - Grid uses max(1, num_cfg_pairs) to ensure kernel is always launched
-    - When num_cfg_pairs=0, one block is launched but exits immediately
-    - Full parallelism preserved: each block handles one pair
+    - num_cfg_pairs is a 1-element GPU tensor (not a Python scalar) so the
+      kernel reads the current value at runtime instead of using a frozen
+      capture-time scalar
+    - Grid uses max_num_pairs to ensure enough blocks are captured to cover
+      any runtime num_cfg_pairs value
+    - When num_cfg_pairs=0, all blocks exit immediately via bounds check
 
     Args:
         logits: Tensor of shape (seq_len, vocab_size) containing packed logits.
@@ -113,16 +121,20 @@ def apply_cfg_logits(
         guidance_scales: Pre-allocated tensor of shape (max_num_reqs,) containing
                         guidance scale for each CFG pair.
                         Only first `num_cfg_pairs` entries are valid.
-        num_cfg_pairs: Number of valid CFG pairs to process.
+        num_cfg_pairs: 1-element int32 GPU tensor with number of valid CFG
+                      pairs to process.
+        max_num_pairs: Maximum possible number of pairs (for grid sizing).
+                      Must be provided for CUDA graph compatibility.
     """
     vocab_size = logits.shape[1]
 
     BLOCK_VOCAB = 1024
 
-    # Use max(1, num_cfg_pairs) to ensure kernel is always launched for CUDA graphs
-    # When num_cfg_pairs=0, the single block will exit immediately via bounds check
+    # Use max_num_pairs for grid to ensure enough blocks are captured in
+    # CUDA graphs. Excess blocks read num_cfg_pairs from the GPU tensor
+    # and exit immediately.
     grid = (
-        max(1, num_cfg_pairs),
+        max(1, max_num_pairs),
         triton.cdiv(vocab_size, BLOCK_VOCAB),
     )
 
@@ -144,7 +156,7 @@ def _set_uncond_embeddings_kernel(
     embeddings_ptr,
     null_emb_ptr,
     mask_ptr,
-    num_tokens,
+    num_tokens_ptr,
     dim,
     stride_seq,
     stride_dim,
@@ -158,14 +170,15 @@ def _set_uncond_embeddings_kernel(
     For each token where mask[seq_idx] == True, the entire embedding
     row is set to the null_emb values.
 
-    Grid: (max(1, cdiv(num_tokens, BLOCK_SEQ)), cdiv(dim, BLOCK_DIM))
+    Grid: (max(1, cdiv(max_num_tokens, BLOCK_SEQ)), cdiv(dim, BLOCK_DIM))
 
     Args:
         embeddings_ptr: Pointer to embeddings tensor of shape (seq_len, dim)
         null_emb_ptr: Pointer to null embedding tensor of shape (dim,)
         mask_ptr: Pointer to boolean mask tensor of shape (max_num_tokens,)
                   True indicates unconditional tokens to be set to null_emb
-        num_tokens: Number of valid tokens to process
+        num_tokens_ptr: Pointer to 1-element int32 tensor with number of valid
+                        tokens. Stored as a tensor for CUDA graph compatibility.
         dim: Embedding dimension
         stride_seq: Stride along sequence dimension
         stride_dim: Stride along embedding dimension
@@ -180,7 +193,8 @@ def _set_uncond_embeddings_kernel(
     seq_offsets = pid_seq * BLOCK_SEQ + tl.arange(0, BLOCK_SEQ)
     dim_offsets = pid_dim * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
 
-    # Mask for valid positions (handles num_tokens=0 case during CUDA graph capture)
+    # Load num_tokens from GPU tensor for CUDA graph compatibility.
+    num_tokens = tl.load(num_tokens_ptr)
     seq_mask = seq_offsets < num_tokens
     dim_mask = dim_offsets < dim
 
@@ -221,7 +235,7 @@ def _copy_columns_by_indices_kernel(
     data_ptr,
     src_indices_ptr,
     dst_indices_ptr,
-    num_pairs,
+    num_pairs_ptr,
     num_rows,
     stride_row,
     stride_col,
@@ -233,13 +247,14 @@ def _copy_columns_by_indices_kernel(
     For each valid pair i (i < num_pairs):
         data[:, dst_indices[i]] = data[:, src_indices[i]]
 
-    Grid: (max(1, num_pairs), cdiv(num_rows, BLOCK_ROWS))
+    Grid: (max(1, max_num_pairs), cdiv(num_rows, BLOCK_ROWS))
 
     Args:
         data_ptr: Pointer to 2D tensor of shape (num_rows, num_cols)
         src_indices_ptr: Pointer to tensor of source column indices
         dst_indices_ptr: Pointer to tensor of destination column indices
-        num_pairs: Number of valid pairs to process
+        num_pairs_ptr: Pointer to 1-element int32 tensor with number of valid
+                       pairs. Stored as a tensor for CUDA graph compatibility.
         num_rows: Number of rows in the data tensor
         stride_row: Stride along the row dimension
         stride_col: Stride along the column dimension
@@ -248,7 +263,8 @@ def _copy_columns_by_indices_kernel(
     pid_pair = tl.program_id(0)
     pid_row = tl.program_id(1)
 
-    # Early exit for padding pairs (handles num_pairs=0 for CUDA graph capture)
+    # Load num_pairs from GPU tensor for CUDA graph compatibility.
+    num_pairs = tl.load(num_pairs_ptr)
     if pid_pair >= num_pairs:
         return
 
@@ -273,7 +289,8 @@ def copy_columns_by_indices(
     data: torch.Tensor,
     src_indices: torch.Tensor,
     dst_indices: torch.Tensor,
-    num_pairs: int,
+    num_pairs: torch.Tensor,
+    max_num_pairs: int = 0,
 ) -> None:
     """
     Copy columns in a 2D tensor from source positions to destination
@@ -283,10 +300,10 @@ def copy_columns_by_indices(
         data[:, dst_indices[i]] = data[:, src_indices[i]]
 
     Designed for CUDA graph compatibility:
-    - Grid uses max(1, num_pairs) to ensure kernel is always launched
-    - When num_pairs=0, one block is launched but exits immediately
-    - Pre-allocated index tensors can be used at full size; only
-      the first ``num_pairs`` entries are read
+    - num_pairs is a 1-element GPU tensor so the kernel reads the current
+      value at runtime instead of using a frozen capture-time scalar
+    - Grid uses max_num_pairs to ensure enough blocks are captured
+    - When num_pairs=0, all blocks exit immediately via bounds check
 
     Args:
         data: Tensor of shape (num_rows, num_cols). Modified in-place.
@@ -296,14 +313,16 @@ def copy_columns_by_indices(
         dst_indices: Pre-allocated tensor of shape (max_num_pairs,)
                      containing destination column indices.
                      Only first ``num_pairs`` entries are used.
-        num_pairs: Number of valid pairs to process.
+        num_pairs: 1-element int32 GPU tensor with number of valid pairs.
+        max_num_pairs: Maximum possible number of pairs (for grid sizing).
+                      Must be provided for CUDA graph compatibility.
     """
     num_rows = data.shape[0]
 
     BLOCK_ROWS = 32
 
     grid = (
-        max(1, num_pairs),
+        max(1, max_num_pairs),
         triton.cdiv(num_rows, BLOCK_ROWS),
     )
 
@@ -323,7 +342,8 @@ def set_uncond_embeddings(
     embeddings: torch.Tensor,
     null_emb: torch.Tensor,
     uncond_token_mask: torch.Tensor,
-    num_tokens: int,
+    num_tokens: torch.Tensor,
+    max_num_tokens: int = 0,
 ) -> None:
     """
     Set embeddings for unconditional tokens to null_emb values in-place.
@@ -333,9 +353,10 @@ def set_uncond_embeddings(
     which represents the unconditional path.
 
     Designed for CUDA graph compatibility:
-    - Grid uses max(1, cdiv(num_tokens, BLOCK_SEQ)) to ensure kernel is always launched
-    - When num_tokens=0, one block is launched but seq_mask is all False (no stores)
-    - Full parallelism preserved: each block handles a chunk of tokens
+    - num_tokens is a 1-element GPU tensor so the kernel reads the current
+      value at runtime instead of using a frozen capture-time scalar
+    - Grid uses max_num_tokens to ensure enough blocks are captured
+    - When num_tokens=0, all blocks exit via seq_mask (no stores)
 
     Args:
         embeddings: Tensor of shape (seq_len, dim) containing token embeddings.
@@ -346,17 +367,20 @@ def set_uncond_embeddings(
                           indicates tokens that belong to unconditional requests
                           and should be set to null_emb. Pre-allocated for
                           CUDA graphs.
-        num_tokens: Number of valid tokens to process.
+        num_tokens: 1-element int32 GPU tensor with number of valid tokens.
+        max_num_tokens: Maximum possible number of tokens (for grid sizing).
+                       Must be provided for CUDA graph compatibility.
     """
     dim = embeddings.shape[1]
 
     BLOCK_SEQ = 32
     BLOCK_DIM = 128
 
-    # Use max(1, ...) to ensure kernel is always launched for CUDA graphs
-    # When num_tokens=0, the single seq block will have seq_mask all False (no stores)
+    # Use max_num_tokens for grid to ensure enough blocks are captured in
+    # CUDA graphs. Excess blocks read num_tokens from the GPU tensor and
+    # skip via seq_mask.
     grid = (
-        max(1, triton.cdiv(num_tokens, BLOCK_SEQ)),
+        max(1, triton.cdiv(max_num_tokens, BLOCK_SEQ)),
         triton.cdiv(dim, BLOCK_DIM),
     )
 

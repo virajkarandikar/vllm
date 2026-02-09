@@ -63,11 +63,20 @@ class CFGMetadata:
     # Only first `num_cfg_pairs` entries are valid
     uncond_logits_indices: torch.Tensor
 
-    # Number of valid CFG pairs in this batch (rest of tensors may be padding)
-    num_cfg_pairs: int = 0
+    # Number of valid CFG pairs in this batch (rest of tensors may be padding).
+    # Stored as a 1-element int32 GPU tensor for CUDA graph compatibility:
+    # scalar kernel args get frozen during CUDA graph capture, but tensor
+    # data can be updated between replays.
+    num_cfg_pairs: torch.Tensor = None  # type: ignore[assignment]
 
-    # Number of valid tokens in uncond_token_mask. Used to zero embeddings during prefill.
-    num_tokens: int = 0
+    # Number of valid tokens in uncond_token_mask.
+    # Stored as a 1-element int32 GPU tensor for CUDA graph compatibility.
+    num_tokens: torch.Tensor = None  # type: ignore[assignment]
+
+    # Max sizes for grid dimensioning in CUDA graph capture.
+    # Ensures enough Triton blocks are captured to cover any runtime value.
+    max_num_reqs: int = 0
+    max_num_tokens: int = 0
 
 
 class CFGBuffers:
@@ -106,6 +115,16 @@ class CFGBuffers:
             max_num_reqs, dtype=torch.int32, device=device
         )
 
+        # GPU scalar tensors for CUDA graph compatibility: scalar kernel
+        # args get frozen during capture, but tensor data can be updated
+        # between replays.
+        self.num_cfg_pairs_gpu = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+        self.num_tokens_gpu = torch.zeros(
+            1, dtype=torch.int32, device=device
+        )
+
         # CPU tensors for building metadata (pinned for fast H2D transfer)
         self.guidance_scales_cpu = torch.ones(
             max_num_reqs, dtype=torch.float32, pin_memory=pin_memory
@@ -120,13 +139,13 @@ class CFGBuffers:
             max_num_reqs, dtype=torch.int32, pin_memory=pin_memory
         )
 
-        # Current valid count
-        self.num_cfg_pairs = 0
+        # Current valid counts (CPU tracking)
+        self._num_cfg_pairs = 0
         self.num_tokens = 0
 
     def reset(self) -> None:
         """Reset the buffers for a new batch."""
-        self.num_cfg_pairs = 0
+        self._num_cfg_pairs = 0
         # Zero out the mask (important for correctness)
         if self.num_tokens > 0:
             self.uncond_token_mask_cpu[: self.num_tokens].zero_()
@@ -150,11 +169,11 @@ class CFGBuffers:
                               request's sampling position.
             guidance_scale: Guidance scale for this CFG pair.
         """
-        idx = self.num_cfg_pairs
+        idx = self._num_cfg_pairs
         self.cond_logits_indices_cpu[idx] = cond_logits_idx
         self.uncond_logits_indices_cpu[idx] = uncond_logits_idx
         self.guidance_scales_cpu[idx] = guidance_scale
-        self.num_cfg_pairs += 1
+        self._num_cfg_pairs += 1
 
     def set_uncond_token_range(self, start: int, end: int) -> None:
         """Mark a range of tokens as belonging to unconditional requests."""
@@ -163,8 +182,8 @@ class CFGBuffers:
 
     def sync_to_gpu(self) -> None:
         """Copy CPU buffers to GPU (async, non-blocking)."""
-        if self.num_cfg_pairs > 0:
-            n = self.num_cfg_pairs
+        if self._num_cfg_pairs > 0:
+            n = self._num_cfg_pairs
             self.guidance_scales[:n].copy_(
                 self.guidance_scales_cpu[:n], non_blocking=True
             )
@@ -178,19 +197,24 @@ class CFGBuffers:
             self.uncond_token_mask[: self.num_tokens].copy_(
                 self.uncond_token_mask_cpu[: self.num_tokens], non_blocking=True
             )
+        # Always update GPU scalar tensors (CUDA graph reads these at runtime)
+        self.num_cfg_pairs_gpu.fill_(self._num_cfg_pairs)
+        self.num_tokens_gpu.fill_(self.num_tokens)
 
     def get_metadata(self) -> CFGMetadata:
         """Get CFGMetadata from the current buffer state.
 
         Always returns valid metadata. If there are no CFG pairs,
-        num_cfg_pairs will be 0 and kernels will early-exit.
-        This is required for CUDA graph compatibility.
+        the num_cfg_pairs GPU tensor will contain 0 and kernels will
+        early-exit. This is required for CUDA graph compatibility.
         """
         return CFGMetadata(
             guidance_scales=self.guidance_scales,
             uncond_token_mask=self.uncond_token_mask,
             cond_logits_indices=self.cond_logits_indices,
             uncond_logits_indices=self.uncond_logits_indices,
-            num_cfg_pairs=self.num_cfg_pairs,
-            num_tokens=self.num_tokens,
+            num_cfg_pairs=self.num_cfg_pairs_gpu,
+            num_tokens=self.num_tokens_gpu,
+            max_num_reqs=self.max_num_reqs,
+            max_num_tokens=self.max_num_tokens,
         )

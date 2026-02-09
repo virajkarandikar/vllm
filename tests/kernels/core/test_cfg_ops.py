@@ -36,8 +36,10 @@ def test_set_uncond_embeddings_basic(
     # Create mask where all tokens are unconditional
     uncond_mask = torch.ones(num_tokens, device="cuda", dtype=torch.bool)
 
-    # Apply kernel
-    set_uncond_embeddings(embeddings, null_emb, uncond_mask, num_tokens)
+    # Apply kernel (num_tokens as GPU tensor for CUDA graph compatibility)
+    num_tokens_t = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
+    set_uncond_embeddings(embeddings, null_emb, uncond_mask,
+                          num_tokens_t, max_num_tokens=num_tokens)
 
     # All rows should be set to null_emb
     expected = null_emb.unsqueeze(0).expand(num_tokens, -1)
@@ -69,7 +71,9 @@ def test_set_uncond_embeddings_partial_mask(num_tokens: int, hidden_size: int):
     uncond_mask[::2] = True  # Every other token is unconditional
 
     # Apply kernel
-    set_uncond_embeddings(embeddings, null_emb, uncond_mask, num_tokens)
+    num_tokens_t = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
+    set_uncond_embeddings(embeddings, null_emb, uncond_mask,
+                          num_tokens_t, max_num_tokens=num_tokens)
 
     # Check that unconditional tokens are set to null_emb
     for i in range(num_tokens):
@@ -102,7 +106,9 @@ def test_set_uncond_embeddings_no_uncond():
     uncond_mask = torch.zeros(num_tokens, device="cuda", dtype=torch.bool)
 
     # Apply kernel
-    set_uncond_embeddings(embeddings, null_emb, uncond_mask, num_tokens)
+    num_tokens_t = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
+    set_uncond_embeddings(embeddings, null_emb, uncond_mask,
+                          num_tokens_t, max_num_tokens=num_tokens)
 
     # All tokens should be unchanged
     torch.testing.assert_close(embeddings, original_embeddings, atol=0, rtol=0)
@@ -122,7 +128,9 @@ def test_set_uncond_embeddings_empty():
     uncond_mask = torch.zeros(0, device="cuda", dtype=torch.bool)
 
     # Should not raise, just return early
-    set_uncond_embeddings(embeddings, null_emb, uncond_mask, num_tokens=0)
+    set_uncond_embeddings(embeddings, null_emb, uncond_mask,
+                          num_tokens=torch.tensor([0], dtype=torch.int32, device="cuda"),
+                          max_num_tokens=0)
 
 
 def test_set_uncond_embeddings_cfg_scenario():
@@ -149,7 +157,9 @@ def test_set_uncond_embeddings_cfg_scenario():
     uncond_mask[num_tokens:] = True
 
     # Apply kernel
-    set_uncond_embeddings(embeddings, null_emb, uncond_mask, total_tokens)
+    total_tokens_t = torch.tensor([total_tokens], dtype=torch.int32, device="cuda")
+    set_uncond_embeddings(embeddings, null_emb, uncond_mask,
+                          total_tokens_t, max_num_tokens=total_tokens)
 
     # Conditional tokens (first half) should be unchanged
     torch.testing.assert_close(
@@ -185,7 +195,9 @@ def test_set_uncond_embeddings_irregular_sizes(num_tokens: int, hidden_size: int
     original_embeddings = embeddings.clone()
 
     # Apply kernel
-    set_uncond_embeddings(embeddings, null_emb, uncond_mask, num_tokens)
+    num_tokens_t = torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
+    set_uncond_embeddings(embeddings, null_emb, uncond_mask,
+                          num_tokens_t, max_num_tokens=num_tokens)
 
     # Verify results
     for i in range(num_tokens):
@@ -216,8 +228,10 @@ def test_set_uncond_embeddings_preallocated_mask():
     original_embeddings = embeddings.clone()
     uncond_mask[:actual_tokens:2] = True  # Every other token in valid range
 
-    # Apply kernel with actual token count
-    set_uncond_embeddings(embeddings, null_emb, uncond_mask, actual_tokens)
+    # Apply kernel with actual token count (GPU tensor + max for grid)
+    actual_tokens_t = torch.tensor([actual_tokens], dtype=torch.int32, device="cuda")
+    set_uncond_embeddings(embeddings, null_emb, uncond_mask,
+                          actual_tokens_t, max_num_tokens=max_num_tokens)
 
     # Verify only the first actual_tokens are modified
     for i in range(actual_tokens):
@@ -258,13 +272,17 @@ def test_apply_cfg_logits_basic(vocab_size: int, dtype: torch.dtype):
     uncond_logits_indices = torch.tensor([1], dtype=torch.int32, device="cuda")
     guidance_scales = torch.tensor([3.0], dtype=torch.float32, device="cuda")
 
+    # num_cfg_pairs as 1-element GPU tensor (CUDA graph compatible)
+    num_cfg_pairs_t = torch.tensor([num_cfg_pairs], dtype=torch.int32, device="cuda")
+
     # Apply CFG kernel
     apply_cfg_logits(
         logits,
         cond_logits_indices,
         uncond_logits_indices,
         guidance_scales,
-        num_cfg_pairs,
+        num_cfg_pairs_t,
+        max_num_pairs=num_cfg_pairs,
     )
 
     # Verify CFG formula: x = x_cond + scale * (x_cond - x_uncond)
@@ -303,12 +321,15 @@ def test_apply_cfg_logits_multiple_pairs():
     uncond_logits_indices = torch.tensor([1, 4], dtype=torch.int32, device="cuda")
     guidance_scales = torch.tensor([2.0, 5.0], dtype=torch.float32, device="cuda")
 
+    num_cfg_pairs_t = torch.tensor([num_cfg_pairs], dtype=torch.int32, device="cuda")
+
     apply_cfg_logits(
         logits,
         cond_logits_indices,
         uncond_logits_indices,
         guidance_scales,
-        num_cfg_pairs,
+        num_cfg_pairs_t,
+        max_num_pairs=num_cfg_pairs,
     )
 
     # Verify pair 0 (compute in float32, convert to target dtype)
@@ -355,7 +376,8 @@ def test_apply_cfg_logits_zero_scale():
         cond_logits_indices,
         uncond_logits_indices,
         guidance_scales,
-        num_cfg_pairs=1,
+        num_cfg_pairs=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        max_num_pairs=1,
     )
 
     # With scale=0: x = x_cond + 0 * (x_cond - x_uncond) = x_cond
@@ -384,7 +406,8 @@ def test_apply_cfg_logits_no_pairs():
         cond_logits_indices,
         uncond_logits_indices,
         guidance_scales,
-        num_cfg_pairs=0,
+        num_cfg_pairs=torch.tensor([0], dtype=torch.int32, device="cuda"),
+        max_num_pairs=0,
     )
 
     # No changes should be made
@@ -418,12 +441,15 @@ def test_apply_cfg_logits_preallocated_buffers():
     uncond_logits_indices[1] = 5
     guidance_scales[1] = 1.5
 
+    num_cfg_pairs_t = torch.tensor([num_cfg_pairs], dtype=torch.int32, device="cuda")
+
     apply_cfg_logits(
         logits,
         cond_logits_indices,
         uncond_logits_indices,
         guidance_scales,
-        num_cfg_pairs,
+        num_cfg_pairs_t,
+        max_num_pairs=max_num_reqs,
     )
 
     # Verify pair 0 (compute in float32, convert to target dtype)
@@ -468,7 +494,8 @@ def test_apply_cfg_logits_large_vocab():
         cond_logits_indices,
         uncond_logits_indices,
         guidance_scales,
-        num_cfg_pairs=1,
+        num_cfg_pairs=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        max_num_pairs=1,
     )
 
     # Compute expected in float32, convert to target dtype
@@ -505,7 +532,10 @@ def test_copy_columns_by_indices_basic(
     src_indices = torch.tensor([1, 3], dtype=torch.int32, device="cuda")
     dst_indices = torch.tensor([0, 2], dtype=torch.int32, device="cuda")
 
-    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs)
+    num_pairs_t = torch.tensor([num_pairs], dtype=torch.int32, device="cuda")
+
+    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs_t,
+                            max_num_pairs=num_pairs)
 
     # Verify copied columns
     torch.testing.assert_close(data[:, 0], original[:, 1])
@@ -529,7 +559,9 @@ def test_copy_columns_by_indices_no_pairs():
     src_indices = torch.zeros(32, dtype=torch.int32, device="cuda")
     dst_indices = torch.zeros(32, dtype=torch.int32, device="cuda")
 
-    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs=0)
+    copy_columns_by_indices(data, src_indices, dst_indices,
+                            num_pairs=torch.tensor([0], dtype=torch.int32, device="cuda"),
+                            max_num_pairs=0)
 
     torch.testing.assert_close(data, original, atol=0, rtol=0)
 
@@ -557,7 +589,10 @@ def test_copy_columns_by_indices_preallocated():
     src_indices[1] = 4
     dst_indices[1] = 5
 
-    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs)
+    num_pairs_t = torch.tensor([num_pairs], dtype=torch.int32, device="cuda")
+
+    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs_t,
+                            max_num_pairs=max_num_reqs)
 
     # Verify copied columns
     torch.testing.assert_close(data[:, 1], original[:, 0])
@@ -582,7 +617,9 @@ def test_copy_columns_by_indices_single_pair():
     src_indices = torch.tensor([3], dtype=torch.int32, device="cuda")
     dst_indices = torch.tensor([7], dtype=torch.int32, device="cuda")
 
-    copy_columns_by_indices(data, src_indices, dst_indices, num_pairs=1)
+    copy_columns_by_indices(data, src_indices, dst_indices,
+                            num_pairs=torch.tensor([1], dtype=torch.int32, device="cuda"),
+                            max_num_pairs=1)
 
     torch.testing.assert_close(data[:, 7], original[:, 3])
 
@@ -616,7 +653,10 @@ def test_copy_columns_by_indices_cfg_scenario(num_pairs: int):
         src_indices[i] = i * 2      # cond position
         dst_indices[i] = i * 2 + 1  # uncond position
 
-    copy_columns_by_indices(code, src_indices, dst_indices, num_pairs)
+    num_pairs_t = torch.tensor([num_pairs], dtype=torch.int32, device="cuda")
+
+    copy_columns_by_indices(code, src_indices, dst_indices, num_pairs_t,
+                            max_num_pairs=max_num_reqs)
 
     # Verify: uncond positions should now have cond codes
     for i in range(num_pairs):
