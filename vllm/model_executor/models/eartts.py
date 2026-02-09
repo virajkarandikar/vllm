@@ -387,7 +387,8 @@ class EarTTSInputEmbedding(nn.Module):
                 text_emb,
                 self.null_emb,
                 cfg_metadata.uncond_token_mask,
-                cfg_metadata.num_tokens
+                cfg_metadata.num_tokens,
+                cfg_metadata.max_num_tokens,
             )
 
         # prepare total embedding by adding all components
@@ -539,7 +540,10 @@ class MoGHead(nn.Module):
 
         x = self.mlp_stack(x)
 
-        # NOTE: in NeMo it is applied not to logits but before projection
+        # NOTE: in NeMo it is applied not to logits but before projection.
+        # Always call the kernel when enable_guidance is True so the launch
+        # is captured in CUDA graphs. The kernel reads num_cfg_pairs from a
+        # GPU tensor and is a no-op when num_cfg_pairs=0.
         if self.enable_guidance:
             cfg_metadata = get_forward_context().cfg_metadata
             apply_cfg_logits(
@@ -548,6 +552,7 @@ class MoGHead(nn.Module):
                 cfg_metadata.uncond_logits_indices,
                 cfg_metadata.guidance_scales,
                 cfg_metadata.num_cfg_pairs,
+                cfg_metadata.max_num_reqs,
             )
 
         logits = self.proj_logits(x)
@@ -744,6 +749,7 @@ class MaskGITSampler(nn.Module):
                     cfg_metadata.cond_logits_indices,
                     cfg_metadata.uncond_logits_indices,
                     cfg_metadata.num_cfg_pairs,
+                    cfg_metadata.max_num_reqs,
                 )
 
 
