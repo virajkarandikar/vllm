@@ -2756,7 +2756,7 @@ class GPUModelRunner(
         self,
         scheduler_output: "SchedulerOutput",
         query_start_loc_cpu: torch.Tensor,
-        num_tokens: int,
+        padded_num_tokens: int,
     ) -> Optional[CFGMetadata]:
         """
         Build CFG metadata from the current batch.
@@ -2778,7 +2778,10 @@ class GPUModelRunner(
             scheduler_output: The scheduler output for this step
             query_start_loc_cpu: CPU tensor of shape (num_reqs + 1,) with
                 cumulative token counts for each request
-            num_tokens: Total number of tokens in this batch
+            padded_num_tokens: Padded num_input_tokens (the CUDA graph
+                capture size). Used to size Triton kernel grids so each
+                captured graph gets a right-sized grid rather than always
+                using the absolute maximum.
 
         Returns:
             CFGMetadata when guidance is enabled, None when disabled
@@ -2791,7 +2794,6 @@ class GPUModelRunner(
 
         # Reset buffers for new batch
         self.cfg_buffers.reset()
-        self.cfg_buffers.num_tokens = num_tokens
 
         # Find all CFG pairs in the batch
         num_reqs = self.input_batch.num_reqs
@@ -2863,7 +2865,7 @@ class GPUModelRunner(
         # Always sync buffers and return metadata for CUDA graph compatibility.
         # Even if num_cfg_pairs=0, we need consistent kernel calls.
         self.cfg_buffers.sync_to_gpu()
-        return self.cfg_buffers.get_metadata()
+        return self.cfg_buffers.get_metadata(padded_num_tokens)
 
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
         mrope_pos_ptr = 0
@@ -4374,15 +4376,6 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
-            # Prepare CFG (Classifier Free Guidance) metadata if applicable.
-            # This identifies cond/uncond pairs and builds masks for:
-            # 1. Zeroing uncond embeddings during prefill
-            # 2. Combining cond/uncond logits with guidance scale
-            cfg_metadata = self._prepare_cfg_metadata(
-                scheduler_output,
-                self.query_start_loc.cpu[:self.input_batch.num_reqs + 1],
-                scheduler_output.total_num_scheduled_tokens,
-            )
 
             (
                 cudagraph_mode,
@@ -4521,6 +4514,18 @@ class GPUModelRunner(
                 ec_connector_output,
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
+            )
+
+            # Prepare CFG (Classifier Free Guidance) metadata if applicable.
+            # This identifies cond/uncond pairs and builds masks for:
+            # 1. Zeroing uncond embeddings during prefill
+            # 2. Combining cond/uncond logits with guidance scale
+            # Called after _preprocess so that num_tokens_padded (the padded
+            # CUDA graph size) is available for kernel grid sizing.
+            cfg_metadata = self._prepare_cfg_metadata(
+                scheduler_output,
+                self.query_start_loc.cpu[:self.input_batch.num_reqs + 1],
+                num_tokens_padded,
             )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
@@ -6216,12 +6221,14 @@ class GPUModelRunner(
             # When guidance is enabled, model expects cfg_metadata in forward
             # context. We provide empty metadata (num_cfg_pairs=0) which causes
             # CFG kernels to early-exit.
+            # Pass num_tokens as padded_num_tokens so the Triton kernel grids
+            # are sized to the CUDA graph capture size, not the absolute max.
             cfg_metadata = None
-            if self.enable_guidance and self.cfg_buffers is not None:
+            if self.enable_guidance:
+                assert self.cfg_buffers is not None
                 self.cfg_buffers.reset()
-                self.cfg_buffers.num_tokens = num_tokens
                 self.cfg_buffers.sync_to_gpu()
-                cfg_metadata = self.cfg_buffers.get_metadata()
+                cfg_metadata = self.cfg_buffers.get_metadata(num_tokens)
 
             with (
                 self.maybe_randomize_inputs(input_ids, inputs_embeds),

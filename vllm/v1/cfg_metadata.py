@@ -73,10 +73,12 @@ class CFGMetadata:
     # Stored as a 1-element int32 GPU tensor for CUDA graph compatibility.
     num_tokens: torch.Tensor = None  # type: ignore[assignment]
 
-    # Max sizes for grid dimensioning in CUDA graph capture.
-    # Ensures enough Triton blocks are captured to cover any runtime value.
-    max_num_reqs: int = 0
-    max_num_tokens: int = 0
+    # Padded num_input_tokens for Triton kernel grid sizing.
+    # During CUDA graph capture this equals the graph capture size, so each
+    # captured graph gets a right-sized grid instead of the absolute maximum.
+    # Used as the grid upper bound for both token-level and pair-level kernels
+    # (num_pairs <= num_tokens always holds).
+    padded_num_tokens: int = 0
 
 
 class CFGBuffers:
@@ -141,15 +143,15 @@ class CFGBuffers:
 
         # Current valid counts (CPU tracking)
         self._num_cfg_pairs = 0
-        self.num_tokens = 0
+        self._num_tokens = 0
 
     def reset(self) -> None:
         """Reset the buffers for a new batch."""
         self._num_cfg_pairs = 0
         # Zero out the mask (important for correctness)
-        if self.num_tokens > 0:
-            self.uncond_token_mask_cpu[: self.num_tokens].zero_()
-        self.num_tokens = 0
+        if self._num_tokens > 0:
+            self.uncond_token_mask_cpu[: self._num_tokens].zero_()
+        self._num_tokens = 0
 
     def add_cfg_pair(
         self,
@@ -178,7 +180,7 @@ class CFGBuffers:
     def set_uncond_token_range(self, start: int, end: int) -> None:
         """Mark a range of tokens as belonging to unconditional requests."""
         self.uncond_token_mask_cpu[start:end] = True
-        self.num_tokens = max(self.num_tokens, end)
+        self._num_tokens = max(self._num_tokens, end)
 
     def sync_to_gpu(self) -> None:
         """Copy CPU buffers to GPU (async, non-blocking)."""
@@ -193,20 +195,28 @@ class CFGBuffers:
             self.uncond_logits_indices[:n].copy_(
                 self.uncond_logits_indices_cpu[:n], non_blocking=True
             )
-        if self.num_tokens > 0:
-            self.uncond_token_mask[: self.num_tokens].copy_(
-                self.uncond_token_mask_cpu[: self.num_tokens], non_blocking=True
+        if self._num_tokens > 0:
+            self.uncond_token_mask[: self._num_tokens].copy_(
+                self.uncond_token_mask_cpu[: self._num_tokens], non_blocking=True
             )
         # Always update GPU scalar tensors (CUDA graph reads these at runtime)
         self.num_cfg_pairs_gpu.fill_(self._num_cfg_pairs)
-        self.num_tokens_gpu.fill_(self.num_tokens)
+        self.num_tokens_gpu.fill_(self._num_tokens)
 
-    def get_metadata(self) -> CFGMetadata:
+    def get_metadata(self, padded_num_tokens: int) -> CFGMetadata:
         """Get CFGMetadata from the current buffer state.
 
         Always returns valid metadata. If there are no CFG pairs,
         the num_cfg_pairs GPU tensor will contain 0 and kernels will
         early-exit. This is required for CUDA graph compatibility.
+
+        Args:
+            padded_num_tokens: The padded num_input_tokens for this step.
+                During CUDA graph capture this is the graph capture size;
+                during replay the graph's baked-in grid is used so the
+                value here doesn't matter.  Used for kernel grid sizing
+                so that each captured graph has a right-sized grid
+                instead of always using the absolute maximum.
         """
         return CFGMetadata(
             guidance_scales=self.guidance_scales,
@@ -215,6 +225,5 @@ class CFGBuffers:
             uncond_logits_indices=self.uncond_logits_indices,
             num_cfg_pairs=self.num_cfg_pairs_gpu,
             num_tokens=self.num_tokens_gpu,
-            max_num_reqs=self.max_num_reqs,
-            max_num_tokens=self.max_num_tokens,
+            padded_num_tokens=padded_num_tokens,
         )
