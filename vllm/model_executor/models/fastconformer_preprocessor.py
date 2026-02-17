@@ -217,6 +217,11 @@ class MelSpectrogramLayer(CustomOp, AttentionLayerBase):
         # output_divisor internally, no need for pre-computed output positions
         return FastConformerConvBackend
 
+    @property
+    def output_elements_per_token(self) -> int:
+        """Number of output frames produced per input token."""
+        return self.time_factor // self.hop_length
+
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return FastConformerConvSpec(
             block_size=1,
@@ -254,7 +259,7 @@ def mel_spec_fwd_fake(
 direct_register_custom_op(
     op_name="mel_spec_layer",
     op_func=mel_spec_fwd,
-    fake_impl=mel_spec_fwd,
+    fake_impl=mel_spec_fwd_fake,
 )
 
 
@@ -386,6 +391,11 @@ class Conv2dLayer(CustomOp, AttentionLayerBase):
             metadata=attn_metadata,
         )
         return out
+
+    @property
+    def output_elements_per_token(self) -> int:
+        """Number of output time steps produced per input token."""
+        return self.time_factor // self.stride
 
     def get_attn_backend(self) -> AttentionBackend:
         # Use FastConformerConvBackend - kernel handles time_factor and
@@ -558,7 +568,7 @@ class FastConformerPreprocessor(nn.Module):
         """
         mel = self.mel_spec(audio.view(-1))  # frames x freq_bins
         emb = self.pre_encode(mel)  # frames/8 x 512
-        return emb
+        return emb, mel
 
     def load_weights(self, nemo: dict[str, torch.Tensor]):
         """Load weights from FastConformer checkpoint."""

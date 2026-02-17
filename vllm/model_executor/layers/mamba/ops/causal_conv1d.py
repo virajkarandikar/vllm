@@ -123,6 +123,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     token_offset = BLOCK_M * chunk_offset
     segment_len = min(BLOCK_M, seqlen - token_offset)
 
+    # Skip if this chunk is beyond the actual sequence length.
+    # This happens when metadata is shared across layers with different
+    # temporal expansion factors (e.g., FastConformer preprocessing).
+    if segment_len <= 0:
+        return
+
     # base of the sequence
     x_base = (
         x_ptr + sequence_start_index * stride_x_token + idx_feats * stride_x_dim

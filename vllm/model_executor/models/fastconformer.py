@@ -308,6 +308,11 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
         y_out = F.linear(y_act.transpose(0, 1), w2, b2)
         return y_out
 
+    @property
+    def output_elements_per_token(self) -> int:
+        """Conv1d: 1 output per input token (no temporal expansion)."""
+        return 1
+
     def get_attn_backend(self) -> AttentionBackend:
         return FastConformerConvBackend
 
@@ -320,7 +325,6 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
             shape=(self.left_shape, self.d_model),
             dtype=self.dtype,
         )
-
 
 
 def fastconformer_conv_fwd(
@@ -448,14 +452,16 @@ class FastConformerCTC(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = self.preprocessor(audio)
+        emb, mel = self.preprocessor(audio)
         if self.xscale:
-            x = x * self.xscale
+            emb = emb * self.xscale
+        x = emb
         for blk in self.blocks:
             x = blk(x)
         if self.adapter is not None:
             x = self.adapter(x)
-        return x, x
+        #print(f"x {x.shape}, emb {emb.shape}, mel {mel.shape}", flush=True)
+        return x, x, emb, mel.view(-1, 8, 128)
 
     def compute_logits(
         self,
