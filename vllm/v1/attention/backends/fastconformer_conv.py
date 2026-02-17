@@ -46,6 +46,9 @@ class FastConformerConvMetadata:
     query_start_loc: torch.Tensor  # [num_seqs+1]
     slot_mapping: torch.Tensor  # [num_seqs]
     block_table_tensor: torch.Tensor  # [num_seqs, num_blocks]
+    # 1 for requests with valid cache history (decode), 0 for true prefill.
+    # Kept as a pre-allocated static-size tensor for CUDA graph compatibility.
+    has_initial_state: Optional[torch.Tensor] = None
 
     # These attributes are for triton implementation of causal_conv1d.
     # nums_dict is structured as expected by causal_conv1d_fn.
@@ -108,6 +111,9 @@ class FastConformerConvMetadataBuilder(AttentionMetadataBuilder):
         self.offset_cpu = torch.empty(
             (self.max_num_programs,), dtype=torch.int32, device="cpu", pin_memory=True
         )
+        self.has_initial_state_cpu = torch.empty(
+            (self.max_num_seqs,), dtype=torch.bool, device="cpu", pin_memory=True
+        )
 
         # Pre-allocate GPU buffers for causal_conv1d metadata
         self.batch_ptr = torch.full(
@@ -121,6 +127,9 @@ class FastConformerConvMetadataBuilder(AttentionMetadataBuilder):
             PAD_SLOT_ID,
             dtype=torch.int32,
             device=device,
+        )
+        self.has_initial_state = torch.ones(
+            (self.max_num_seqs,), dtype=torch.bool, device=device
         )
 
         # Track the previous mlist_len to efficiently clear stale entries
@@ -261,11 +270,21 @@ class FastConformerConvMetadataBuilder(AttentionMetadataBuilder):
             self.nums_dict[self.BLOCK_M]["mlist_len"] = 0
             self.nums_dict[self.BLOCK_M]["offsetlist"] = self.offset_cpu[:0]
 
+        # Build a per-request "has initial cache state" vector:
+        #   1 => decode (num_computed_tokens > 0)
+        #   0 => true prefill (must treat old cache as zeros)
+        num_computed_tokens_cpu = common_attn_metadata.num_computed_tokens_cpu[:num_reqs]
+        torch.gt(num_computed_tokens_cpu, 0, out=self.has_initial_state_cpu[:num_reqs])
+        self.has_initial_state[:num_reqs].copy_(
+            self.has_initial_state_cpu[:num_reqs], non_blocking=True
+        )
+
         return FastConformerConvMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             query_start_loc=query_start_loc,
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table_tensor=common_attn_metadata.block_table_tensor,
+            has_initial_state=self.has_initial_state,
             nums_dict=self.nums_dict,
             batch_ptr=self.batch_ptr,
             token_chunk_offset_ptr=self.token_chunk_offset_ptr,

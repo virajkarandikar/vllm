@@ -368,10 +368,13 @@ class Conv2dLayer(CustomOp, AttentionLayerBase):
 
         query_start_loc = attn_metadata.query_start_loc
 
-        # True if cache has valid data (decode), False for first call (prefill)
-        has_initial_state = torch.ones(
-            page_indices.size(0), dtype=torch.bool, device=x.device
-        )
+        # Use metadata-driven cache validity for CUDA-graph-safe prefill behavior.
+        if attn_metadata.has_initial_state is not None:
+            has_initial_state = attn_metadata.has_initial_state[: page_indices.size(0)]
+        else:
+            has_initial_state = torch.ones(
+                page_indices.size(0), dtype=torch.bool, device=x.device
+            )
 
         out = torch.empty(
             (out_seq_len, out_freq, self.channels), device=x.device, dtype=x.dtype

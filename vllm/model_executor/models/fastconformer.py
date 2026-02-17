@@ -279,9 +279,12 @@ class ConformerConvModule(CustomOp, AttentionLayerBase):
 
         query_start_loc = attn_metadata.query_start_loc
 
-        has_initial_state = torch.ones(
-            page_indices.size(0), dtype=torch.bool, device=pre_dw_2d.device
-        )
+        if attn_metadata.has_initial_state is not None:
+            has_initial_state = attn_metadata.has_initial_state[: page_indices.size(0)]
+        else:
+            has_initial_state = torch.ones(
+                page_indices.size(0), dtype=torch.bool, device=pre_dw_2d.device
+            )
 
         y_dw_2d = causal_conv1d_fn(  # dim x cu_seq_len
             pre_dw_2d,
