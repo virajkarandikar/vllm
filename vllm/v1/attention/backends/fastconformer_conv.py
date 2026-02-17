@@ -71,10 +71,25 @@ class FastConformerConvMetadataBuilder(AttentionMetadataBuilder):
         self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.compilation_config = vllm_config.compilation_config
 
+        # Compute the max expansion factor across all layers in this group.
+        # Preprocessing layers (STFT, Conv2d) produce multiple output elements
+        # per token due to time_factor/output_divisor.  The program count must
+        # cover the worst-case layer so that all output elements are processed.
+        static_ctx = self.compilation_config.static_forward_context
+        max_expansion = 1
+        for name in layer_names:
+            layer = static_ctx.get(name)
+            if layer is not None and hasattr(layer, "output_elements_per_token"):
+                max_expansion = max(max_expansion,
+                                    layer.output_elements_per_token)
+        self.max_expansion_factor = max_expansion
+
         # Estimate max number of programs needed.
-        # Each sequence can have at most ceil(max_model_len / BLOCK_M) chunks.
+        # Each sequence can have at most
+        # ceil(max_model_len * expansion / BLOCK_M) chunks.
         max_model_len = vllm_config.model_config.max_model_len
-        max_chunks_per_seq = (max_model_len + self.BLOCK_M - 1) // self.BLOCK_M
+        max_effective_len = max_model_len * self.max_expansion_factor
+        max_chunks_per_seq = (max_effective_len + self.BLOCK_M - 1) // self.BLOCK_M
         self.max_num_programs = max(1024, self.max_num_seqs * max_chunks_per_seq) * 2
 
         # Pre-allocate CPU (pinned) scratch buffers to avoid per-call allocations.
@@ -108,6 +123,12 @@ class FastConformerConvMetadataBuilder(AttentionMetadataBuilder):
             device=device,
         )
 
+        # Track the previous mlist_len to efficiently clear stale entries
+        # in batch_ptr/token_chunk_offset_ptr for CUDA graph correctness.
+        # When the grid is frozen at capture time and replayed with fewer
+        # programs, excess programs must read PAD_SLOT_ID to return early.
+        self._prev_mlist_len = 0
+
         # Pre-allocate the nums_dict structure that causal_conv1d_fn expects.
         # This dict is keyed by BLOCK_M and contains pre-allocated tensors.
         self.nums_dict: dict = {
@@ -139,6 +160,13 @@ class FastConformerConvMetadataBuilder(AttentionMetadataBuilder):
             query_start_loc_cpu[:num_reqs],
             out=seqlens,
         )
+
+        # Scale by max expansion factor so that preprocessing layers
+        # (STFT, Conv2d) that produce multiple output elements per token
+        # get enough programs.  Layers with lower expansion simply skip
+        # the extra programs (chunk_len <= 0 → early return in kernel).
+        if self.max_expansion_factor > 1:
+            seqlens = seqlens * self.max_expansion_factor
 
         # Ceil divide by BLOCK_M without creating new tensors.
         tmp = self._tmp_cpu[:num_reqs]
@@ -198,6 +226,20 @@ class FastConformerConvMetadataBuilder(AttentionMetadataBuilder):
                 self.offset_cpu[:mlist_len], non_blocking=True
             )
 
+            # Clear stale entries beyond current batch.  When a CUDA graph
+            # is replayed, the grid size is frozen at capture time.  Excess
+            # programs (those with index >= current mlist_len) must read
+            # PAD_SLOT_ID so they return early instead of processing stale
+            # sequence indices and corrupting the conv/stft cache state.
+            if mlist_len < self._prev_mlist_len:
+                self.batch_ptr[mlist_len:self._prev_mlist_len].fill_(
+                    PAD_SLOT_ID
+                )
+                self.token_chunk_offset_ptr[
+                    mlist_len:self._prev_mlist_len
+                ].fill_(PAD_SLOT_ID)
+            self._prev_mlist_len = mlist_len
+
             # Update the nums_dict in-place with computed values
             self.nums_dict[self.BLOCK_M]["nums"] = nums
             self.nums_dict[self.BLOCK_M]["tot"] = mlist_len
@@ -205,7 +247,14 @@ class FastConformerConvMetadataBuilder(AttentionMetadataBuilder):
             self.nums_dict[self.BLOCK_M]["mlist_len"] = mlist_len
             self.nums_dict[self.BLOCK_M]["offsetlist"] = self.offset_cpu[:mlist_len]
         else:
-            # Empty batch case
+            # Empty batch case — clear any stale GPU data
+            if self._prev_mlist_len > 0:
+                self.batch_ptr[:self._prev_mlist_len].fill_(PAD_SLOT_ID)
+                self.token_chunk_offset_ptr[
+                    :self._prev_mlist_len
+                ].fill_(PAD_SLOT_ID)
+            self._prev_mlist_len = 0
+
             self.nums_dict[self.BLOCK_M]["nums"] = nums
             self.nums_dict[self.BLOCK_M]["tot"] = 0
             self.nums_dict[self.BLOCK_M]["mlist"] = self.mlist_cpu[:0]
