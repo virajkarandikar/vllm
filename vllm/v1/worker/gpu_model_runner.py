@@ -511,9 +511,12 @@ class GPUModelRunner(
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
-        self.sampler = Sampler(
-            logprobs_mode=self.model_config.logprobs_mode,
-            use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+        self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        # Number of dummy tokens produced per step when skip_sampling=True.
+        # Allows non-autoregressive models (e.g. FastConformer) to process
+        # multiple frames per decode step.
+        self.num_output_tokens_per_step: int = getattr(
+            model_config.hf_config, "num_output_tokens_per_step", 1
         )
 
         self.eplb_state: EplbState | None = None
@@ -896,7 +899,7 @@ class GPUModelRunner(
         self._draft_token_req_ids: list[str] | None = None
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
-            (self.max_num_reqs, 1),
+            (self.max_num_reqs, max(self.num_output_tokens_per_step, 1)),
             dtype=torch.int64,
             device="cpu",
             pin_memory=PIN_MEMORY,
@@ -3809,8 +3812,9 @@ class GPUModelRunner(
         self.input_batch.update_async_output_token_ids()
         if sampling_metadata.skip_sampling:
             num_reqs = self.input_batch.num_reqs
+            n = self.num_output_tokens_per_step
             return SamplerOutput(
-                sampled_token_ids=torch.zeros((num_reqs, 1), dtype=torch.int32, device="cpu"),
+                sampled_token_ids=torch.zeros((num_reqs, n), dtype=torch.int32, device="cpu"),
                 logprobs_tensors=None,
             )
         elif spec_decode_metadata is None:
@@ -3900,6 +3904,10 @@ class GPUModelRunner(
 
                 if logprobs_tensors is not None:
                     logprobs_lists = logprobs_tensors.tolists()
+            elif sampling_metadata.skip_sampling:
+                # Multi-token skip_sampling (non-autoregressive models).
+                # The tensor is already on CPU, just convert to list.
+                valid_sampled_token_ids = sampled_token_ids.tolist()
             else:
                 # Includes spec decode tokens.
                 valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
@@ -3912,6 +3920,7 @@ class GPUModelRunner(
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
+            assert sampled_token_ids.shape[-1] == 1 or sampling_metadata.skip_sampling
 
             # Cache the sampled tokens on the GPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
@@ -6378,8 +6387,9 @@ class GPUModelRunner(
         )
         try:
             if skip_sampling:
+                n = self.num_output_tokens_per_step
                 sampler_output = SamplerOutput(
-                    sampled_token_ids=torch.zeros((num_reqs, 1), dtype=torch.int32, device="cpu"),
+                    sampled_token_ids=torch.zeros((num_reqs, n), dtype=torch.int32, device="cpu"),
                     logprobs_tensors=None,
                 )
             else:
