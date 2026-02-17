@@ -633,8 +633,12 @@ class FastConformerConvSpec(KVCacheSpec):
         return prod(self.shape) * get_dtype_size(self.dtype)
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
-        max_model_len = vllm_config.model_config.max_model_len
-        return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+        # Conv/mel/stft layers use a fixed-size ring buffer: only 1 block
+        # is ever accessed per request (block_table[:, 0]), regardless of
+        # sequence length.  Reporting more than 1 block here would cause
+        # vLLM to massively over-estimate KV-cache memory requirements
+        # (max_model_len * page_size_bytes instead of just page_size_bytes).
+        return self.page_size_bytes
 
     def __hash__(self) -> int:
         # Hash by block_size, page_size_bytes, and dtype - not shape
