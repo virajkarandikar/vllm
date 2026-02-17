@@ -8,9 +8,8 @@ import numpy as np
 # CACHED VERSION: Supports cache (stft_state) for streaming execution
 # =============================================================================
 # Simplified version that ALWAYS uses cache:
-# - Cache is always read (zeros for first call / prefill)
+# - Cache is read only when has_initial_state indicates valid history
 # - Cache is always updated with last samples after processing
-# - No has_initial_state needed - just initialize cache to zeros before first use
 #
 # Cache size = N_FFT - HOP (the overlap between consecutive STFT frames)
 # Virtual input = [cache | new_samples], so for streaming:
@@ -37,6 +36,7 @@ def stft_cached_kernel(
     # Cache pointers
     stft_state_ptr,         # Cache: (num_cache_lines, CACHE_LEN) - stores last N_FFT-HOP samples
     cache_indices_ptr,      # (batch,) int32 - maps sequence to cache line index
+    has_initial_state_ptr,  # (batch,) int32 - 1: decode(has cache), 0: prefill(no cache)
     # Sequence mapping (from FastConformerConvMetadata)
     batch_ptr,              # (num_programs,) maps program_id -> sequence index
     time_chunk_offset_ptr,  # (num_programs,) maps program_id -> chunk index
@@ -58,6 +58,7 @@ def stft_cached_kernel(
     OUTPUT_DIVISOR: tl.constexpr,  # Divide sample positions to get frame positions
     pad_slot_id: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
+    HAS_INITIAL_STATE: tl.constexpr,
 ):
     """
     Varlen STFT magnitude kernel with cache support for streaming execution.
@@ -149,6 +150,9 @@ def stft_cached_kernel(
     # Step 6: Cache base pointer
     # ==========================================================================
     cache_base = stft_state_ptr + cache_idx * stride_cache_seq
+    has_initial_state = 1
+    if HAS_INITIAL_STATE:
+        has_initial_state = tl.load(has_initial_state_ptr + idx_seq).to(tl.int32)
     
     # ==========================================================================
     # Step 7: Process frames in this chunk
@@ -178,7 +182,7 @@ def stft_cached_kernel(
         cache_read_pos = tl.where(is_from_cache, virtual_pos, 0)
         cache_vals = tl.load(
             cache_base + cache_read_pos * stride_cache_sample,
-            mask=is_from_cache & valid_pos & valid_frame,
+            mask=is_from_cache & valid_pos & valid_frame & (has_initial_state > 0),
             other=0.0
         )
         
@@ -244,7 +248,7 @@ def stft_cached_kernel(
         old_cache_pos = tl.where(is_from_old_cache, virtual_pos_for_cache, 0)
         old_cache_vals = tl.load(
             cache_base + old_cache_pos * stride_cache_sample,
-            mask=cache_mask & is_from_old_cache,
+            mask=cache_mask & is_from_old_cache & (has_initial_state > 0),
             other=0.0
         )
         
@@ -355,6 +359,11 @@ def stft_cached(
         # Use pre-computed values from FastConformerConvMetadata (no CPU blocking)
         batch_ptr = metadata.batch_ptr
         time_chunk_offset_ptr = metadata.token_chunk_offset_ptr
+        has_initial_state_ptr = (
+            metadata.has_initial_state
+            if hasattr(metadata, "has_initial_state")
+            else None
+        )
         
         # Get num_programs from metadata if available
         if hasattr(metadata, 'nums_dict') and metadata.nums_dict is not None:
@@ -373,6 +382,7 @@ def stft_cached(
     else:
         # Compute on the fly (CPU blocking - not safe for CUDA graphs)
         query_start_loc_cpu = query_start_loc.cpu()
+        has_initial_state_ptr = None
         
         # Scale by time_factor to get sample lengths
         seqlens_samples = (query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]) * time_factor
@@ -420,7 +430,7 @@ def stft_cached(
     
     stft_cached_kernel[grid](
         x, w_real, w_imag, out,
-        stft_state, cache_indices,
+        stft_state, cache_indices, has_initial_state_ptr if has_initial_state_ptr is not None else cache_indices,
         batch_ptr, time_chunk_offset_ptr,
         query_start_loc,
         w_real.stride(0), w_real.stride(1),
@@ -437,6 +447,7 @@ def stft_cached(
         OUTPUT_DIVISOR=output_divisor,
         pad_slot_id=pad_slot_id,
         USE_PAD_SLOT=pad_slot_id is not None,
+        HAS_INITIAL_STATE=has_initial_state_ptr is not None,
     )
     
     return out
