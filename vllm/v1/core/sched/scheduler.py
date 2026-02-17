@@ -1056,6 +1056,9 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        if self.await_inputs and request.custom_inputs is not None:
+            request.custom_inputs_num_consumed = 0
+            request.custom_inputs_ready = True
         if request.spec_token_ids:
             request.spec_token_ids = []
         request.num_preemptions += 1
