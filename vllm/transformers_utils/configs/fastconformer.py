@@ -46,4 +46,9 @@ class FastConformerCTCConfig(PretrainedConfig):
         self.tokenizer = tokenizer if tokenizer is not None else {}
         self.notes = notes
         self.adapted_dimension = adapted_dimension
+        # Number of dummy output tokens produced per step when skip_sampling
+        # is True. Controls how many frames are processed per decode step.
+        self.num_output_tokens_per_step = kwargs.pop(
+            "num_output_tokens_per_step", 1
+        )
         super().__init__(**kwargs)
