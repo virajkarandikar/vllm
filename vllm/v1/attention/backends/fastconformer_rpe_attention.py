@@ -8,12 +8,12 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from vllm.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
 reshape_and_cache_flash = triton_reshape_and_cache_flash
 
-from vllm.v1.attention.backends.utils import AttentionCGSupport
-from vllm.attention.backends.abstract import (
+from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport
     AttentionImpl,
     AttentionMetadata,
     AttentionType,

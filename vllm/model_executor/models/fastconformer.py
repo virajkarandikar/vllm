@@ -13,7 +13,7 @@ import math
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.config import VllmConfig, CacheConfig, SchedulerConfig, get_current_vllm_config
 from vllm.model_executor.custom_op import CustomOp
-from vllm.attention.layer import Attention
+from vllm.model_executor.layers.attention import Attention
 from vllm.sequence import IntermediateTensors
 from vllm.compilation.decorators import support_torch_compile
 
@@ -22,7 +22,7 @@ from vllm.v1.attention.backends.fastconformer_conv import (
     FastConformerConvMetadata,
 )
 from vllm.forward_context import get_forward_context
-from vllm.attention.backends.abstract import AttentionBackend
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.fastconformer_rpe_attention import (
     FastConformerRPEBackend,
 )

@@ -5,11 +5,12 @@ from typing import ClassVar, Optional
 
 import torch
 
-from vllm.attention.backends.abstract import AttentionBackend, AttentionMetadata
-from vllm.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.config import VllmConfig
-from vllm.v1.attention.backends.utils import (
+from vllm.v1.attention.backend import (
+    AttentionBackend, 
     AttentionCGSupport,
+    AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
