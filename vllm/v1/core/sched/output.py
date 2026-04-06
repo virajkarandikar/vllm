@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+import torch
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -124,6 +126,7 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    new_input_embeds: list[torch.Tensor]
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:

@@ -1215,6 +1215,8 @@ class GPUModelRunner(
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
                 prompt_is_token_ids=new_req_data.prompt_is_token_ids,
+                # for a new request, use prompt embeds
+                next_input_embeds=None,
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
@@ -1276,6 +1278,7 @@ class GPUModelRunner(
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
+            req_state.next_input_embeds = req_data.new_input_embeds[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
             if req_state.prev_num_draft_len and self.use_async_scheduling:
@@ -1971,6 +1974,36 @@ class GPUModelRunner(
                         output_idx : output_idx + actual_num_sched
                     ].copy_(req_embeds[start_pos:actual_end])
 
+                output_idx += num_sched
+
+        # same as with `req_prompt_embeds`, copy the explicitly
+        # provided input embeddings to `self.inputs_embeds`
+        # TODO: can this iteration be combined with the one for `req_prompt_embeds`?
+        if self.input_batch.req_next_embeds:
+            output_idx = 0
+            for req_idx in range(num_reqs):
+                num_sched = num_scheduled_tokens[req_idx]
+
+                # skip request if it doesnt have embeddings
+                if req_idx not in self.input_batch.req_next_embeds:
+                    output_idx += num_sched
+                    continue
+
+                # Skip if no tokens scheduled
+                if num_sched <= 0:
+                    output_idx += num_sched
+                    continue
+
+                next_embeds = self.input_batch.req_next_embeds[req_idx]
+                if next_embeds is None:
+                    output_idx += num_sched
+                    continue
+
+                if next_embeds.shape[0] != num_sched:
+                    raise RuntimeError(f"Expected {num_sched} embeddings for request {req_idx}, but got {next_embeds.shape[0]}")
+
+                self.inputs_embeds.cpu[output_idx : output_idx + num_sched].copy_(next_embeds)
+                self.is_token_ids.cpu[output_idx : output_idx + num_sched] = False
                 output_idx += num_sched
 
         # Prepare the attention metadata.

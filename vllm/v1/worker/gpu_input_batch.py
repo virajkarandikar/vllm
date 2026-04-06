@@ -49,6 +49,7 @@ class CachedRequestState:
 
     lora_request: LoRARequest | None = None
     prompt_embeds: torch.Tensor | None = None
+    next_input_embeds: torch.Tensor | None = None
     # To accumulate prompt logprobs tensor chunks across prefill steps.
     in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None
 
@@ -145,6 +146,7 @@ class InputBatch:
         # allocation if max_model_len is big.
         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
         self.req_prompt_embeds: dict[int, torch.Tensor] = {}
+        self.req_next_embeds: dict[int, torch.Tensor] = {}
         self.num_tokens_no_spec_cpu_tensor = torch.zeros(
             (max_num_reqs,),
             device="cpu",
@@ -369,6 +371,8 @@ class InputBatch:
             self.is_token_ids[req_index, :num_prompt_tokens] = False
         if request.prompt_embeds is not None:
             self.req_prompt_embeds[req_index] = request.prompt_embeds
+        if request.next_input_embeds is not None:
+            self.req_next_embeds[req_index] = request.next_input_embeds
         self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
         self.is_token_ids[req_index, start_idx:end_idx] = True
         # Number of tokens without spec decode tokens.
@@ -624,6 +628,17 @@ class InputBatch:
             self.req_prompt_embeds[i1] = embeds_i2
         else:
             self.req_prompt_embeds.pop(i1, None)
+        # swap next input embeddings if they exist
+        next_embeds_i1 = self.req_next_embeds.get(i1)
+        next_embeds_i2 = self.req_next_embeds.get(i2)
+        if next_embeds_i1 is not None:
+            self.req_next_embeds[i2] = next_embeds_i1
+        else:
+            self.req_next_embeds.pop(i2, None)
+        if next_embeds_i2 is not None:
+            self.req_next_embeds[i1] = next_embeds_i2
+        else:
+            self.req_next_embeds.pop(i1, None)
 
         self.block_table.swap_row(i1, i2)
 
@@ -745,6 +760,10 @@ class InputBatch:
             ]
             if last_req_index in self.req_prompt_embeds:
                 self.req_prompt_embeds[empty_index] = self.req_prompt_embeds.pop(
+                    last_req_index
+                )
+            if last_req_index in self.req_next_embeds:
+                self.req_next_embeds[empty_index] = self.req_next_embeds.pop(
                     last_req_index
                 )
             self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -124,6 +125,10 @@ class Request:
         # prompt_embeds). `None` except when both `prompt_token_ids` and
         # `prompt_embeds` are set and their positions are interleaved.
         self.prompt_is_token_ids = prompt_is_token_ids
+        self.next_input_embeds: torch.Tensor | None = None
+        # for a running request, scheduler will wait for event to be set.
+        # for new request, prompt embeds are used
+        self._next_input_embeds_ready = threading.Event()
         # Cache per-block prompt-embed hashes to avoid rehashing the same
         # tensor slices when generating extra keys.
         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
@@ -297,6 +302,19 @@ class Request:
         prefill_stats = self.prefill_stats
         self.prefill_stats = None
         return prefill_stats
+
+    def set_next_input_embeds(self, input_embeds: torch.Tensor) -> None:
+        self.next_input_embeds = input_embeds
+        self._next_input_embeds_ready.set()
+
+    def read_next_input_embeds(self) -> torch.Tensor | None:
+        # clear, so request does not get scheduled again, before
+        # another `set_next_input_embeds` is called
+        self._next_input_embeds_ready.clear()
+        return self.next_input_embeds
+
+    def has_next_input_embeds(self) -> bool:
+        return self._next_input_embeds_ready.is_set()
 
     def __lt__(self, other: "Request") -> bool:
         """
