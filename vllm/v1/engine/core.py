@@ -239,8 +239,6 @@ class EngineCore:
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
-        print(f"debug: kv_cache_specs: {kv_cache_specs}")
-
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
@@ -267,7 +265,6 @@ class EngineCore:
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
-        print(f"debug: kv_cache_configs: {kv_cache_configs}")
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling

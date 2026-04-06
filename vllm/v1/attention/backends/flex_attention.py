@@ -42,10 +42,12 @@ from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 logger = init_logger(__name__)
 
 torch._dynamo.config.recompile_limit = 16
-create_block_mask_compiled = torch.compile(
-    create_block_mask, fullgraph=True, mode="reduce-overhead"
-)
-flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
+# create_block_mask_compiled = torch.compile(
+#     create_block_mask, fullgraph=True, mode="reduce-overhead"
+# )
+# flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
+create_block_mask_compiled = create_block_mask
+flex_attention_compiled = flex_attention
 
 
 def _offsets_to_doc_ids_tensor(
@@ -567,10 +569,12 @@ class FlexAttentionMetadata:
             mask_mod = self.get_bidirectional_mask_mod()
         # stage-2: add external mask_mod for special attention during
         # forwarding runtime to create the combined mask_mod.
-        if self.sliding_window is not None:
-            # Add sliding window mask for sliding window attention
-            sliding_window_mask_mod = self.get_sliding_window_mask_mod()
-            mask_mod = and_masks(mask_mod, sliding_window_mask_mod)
+
+        # TODO: remove after debugging...
+        # if self.sliding_window is not None:
+        #     # Add sliding window mask for sliding window attention
+        #     sliding_window_mask_mod = self.get_sliding_window_mask_mod()
+        #     mask_mod = and_masks(mask_mod, sliding_window_mask_mod)
         if self.mm_prefix_range:
             # Add prefix LM mask for vision-language prefix LM attention
             prefix_lm_mask_mod = self.get_prefix_lm_mask_mod()
@@ -1107,12 +1111,13 @@ class FlexAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         needs_rebuild_block_mask = False
-        if attn_metadata.sliding_window != self.sliding_window:
-            attn_metadata.sliding_window = self.sliding_window
-            if attn_metadata.direct_build:
-                # update mask mod in attention metadata
-                attn_metadata.mask_mod = attn_metadata.get_mask_mod()
-            needs_rebuild_block_mask = True
+        # TODO: just debugging....
+        # if attn_metadata.sliding_window != self.sliding_window:
+        #     attn_metadata.sliding_window = self.sliding_window
+        #     if attn_metadata.direct_build:
+        #         # update mask mod in attention metadata
+        #         attn_metadata.mask_mod = attn_metadata.get_mask_mod()
+        #     needs_rebuild_block_mask = True
 
         if self.mm_prefix_range != getattr(attn_metadata, "mm_prefix_range", None):
             self.mm_prefix_range = attn_metadata.mm_prefix_range
