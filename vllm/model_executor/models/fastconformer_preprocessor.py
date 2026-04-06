@@ -22,7 +22,7 @@ import numpy as np
 import math
 
 from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
-from vllm.attention.backends.abstract import AttentionBackend
+from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.fastconformer_conv import (
     FastConformerConvBackend,
     FastConformerConvMetadata,
@@ -33,7 +33,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerConvSpec
 from vllm.model_executor.layers.conv import depthwise_strided_conv2d_cached, stft_cached
 from vllm.forward_context import get_forward_context
 from vllm.sequence import IntermediateTensors
-from vllm.utils import direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.compilation.decorators import support_torch_compile
 
 
