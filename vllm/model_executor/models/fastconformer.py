@@ -7,8 +7,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from vllm.config import VllmConfig
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.sequence import IntermediateTensors
+
+from vllm.v1.attention.backends.fastconformer_attn import (
+    FastConformerBackend,
+    FastConformerMetadata,
+)
+from vllm.forward_context import get_forward_context
+from vllm.attention.backends.abstract import AttentionBackend
+from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerSpec
 
 from vllm.transformers_utils.configs.fastconformer import FastConformerCTCConfig
 import math
@@ -24,13 +33,6 @@ def build_local_band_mask(T: int, window: int, device, dtype) -> torch.Tensor:
 
 
 class NemoSubsample8x2D(nn.Module):
-    """
-    Exact NeMo-style 2D subsampler for FastConformer:
-      - Input (no batch): [T, F] with F=mels (typically 80)
-      - Output: [T/8, D] with D=d_out (512)
-      - Matches checkpoint keys:
-        encoder.pre_encode.conv.{0,2,3,5,6}.* and encoder.pre_encode.out.*
-    """
     def __init__(self, d_out: int, mels: int = 80):
         super().__init__()
         self.mels = mels
@@ -76,9 +78,44 @@ class ConformerFFN(nn.Module):
         return x + self.drop(y) * scale
 
 
+class FastConformerCache(torch.nn.Module, AttentionLayerBase):
+    def __init__(
+        self,
+        sliding_window: int,
+        num_kv_heads: int,
+        head_dim: int,
+        prefix: str,
+    ):
+        super().__init__()
+        self.kv_cache = [torch.tensor([])]
+        self.head_dim = head_dim
+        self.prefix = prefix
+        self.dtype = torch.bfloat16
+        self.sliding_window = sliding_window
+        self.num_kv_heads = num_kv_heads
+        compilation_config = get_current_vllm_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
+    def get_kv_cache_spec(self) -> KVCacheSpec:
+        return FastConformerSpec(
+            block_size=self.sliding_window, # `block_size` controls the shape of the KV cache
+            sliding_window=self.sliding_window,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            dtype=self.dtype,
+        )
+
+    def forward(self): ...
+
+    def get_attn_backend(self) -> AttentionBackend:
+        return FastConformerBackend
+
+
 class RelPosSelfAttention(nn.Module):
     """scores = (q + u) @ k^T + (q + v) @ r^T."""
-    def __init__(self, d_model: int, num_heads: int, window: int):
+    def __init__(self, d_model: int, num_heads: int, window: int, prefix: str):
         super().__init__()
         assert d_model % num_heads == 0
         self.h = num_heads
@@ -93,6 +130,16 @@ class RelPosSelfAttention(nn.Module):
         self.linear_pos = nn.Linear(d_model, d_model, bias=False)
         self.pos_bias_u = nn.Parameter(torch.zeros(self.h, self.dh))
         self.pos_bias_v = nn.Parameter(torch.zeros(self.h, self.dh))
+
+        self.prefix = prefix
+        self.cache_prefix = f"{self.prefix}.kv_cache"
+
+        self.cache = FastConformerCache(
+            sliding_window=self.window,
+            num_kv_heads=self.h,
+            head_dim=self.dh,
+            prefix=self.cache_prefix,
+        )
 
     @staticmethod
     def _build_rel_sin_table(T: int, D: int, device, dtype):
@@ -117,6 +164,14 @@ class RelPosSelfAttention(nn.Module):
         return x[:, :T]                            # [H, T, T]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata is None:
+            # NOTE: attention metadata is not populated for dummy runs
+            return self.forward_no_cache(x)
+        else:
+            return self.forward_cache(x, attn_metadata[self.cache_prefix])
+
+    def forward_no_cache(self, x: torch.Tensor) -> torch.Tensor:
         T, D = x.shape
         H, Dh = self.h, self.dh
 
@@ -124,24 +179,65 @@ class RelPosSelfAttention(nn.Module):
         k = self.k_proj(x).view(T, H, Dh).permute(1, 0, 2)  # [H, T, Dh]
         v = self.v_proj(x).view(T, H, Dh).permute(1, 0, 2)  # [H, T, Dh]
 
+        return self._attention_forward(q, k, v)
+
+    def forward_cache(self, x: torch.Tensor, ctx: FastConformerMetadata) -> torch.Tensor:
+        T, D = x.shape
+        H, Dh = self.h, self.dh
+
+        q = self.q_proj(x).view(T, H, Dh).permute(1, 0, 2)      # [H, T, Dh]
+
+        assert ctx.num_reqs == 1, "bsz>1 not supported yet"
+        page_idx = ctx.slot_mapping[0]
+
+        with torch.no_grad():
+            kv_cache = self.cache.kv_cache[0]  # (2, n_pages, window, H, Dh)
+            k_cache = kv_cache[0][page_idx]  # [window, H, Dh]
+            v_cache = kv_cache[1][page_idx]  # [window, H, Dh]
+
+        k_new = self.k_proj(x).view(T, H, Dh).permute(1, 0, 2)  # [H, T, Dh]
+        v_new = self.v_proj(x).view(T, H, Dh).permute(1, 0, 2)  # [H, T, Dh]
+
+        # k_cat, v_cat: [H, window+T, Dh]
+        k_cat = torch.cat([k_cache.permute(1, 0, 2).reshape(H, -1, Dh), k_new], dim=1)
+        v_cat = torch.cat([v_cache.permute(1, 0, 2).reshape(H, -1, Dh), v_new], dim=1)
+
+        # update cache by rolling left
+        # TODO: this is unoptimized
+        new_k_cache = torch.cat([k_cache[T:], k_new.permute(1, 0, 2)], dim=0)   # [window, H, Dh]
+        new_v_cache = torch.cat([v_cache[T:], v_new.permute(1, 0, 2)], dim=0)   # [window, H, Dh]
+        with torch.no_grad():
+            self.cache.kv_cache[0][0][page_idx] = new_k_cache
+            self.cache.kv_cache[0][1][page_idx] = new_v_cache
+
+        return self._attention_forward(q, k_cat, v_cat)
+
+    def _attention_forward(self, q, k, v) -> torch.Tensor:
+        # q: [H, T, Dh], k/v: [H, S, Dh]
+        H, T, Dh = q.shape
+        S = k.shape[1]
+        D = H * Dh
+        device = q.device
+        dtype = q.dtype
+
         # (q + u) @ k^T
         q_with_u = q + self.pos_bias_u.unsqueeze(1)         # [H, T, Dh]
-        content_scores = torch.matmul(q_with_u, k.transpose(-2, -1))  # [H, T, T]
+        content_scores = torch.matmul(q_with_u, k.transpose(-2, -1))  # [H, T, S]
 
-        rel = self._build_rel_sin_table(T, D, x.device, x.dtype)      # [2T-1, D]
-        rel = self.linear_pos(rel)                                     # [2T-1, D]
-        rel = rel.view(2 * T - 1, H, Dh).permute(1, 0, 2).contiguous() # [H, 2T-1, Dh]
+        rel = self._build_rel_sin_table(S, D, device, dtype)           # [2S-1, D]
+        rel = self.linear_pos(rel)                                     # [2S-1, D]
+        rel = rel.view(2 * S - 1, H, Dh).permute(1, 0, 2).contiguous() # [H, 2S-1, Dh]
 
         q_with_v = q + self.pos_bias_v.unsqueeze(1)                    # [H, T, Dh]
-        rel_scores = torch.matmul(q_with_v, rel.transpose(-2, -1))     # [H, T, 2T-1]
-        rel_scores = self._rel_shift(rel_scores)                       # [H, T, T]
+        rel_scores = torch.matmul(q_with_v, rel.transpose(-2, -1))     # [H, T, 2S-1]
+        rel_scores = self._rel_shift(rel_scores)                       # [H, T, S]
 
-        scores = (content_scores + rel_scores) * (Dh ** -0.5)          # [H, T, T]
+        scores = (content_scores + rel_scores) * (Dh ** -0.5)          # [H, T, S]
 
-        mask = build_local_band_mask(T, self.window, device=x.device, dtype=scores.dtype)  # [T, T]
-        scores = scores + mask  # broadcast over H
+        mask = build_local_band_mask(T, S, device=device, dtype=scores.dtype)  # [T, S]
+        scores = scores + mask.unsqueeze(0)  # broadcast over H
 
-        attn = F.softmax(scores, dim=-1)                               # [H, T, T]
+        attn = F.softmax(scores, dim=-1)                               # [H, T, S]
         y = torch.matmul(attn, v)                                      # [H, T, Dh]
         y = y.permute(1, 0, 2).contiguous().view(T, D)                 # [T, D]
         return self.o_proj(y)
@@ -178,20 +274,27 @@ class ConformerConvModule(nn.Module):
 
 
 class ConformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, k_conv: int, ff_mult: int, attn_window: int, pdrop: float = 0.0):
+    def __init__(self,
+        d_model: int,
+        n_heads: int,
+        k_conv: int,
+        ff_mult: int,
+        attn_window: int,
+        prefix: str,
+    ):
         super().__init__()
-        self.ff1 = ConformerFFN(d_model, ff_mult, pdrop)
+        self.ff1 = ConformerFFN(d_model, ff_mult)
         self.ln_attn = nn.LayerNorm(d_model)
-        self.attn = RelPosSelfAttention(d_model, n_heads, attn_window)
-        self.drop = nn.Dropout(pdrop)
+        self.attn = RelPosSelfAttention(d_model, n_heads, attn_window, prefix=f"{prefix}.attn")
         self.conv = ConformerConvModule(d_model, k_conv)
-        self.ff2 = ConformerFFN(d_model, ff_mult, pdrop)
+        self.ff2 = ConformerFFN(d_model, ff_mult)
         self.ln_out = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.ff1(x, scale=0.5)
-        y = self.ln_attn(x); y = self.attn(y)
-        x = x + self.drop(y)
+        y = self.ln_attn(x)
+        y = self.attn(y)
+        x = x + y
         x = self.conv(x)
         x = self.ff2(x, scale=0.5)
         x = self.ln_out(x)
@@ -224,6 +327,8 @@ class FastConformerCTC(nn.Module):
         att_window = int(config.att_left_ctx + config.att_right_ctx)
         assert att_window > 0, "att_window must be positive"
 
+        self.prefix = prefix
+
         self.blocks = nn.ModuleList([
             ConformerBlock(
                 d_model=self.d_model,
@@ -231,9 +336,9 @@ class FastConformerCTC(nn.Module):
                 k_conv=config.k_conv,
                 ff_mult=config.ff_mult,
                 attn_window=att_window,
-                pdrop=0.0,
+                prefix=f"{prefix}.blocks.{i}",
             )
-            for _ in range(config.n_layers)
+            for i in range(config.n_layers)
         ])
 
         self.proj = nn.Linear(self.d_model, self.vocab_size)

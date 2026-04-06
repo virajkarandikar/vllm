@@ -558,6 +558,24 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             model_version=model_version_set.pop(),
         )
 
+@dataclass(frozen=True)
+class FastConformerSpec(AttentionSpec):
+    sliding_window: int
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            2 * self.sliding_window * self.num_kv_heads * self.head_size *
+            get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        return (
+            2 * vllm_config.scheduler_config.max_num_seqs *
+            self.sliding_window * self.num_kv_heads * self.head_size *
+            get_dtype_size(self.dtype)
+        )
+
 
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
