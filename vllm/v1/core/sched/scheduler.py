@@ -374,7 +374,7 @@ class Scheduler(SchedulerInterface):
             if not request.has_next_input_embeds():
                 # request cannot be scheduled because next input embeddings
                 # are not set yet
-                req_index += 1
+                self.running.pop(req_index)
                 continue
 
             if (
@@ -1806,6 +1806,7 @@ class Scheduler(SchedulerInterface):
         if request is None:
             raise ValueError(f"Request {request_id} not found")
         request.set_next_input_embeds(input_embeds)
+        self.running.append(request)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
