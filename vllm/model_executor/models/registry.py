@@ -105,6 +105,7 @@ _TEXT_GENERATION_MODELS = {
     "ExaoneMoEForCausalLM": ("exaone_moe", "ExaoneMoeForCausalLM"),
     "Fairseq2LlamaForCausalLM": ("fairseq2_llama", "Fairseq2LlamaForCausalLM"),
     "FalconForCausalLM": ("falcon", "FalconForCausalLM"),
+    "FastConformerCTC": ("fastconformer", "FastConformerCTC"),
     "FalconMambaForCausalLM": ("mamba", "MambaForCausalLM"),
     "FalconH1ForCausalLM": ("falcon_h1", "FalconH1ForCausalLM"),
     "FlexOlmoForCausalLM": ("flex_olmo", "FlexOlmoForCausalLM"),
