@@ -227,10 +227,11 @@ class ModelConfig:
     temperature and top_k/top_p.
     """
     use_fp64_gumbel: bool = False
-    """Whether to use FP64 (instead of FP32) random noise for Gumbel-max and
-    equivalent exponential-race sampling. FP64 preserves lower-tail sampling
-    events that fp32 uniform/exponential draws can truncate, at the cost of
-    significantly lower throughput on most GPUs."""
+    """Whether to use FP64 (instead of FP32) for the Gumbel noise used by the
+    sampler. FP64 reduces the chance of ties in Gumbel-max sampling at the cost
+    of significantly lower kernel throughput on most GPUs."""
+    return_hidden_states: bool = False
+    """Whether to return the last layer hidden states of the model."""
     disable_sliding_window: bool = False
     """Whether to disable sliding window. If True, we will disable the sliding
     window functionality of the model, capping to sliding window size. If the
