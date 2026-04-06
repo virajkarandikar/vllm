@@ -93,7 +93,6 @@ class Scheduler(SchedulerInterface):
             )
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
-        self.return_hidden_states = vllm_config.model_config.return_hidden_states
         self.await_inputs = vllm_config.model_config.custom_input_specs is not None
 
         # include_finished_set controls whether a separate set of finished
@@ -1515,9 +1514,9 @@ class Scheduler(SchedulerInterface):
             if num_nans_in_logits is not None and req_id in num_nans_in_logits:
                 request.num_nans_in_logits = num_nans_in_logits[req_id]
 
-            hidden_states = None
-            if self.return_hidden_states:
-                hidden_states = model_runner_output.hidden_states[req_index]
+            custom_outputs = None
+            if model_runner_output.custom_outputs:
+                custom_outputs = model_runner_output.custom_outputs[req_index]
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
@@ -1534,7 +1533,7 @@ class Scheduler(SchedulerInterface):
                         new_token_ids=new_token_ids,
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
-                        new_hidden_states=hidden_states,
+                        new_custom_outputs=custom_outputs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,

@@ -283,8 +283,6 @@ class ModelConfig:
     """Whether to use FP64 (instead of FP32) for the Gumbel noise used by the
     sampler. FP64 reduces the chance of ties in Gumbel-max sampling at the cost
     of significantly lower kernel throughput on most GPUs."""
-    return_hidden_states: bool = False
-    """Whether to return the last layer hidden states of the model."""
     disable_sliding_window: bool = False
     """Whether to disable sliding window. If True, we will disable the sliding
     window functionality of the model, capping to sliding window size. If the
@@ -796,6 +794,7 @@ class ModelConfig:
                 raise RuntimeError(
                     f"Error parsing custom input specifications from hf_config: {e}"
                 ) from e
+        self.custom_outputs = getattr(self.hf_config, "custom_outputs", None)
 
         if self.disable_sliding_window:
             # Set after get_and_verify_max_len to ensure that max_model_len
