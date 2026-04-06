@@ -247,27 +247,7 @@ class EngineCore:
         # Get all kv cache needed by the model
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
-        # Some layers (e.g. Prefix LM attention) run non-causally and tag their
-        # KV cache spec with ``non_causal=True``. The specs are collected here in
-        # the engine-core process (the same process that builds the scheduler),
-        # so this is the multiproc-safe place to translate that layer-level
-        # signal into a scheduling policy: chunked prefill and prefix caching
-        # both assume causal attention and would corrupt non-causal prefill.
-        if any(
-            getattr(spec, "non_causal", False)
-            for worker_specs in kv_cache_specs
-            for spec in worker_specs.values()
-        ):
-            if vllm_config.scheduler_config.enable_chunked_prefill:
-                logger.info(
-                    "Disabling chunked prefill: model has non-causal attention layers."
-                )
-                vllm_config.scheduler_config.enable_chunked_prefill = False
-            if vllm_config.cache_config.enable_prefix_caching:
-                logger.info(
-                    "Disabling prefix caching: model has non-causal attention layers."
-                )
-                vllm_config.cache_config.enable_prefix_caching = False
+        print(f"debug: kv_cache_specs: {kv_cache_specs}")
 
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
@@ -295,6 +275,7 @@ class EngineCore:
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
+        print(f"debug: kv_cache_configs: {kv_cache_configs}")
 
         # If auto-fit reduced max_model_len, sync the new value to workers.
         # This is needed because workers were spawned before memory profiling

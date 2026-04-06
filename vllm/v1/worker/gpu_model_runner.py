@@ -73,6 +73,7 @@ from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
 )
+from vllm.model_executor.models.fastconformer import FastConformerCache
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -7549,6 +7550,12 @@ class GPUModelRunner(
                         indexes = backend.indexes_kv_by_block_stride()
                     spec = replace(spec, indexes_kv_by_block_stride=indexes)
                 kv_cache_spec[layer_name] = spec
+
+        fastconformer_layers = get_layers_from_vllm_config(
+            self.vllm_config, FastConformerCache
+        )
+        for layer_name, fastconformer_module in fastconformer_layers.items():
+            kv_cache_spec[layer_name] = fastconformer_module.get_kv_cache_spec()
 
         return kv_cache_spec
 

@@ -615,13 +615,22 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             model_version=model_version_set.pop(),
         )
 
-    def is_uniform_with_collection(
-        self, kv_cache_specs: dict[str, KVCacheSpec]
-    ) -> bool:
-        return all(
-            isinstance(spec, SlidingWindowMLASpec)
-            and spec.sliding_window == self.sliding_window
-            for spec in kv_cache_specs.values()
+@dataclass(frozen=True)
+class FastConformerSpec(AttentionSpec):
+    sliding_window: int
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            2 * self.sliding_window * self.num_kv_heads * self.head_size *
+            get_dtype_size(self.dtype)
+        )
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        return (
+            2 * vllm_config.scheduler_config.max_num_seqs *
+            self.sliding_window * self.num_kv_heads * self.head_size *
+            get_dtype_size(self.dtype)
         )
 
 
