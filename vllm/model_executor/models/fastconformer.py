@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections.abc import Iterable
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -33,56 +33,209 @@ def build_local_band_mask(T: int, window: int, device, dtype) -> torch.Tensor:
     mask = mask.masked_fill(allowed, 0.0)
     return mask
 
+def _check(save_pth: str, x: torch.Tensor):
+    attn_metadata = get_forward_context().attn_metadata
+    if attn_metadata is None:
+        return
+    print(f"[vllm_debug] checking {save_pth}...")
+    ref_t = torch.load(save_pth)
+    ref_t = ref_t[:,:,:]
+    print(f"[vllm_debug] x.shape {x.shape} ref_t.shape {ref_t.shape} x.dtype {x.dtype} ref_t.dtype {ref_t.dtype}")
+    a = x.detach().float().cpu()
+    b = ref_t.detach().float().cpu()
+    diff = (a-b).abs()
+    rel = diff / (b.abs() + 1e-6)
+    print(f"[vllm_debug] shape={tuple(a.shape)} | mean abs diff={diff.mean():.6f} | max abs diff={diff.max():.6f} | mean rel diff={rel.mean():.6f}")
+
+def _dbg_save(save_pth: str, x: torch.Tensor):
+    attn_metadata = get_forward_context().attn_metadata
+    if attn_metadata is None:
+        return
+    print(f"[vllm_debug] saving {save_pth}...")
+    torch.save(x, save_pth)
+    print(f"[vllm_debug] saved {save_pth}")
+
+class CausalConv2D(nn.Conv2d):
+    """
+    A causal version of nn.Conv2d where each location in the 2D matrix would have no access to locations on its right or down
+    All arguments are the same as nn.Conv2d except padding which should be set as None
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: None = None,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = 'zeros',
+        device=None,
+        dtype=None,
+    ) -> None:
+        self._left_padding = kernel_size - 1
+        self._right_padding = stride - 1
+
+        padding = 0
+        super(CausalConv2D, self).__init__(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding,
+            dilation,
+            groups,
+            bias,
+            padding_mode,
+            device,
+            dtype,
+        )
+
+    def forward(
+        self, x,
+    ):
+        x = F.pad(x, pad=(self._left_padding, self._right_padding, self._left_padding, self._right_padding))
+        x = super().forward(x)
+        return x
+
+class ConvSubsamplingDWStridingCausalReference(nn.Module):
+    def __init__(self, feat_in: int = 80, feat_out: int = 512, conv_channels: int = 256):
+        super().__init__()
+        self.feat_in = feat_in
+        self.feat_out = feat_out
+        self.mid_ch = conv_channels
+
+        # Individual layers to match weight loader
+        self.conv0 = CausalConv2D(1, 256, kernel_size=3, stride=2, padding=None, bias=True)
+        self.act0 = nn.ReLU(inplace=True)
+
+        self.conv2 = CausalConv2D(256, 256, kernel_size=3, stride=2, padding=None, groups=256, bias=True)
+        self.conv3 = nn.Conv2d(256, 256, kernel_size=1, stride=1, padding=0, bias=True)
+        self.act3 = nn.ReLU(inplace=True)
+
+        self.conv5 = CausalConv2D(256, 256, kernel_size=3, stride=2, padding=None, groups=256, bias=True)
+        self.conv6 = nn.Conv2d(256, 256, kernel_size=1, stride=1, padding=0, bias=True)
+        self.act6 = nn.ReLU(inplace=True)
+
+        # Output projection, hardcode sequence length per NeMo for feat_in=80
+        L = torch.tensor(float(self.feat_in))
+        for _ in range(3):
+            L = torch.floor((L + 3 - 3) / 2.0) + 1.0
+        out_length = int(L.item())
+        self.out = nn.Linear(256 * out_length, self.feat_out, bias=True)
+
+    @torch.no_grad()
+    def _mask(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        # NeMo-style time mask on [B, C, T, F]
+        B, _, T, _ = x.shape
+        mask = torch.arange(T, device=x.device).view(1, 1, T, 1) < lengths.view(B, 1, 1, 1)
+        return x * mask
+
+    @torch.no_grad()
+    def _update_lengths(self, lengths: torch.Tensor) -> torch.Tensor:
+        # floor((L + (left+right) - K)/S) + 1 (with Nemo param: left+right=3, K=3, S=2)
+        return torch.floor_divide(lengths, 2) + 1
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor = None) -> torch.Tensor:
+        B, T, F = x.shape
+        assert F == self.feat_in
+        if lengths is None:
+            lengths = torch.full((B,), T, device=x.device, dtype=torch.long)
+
+        y = x.unsqueeze(1)  # [B, 1, T, F]
+
+        # Stage 0: causal 3x3, stride 2, "full" conv, + ReLU
+        y = self._mask(y, lengths)
+        y = self.conv0(y)
+        lengths = self._update_lengths(lengths)
+        y = self.act0(y)
+
+        # Stage 1: causal 3x3, stride 2, depthwise, then 1x1 pointwise + ReLU
+        y = self._mask(y, lengths)
+        y = self.conv2(y)
+        lengths = self._update_lengths(lengths)
+        y = self._mask(y, lengths)
+        y = self.conv3(y)
+        y = self.act3(y)
+
+        # Stage 2: causal 3x3, stride 2, depthwise, then 1x1 pointwise + ReLU
+        y = self._mask(y, lengths)
+        y = self.conv5(y)
+        lengths = self._update_lengths(lengths)
+        y = self._mask(y, lengths)
+        y = self.conv6(y)
+        y = self.act6(y)
+
+        # Flatten and output projection
+        B, C, T_, F_ = y.shape
+        y = y.permute(0, 2, 1, 3).contiguous().view(B, T_, C * F_)
+        y = self.out(y)
+        return y
 
 class NemoSubsample8x2D(nn.Module):
-    def __init__(self, d_out: int, mels: int = 80):
+    def __init__(self, d_out: int, mid_ch: int, mels: int):
         super().__init__()
         self.mels = mels
-        self.conv0 = nn.Conv2d(1, 256, kernel_size=3, stride=(2, 2), padding=(1, 1))            # conv.0
-        self.conv2 = nn.Conv2d(256, 256, kernel_size=3, stride=(2, 2), padding=(1, 1), groups=256)  # conv.2 (DW)
-        self.conv3 = nn.Conv2d(256, 256, kernel_size=1, stride=1, padding=0)                     # conv.3 (PW)
-        # Asymmetric pad on freq to make F_out == 11 for F_in==80 (so 256*11 = 2816 for Linear)
-        self.conv5 = nn.Conv2d(256, 256, kernel_size=3, stride=(2, 2), padding=(1, 2), groups=256)  # conv.5 (DW)
-        self.conv6 = nn.Conv2d(256, 256, kernel_size=1, stride=1, padding=0)                     # conv.6 (PW)
-        self.act = nn.SiLU()
-        self.out = nn.Linear(256 * 11, d_out)  # 2816 -> 512
+        self.mid_ch = mid_ch
+        self.act = nn.ReLU()
+
+        self.pad = nn.ConstantPad2d((2, 1, 2, 1), 0)
+
+        self.conv0 = nn.Conv2d(1, self.mid_ch, kernel_size=3, stride=(2, 2), padding=0)
+
+        self.conv2 = nn.Conv2d(self.mid_ch, self.mid_ch, kernel_size=3, stride=(2, 2),
+                               padding=0, groups=self.mid_ch)
+        self.conv3 = nn.Conv2d(self.mid_ch, self.mid_ch, kernel_size=1, stride=1, padding=0)
+
+        self.conv5 = nn.Conv2d(self.mid_ch, self.mid_ch, kernel_size=3, stride=(2, 2),
+                               padding=0, groups=self.mid_ch)
+        self.conv6 = nn.Conv2d(self.mid_ch, self.mid_ch, kernel_size=1, stride=1, padding=0)
+
+        self.out = nn.Linear(self.mid_ch * 11, d_out)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, F]
         B, T, F = x.shape
         assert F == self.mels, f"Expected mel dim {self.mels}, got {F}"
-        y = x.view(B, 1, T, F)             # [B, C=1, T, F]
-        y = self.act(self.conv0(y))        # [B, 256, T/2, F/2]
-        y = self.act(self.conv2(y))        # [B, 256, T/4, F/4]
-        y = self.act(self.conv3(y))        # [B, 256, T/4, F/4]
-        y = self.act(self.conv5(y))        # [B, 256, T/8, ~11]
-        y = self.act(self.conv6(y))        # [B, 256, T/8, 11]
+
+        y = x.view(B, 1, T, F)
+        y = self.act(self.conv0(self.pad(y)))     # stage 0
+
+        y = self.conv2(self.pad(y))               # depthwise
+        y = self.act(self.conv3(y))               # pointwise + act
+
+        y = self.conv5(self.pad(y))               # depthwise
+        y = self.act(self.conv6(y))               # pointwise + act
+
         B, C, T8, Fp = y.shape
-        # Safety check: must be 11 so that C*Fp == 2816 for the Linear layer
-        if C * Fp != 2816:
+        if C * Fp != 2816:  # should be 256 * 11
             raise RuntimeError(f"Subsampler produced C*F'={C}*{Fp}={C*Fp}, expected 2816.")
-        y = y.permute(2, 0, 1, 3).contiguous().view(B, T8, C * Fp)  # [B, T/8, 256*11]
-        y = self.out(y)                 # [B, T/8, d_out]
+
+        y = y.permute(0, 2, 1, 3).contiguous().view(B, T8, C * Fp)  # [B, T/8, 256*11]
+        y = self.out(y)                                            # [B, T/8, d_out]
         return y
 
-
 class ConformerFFN(nn.Module):
+    """Conformer FeedForward module."""
     def __init__(self, d_model: int, ff_mult: int = 4):
         super().__init__()
-        self.ln = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, ff_mult * d_model)
-        self.fc2 = nn.Linear(ff_mult * d_model, d_model)
+        d_ff = ff_mult * d_model
+        self.linear1 = nn.Linear(d_model, d_ff, bias=True)
+        self.activation = nn.SiLU()
+        self.linear2 = nn.Linear(d_ff, d_model, bias=True)
 
-    def forward(self, x: torch.Tensor, scale: float = 0.5) -> torch.Tensor:
-        # x: [B, T, D]
-        y = self.ln(x)
-        y = self.fc2(F.silu(self.fc1(y)))
-        return x + y * scale
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.linear2(x)
+        return x
 
 class FastConformerConvCache(torch.nn.Module, AttentionLayerBase):
     def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig):
         super().__init__()
-        self.dtype = torch.bfloat16
+        self.dtype = torch.float32
         self.d_model = int(d_model)
         self.k = int(k)
         self.left_ctx = self.k - 1  # L
@@ -115,215 +268,325 @@ class FastConformerConvCache(torch.nn.Module, AttentionLayerBase):
         return FastConformerBackend
 
 
-
 class RelPosSelfAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, window: int, cache_config: CacheConfig, prefix: str):
+    def __init__(self, d_model: int, num_heads: int, window: int,
+                 cache_config: CacheConfig, prefix: str):
         super().__init__()
         assert d_model % num_heads == 0
         self.h = num_heads
         self.dh = d_model // num_heads
         self.window = int(window)
+        self.prefix = prefix
 
+        # projections
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.o_proj = nn.Linear(d_model, d_model)
 
+        # relative-pos pieces
         self.linear_pos = nn.Linear(d_model, d_model, bias=False)
         self.pos_bias_u = nn.Parameter(torch.zeros(self.h, self.dh))
         self.pos_bias_v = nn.Parameter(torch.zeros(self.h, self.dh))
 
-        self.prefix = prefix
-
+        # vLLM attention wrapper (force Flex backend)
         self.attn = Attention(
             num_heads=self.h,
             head_size=self.dh,
-            scale=self.dh**-0.5,
+            scale=self.dh ** -0.5,
             num_kv_heads=self.h,
-            cache_config=CacheConfig(
+            cache_config=CacheConfig(           # values here are ignored by our overrides
                 sliding_window=self.window,
                 cache_dtype="auto",
                 block_size=cache_config.block_size,
                 calculate_kv_scales=False,
             ),
             prefix=self.prefix,
-            attn_backend=FlexAttentionBackend
+            attn_backend=FlexAttentionBackend,
         )
 
-        # TODO: verify whether this is needed
+        # required by KV-cache ops signature
         self._k_scale = torch.tensor(1.0, dtype=torch.float32)
         self._v_scale = torch.tensor(1.0, dtype=torch.float32)
         self._q_scale = torch.tensor(1.0, dtype=torch.float32)
         self._prob_scale = torch.tensor(1.0, dtype=torch.float32)
 
         if cache_config.block_size != 128:
-            # attn page size must match conv page size
-            raise Exception(f"attn cache block size must be 128, got {cache_config.block_size}")
+            raise Exception(
+                f"attn cache block size must be 128, got {cache_config.block_size}"
+            )
 
+    # ---------------- Reference path (for parity checks) ----------------
+    def _forward_ref(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        H, Dh = self.h, self.dh
+        assert D == H * Dh
+
+        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
+        k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
+        v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
+        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q.pt", q)
+        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/k.pt", k)
+        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/v.pt", v)
+
+        device, idtype = x.device, x.dtype
+        pos_idx = torch.arange(T - 1, -T, -1, device=device)[:T]
+        div = torch.exp(torch.arange(0, D, 2, device=device, dtype=torch.float32)
+                        * (-math.log(10000.0) / D))
+        sin = torch.sin(pos_idx[:, None].to(torch.float32) * div[None, :])
+        cos = torch.cos(pos_idx[:, None].to(torch.float32) * div[None, :])
+        pos = torch.zeros(T, D, device=device, dtype=torch.float32)
+        pos[:, 0::2] = sin
+        pos[:, 1::2] = cos
+
+        p = self.linear_pos(pos.to(idtype)).view(T, H, Dh).permute(1, 0, 2).contiguous()
+        p = p.unsqueeze(0).expand(B, -1, -1, -1)
+
+        q_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
+        q_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)
+        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q_u.pt", q_u)
+        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/q_v.pt", q_v)
+
+        scores_ac = torch.matmul(q_u, k.transpose(-2, -1))  # [B,H,T,T]
+
+        raw_bd = torch.matmul(q_v, p.transpose(-2, -1))     # [B,H,T,T]
+        b, h, qlen, pos_len = raw_bd.size()
+        bd = F.pad(raw_bd, (1, 0))
+        bd = bd.view(b, h, pos_len + 1, qlen)[:, :, 1:].view(b, h, qlen, pos_len)
+        scores_bd = bd
+
+        # debugging...
+        W = int(self.window)
+        scores_bd_scaled = scores_bd * (Dh ** -0.5)
+        idx = torch.arange(T, device=q.device)
+        q_idx = idx.view(1,1,T,1)
+        kv_idx = idx.view(1,1,1,T)
+        allowed = (kv_idx <= q_idx) & ((q_idx - kv_idx) <= W)
+        scores_bd_scaled = scores_bd_scaled.masked_fill(~allowed,0)
+        _dbg_save("/home/scratch.jdaw_coreai/landrew/tmp/scores_bd.pt", scores_bd_scaled)
+        # debugging...
+
+        scores = (scores_ac + scores_bd) * (Dh ** -0.5)
+
+        causal = torch.ones(T, T, device=device, dtype=torch.bool).triu(1)
+        scores = scores.masked_fill(causal.view(1, 1, T, T), float("-inf"))
+
+        W = int(self.window)
+        if W > 0 and W < T:
+            idx = torch.arange(T, device=device)
+            q_idx = idx.view(1, 1, T, 1)
+            k_idx = idx.view(1, 1, 1, T)
+            allowed = (k_idx <= q_idx) & ((q_idx - k_idx) <= W)
+            scores = scores.masked_fill(~allowed, float("-inf"))
+
+        scores32 = scores.to(torch.float32)
+        scores32 = scores32 - torch.amax(scores32, dim=-1, keepdim=True)
+        probs = torch.softmax(scores32, dim=-1).to(idtype)
+
+        ctx = torch.matmul(probs, v).transpose(1, 2).contiguous().view(B, T, D)
+        return self.o_proj(ctx)
+
+    # ---------------- Shaw band for score_mod ----------------
     def _build_shaw_band_bias(self, q: torch.Tensor, W: int) -> torch.Tensor:
         B, H, T, Dh = q.shape
         D = H * Dh
         device, dtype = q.device, q.dtype
 
-        deltas = torch.arange(-(W - 1), W, device=device)
-        pos = deltas[:, None].to(dtype)  # [2W-1, 1]
-        div = torch.exp(torch.arange(0, D, 2, device=device, dtype=dtype)
+        deltas = torch.arange(-W, W + 1, device=device)[:, None].to(torch.float32)  # [2W+1,1]
+        div = torch.exp(torch.arange(0, D, 2, device=device, dtype=torch.float32)
                         * (-math.log(10000.0) / D))
-        sin = torch.sin(pos * div)  # [2W-1, D/2]
-        cos = torch.cos(pos * div)
-        rel = torch.zeros((2 * W - 1, D), device=device, dtype=dtype)
+        sin = torch.sin(deltas * div)
+        cos = torch.cos(deltas * div)
+        rel = torch.zeros((2 * W + 1, D), device=device, dtype=torch.float32)
         rel[:, 0::2] = sin
         rel[:, 1::2] = cos
-        rel = self.linear_pos(rel)                              # [2W-1, D]
-        rel = rel.view(2 * W - 1, H, Dh).permute(1, 2, 0)       # [H, Dh, 2W-1]
 
-        q_with_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)  # [B,H,T,Dh]
-        band_bias = torch.einsum("bhtd,hdm->bhtm", q_with_v, rel) # [B,H,T,2W-1]
+        rel = self.linear_pos(rel.to(dtype))                # [2W+1, D]
+        rel = rel.view(2 * W + 1, H, Dh).permute(1, 2, 0)   # [H, Dh, 2W+1]
+
+        q_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)   # [B,H,T,Dh]
+        # _check("/home/scratch.jdaw_coreai/landrew/tmp/q_v.pt", q_v)
+        band_bias = torch.einsum("bhtd,hdm->bhtm", q_v, rel)  # [B,H,T,2W+1]
+        band_bias = band_bias * (Dh ** -0.5)
         return band_bias
 
-    def _make_shaw_score_mod(self, band_bias: torch.Tensor, W: int):
-        # band_bias: [B, H, T, 2W-1]
+    def _make_shaw_score_mod_flat(self, band_bias: torch.Tensor, W: int):
         @torch.jit.script_if_tracing
-        def score_mod(score: torch.Tensor,
-                    b: torch.Tensor, h: torch.Tensor,
-                    q_idx: torch.Tensor, kv_idx: torch.Tensor,
-                    physical_q: torch.Tensor = None) -> torch.Tensor:
-            rel = q_idx - kv_idx
-            low = -(W - 1); high = (W - 1)
-            rel = torch.clamp(rel, low, high)
-            idx = rel + (W - 1)  # [0..2W-2]
-            return score + band_bias[b.long(), h.long(), q_idx.long(), idx.long()]
+        def score_mod(
+            score: torch.Tensor,
+            b: torch.Tensor,
+            h: torch.Tensor,
+            logical_q_idx: torch.Tensor,
+            logical_kv_idx: torch.Tensor,
+            physical_q: torch.Tensor = None # physical_q_idx
+        ) -> torch.Tensor:
+            rel = logical_q_idx - logical_kv_idx
+            rel = torch.clamp(rel, -W, W) + W
+            return score + band_bias[b.long(), h.long(), logical_q_idx.long(), rel.long()]
         return score_mod
 
-    def _prepare_flex(self, attn_metadata: FlexAttentionMetadata, score_mod):
-        # TODO: verify whether this is needed. for example,
-        # - is block_mask already set?
-        # - is score_mod already set?
-        # - is transformed_score_mod already set?
-        attn_metadata.sliding_window = int(self.window)
+    def _install_exact_mask(self, attn_meta: FlexAttentionMetadata):
+        """
+        Replace any internal mask with our own logical_mask_mod (causal + inclusive window)
+        and rebuild the block mask using the generic path.
+        """
+        W = int(self.window)
 
-        attn_metadata.score_mod = score_mod
-        attn_metadata.transformed_score_mod = attn_metadata.get_transformed_score_mod()
+        # exact logical mask in LOGICAL space (decoder path)
+        def logical_mask_mod(b: torch.Tensor,
+                             h: torch.Tensor,
+                             q_idx: torch.Tensor,
+                             kv_idx: torch.Tensor) -> torch.Tensor:
+            return (kv_idx <= q_idx) & ((q_idx - kv_idx) <= W)
 
-        attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
+        attn_meta.sliding_window = None
+        attn_meta.logical_mask_mod = logical_mask_mod
+
+        attn_meta.direct_build = False
+        attn_meta.block_mask = attn_meta.build_block_mask()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # a = self._forward_ref(x)
+        # b = self._forward(x)
+        # attn_meta = get_forward_context().attn_metadata
+        # if attn_meta is not None:
+        #     print(f"[vllm_debug] a.shape {a.shape} b.shape {b.shape}")
+        #     abs_diff = (a - b).abs()
+        #     rel_diff = abs_diff / a.abs().clamp_min(1e-9)
+        #     print(f"[vllm_debug] max abs diff: {abs_diff.max()} max rel diff: {rel_diff.max()}")
+        # return b
+        return self._forward(x)
+
+    def _forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         H, Dh = self.h, self.dh
 
-        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()  # [B,H,T,Dh]
-        k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()  # [B,H,T,Dh]
-        v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()  # [B,H,T,Dh]
+        # Projections
+        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
+        k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
+        v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()
+        # _check("/home/scratch.jdaw_coreai/landrew/tmp/q.pt", q)
+        # _check("/home/scratch.jdaw_coreai/landrew/tmp/k.pt", k)
+        # _check("/home/scratch.jdaw_coreai/landrew/tmp/v.pt", v)
+        q_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)
+        # _check("/home/scratch.jdaw_coreai/landrew/tmp/q_u.pt", q_u)
 
-        q_plus_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)            # [B,H,T,Dh]
+        W = int(self.window)
+        band_bias = self._build_shaw_band_bias(q, W)
 
-        band_bias = self._build_shaw_band_bias(q, self.window)
-        score_mod = self._make_shaw_score_mod(band_bias, self.window)
+        # debugging.....
+        idx = torch.arange(T, device=q.device)
+        q_idx = idx.view(1, 1, T, 1)
+        kv_idx = idx.view(1, 1, 1, T)
+        rel = q_idx - kv_idx
+        rel = torch.clamp(rel, -W, W) + W  # [1,1,T,T]
+        scores_bd_band = band_bias.gather(-1, rel.expand(B, H, T, T))  # [B,H,T,T]
+        idx = torch.arange(T, device=q.device)
+        q_idx = idx.view(1,1,T,1)
+        kv_idx = idx.view(1,1,1,T)
+        allowed = (kv_idx <= q_idx) & ((q_idx - kv_idx) <= W)
+        scores_bd_band = scores_bd_band.masked_fill(~allowed,0)
+        # _check("/home/scratch.jdaw_coreai/landrew/tmp/scores_bd.pt", scores_bd_band)
+        # debugging.....
 
-        query = q_plus_u.reshape(-1, H, Dh)
+        band_bias_flat = band_bias.view(-1, H, 2 * W + 1)
+
+        query = q_u.reshape(-1, H, Dh)
         key   = k.reshape(-1, H, Dh)
         value = v.reshape(-1, H, Dh)
 
         fctx = get_forward_context()
-        attn_metadata_all = fctx.attn_metadata
-        if isinstance(attn_metadata_all, dict):
-            attn_metadata: FlexAttentionMetadata = attn_metadata_all[self.prefix]
-            self._prepare_flex(attn_metadata, score_mod=score_mod)
-        else:
-            # dummy run; compute normal attention
-            attn_scores = torch.matmul(query, key.transpose(-2, -1)) / (Dh ** 0.5)
-            attn_probs = torch.softmax(attn_scores, dim=-1)
-            attn_output = torch.matmul(attn_probs, value)
-            out = attn_output.view(B, T, H, Dh).transpose(1, 2).contiguous().view(B, T, D)
-            return self.o_proj(out)
+        attn_meta_all = fctx.attn_metadata
+        if not isinstance(attn_meta_all, dict):
+            # No metadata (profiling etc) -> fall back to reference
+            return self._forward_ref(x)
+
+        attn_meta: FlexAttentionMetadata = attn_meta_all[self.prefix]
+
+        self._install_exact_mask(attn_meta)
+
+        score_mod = self._make_shaw_score_mod_flat(band_bias, W)
+        attn_meta.score_mod = score_mod
+        attn_meta.transformed_score_mod = attn_meta.get_transformed_score_mod()
 
         self_kv_cache = self.attn.kv_cache[fctx.virtual_engine]
-
-        out_buf = torch.empty_like(query)
+        out_buf = torch.empty_like(query)  # [num_tokens, H, Dh]
         out = self.attn.impl.forward(
             layer=self,
             query=query,
             key=key,
             value=value,
             kv_cache=self_kv_cache,
-            attn_metadata=attn_metadata,
+            attn_metadata=attn_meta,
             output=out_buf,
         )
         out = out.view(B, T, H, Dh).transpose(1, 2).contiguous().view(B, T, D)
         return self.o_proj(out)
-
 
 class ConformerConvModule(nn.Module):
     def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig):
         super().__init__()
         assert k % 2 == 1
         self.prefix = prefix
-        self.ln = nn.LayerNorm(d_model)
+
         self.pw1 = nn.Conv1d(d_model, 2 * d_model, 1)
-        self.dw  = nn.Conv1d(d_model, d_model, k, padding=(k-1)//2,
-                             groups=d_model)
-        self.bn  = nn.BatchNorm1d(d_model, eps=1e-3, momentum=0.1)
+        self.dw  = nn.Conv1d(d_model, d_model, k, padding=(k-1)//2, groups=d_model)
+        self.bn  = nn.BatchNorm1d(d_model)
+        self.activation = nn.SiLU()
         self.pw2 = nn.Conv1d(d_model, d_model, 1)
 
         self.conv_cache = FastConformerConvCache(
-            d_model=d_model,
-            k=k,
-            prefix=f"{prefix}.conv_cache",
-            cache_config=cache_config,
+            d_model=d_model, k=k, prefix=f"{prefix}.conv_cache", cache_config=cache_config,
         )
-
         self.d_model = d_model
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         # x: [B, T, D]
         B, T, D = x.shape
         assert D == self.d_model
 
-        y = self.ln(x)              # [B,T,D]
-        y = y.transpose(1, 2)       # [B,D,T] (N,C,L)
-        y = self.pw1(y)             # [B,2D,T]
+        y = x.transpose(1, 2)         # [B, D, T]
+        y = self.pw1(y)               # [B, 2D, T]
         a, b = y.chunk(2, dim=1)
-        pre_dw = a * torch.sigmoid(b)   # [B,D,T]
+        pre_dw = a * torch.sigmoid(b)  # GLU
 
         fctx = get_forward_context()
         attn_meta_all = fctx.attn_metadata
         if isinstance(attn_meta_all, dict):
             attn_metadata: FastConformerMetadata = attn_meta_all[self.conv_cache.prefix]
         else:
-            # dummy run; compute normal conv
+            # dummy path: plain conv
             y_dw = self.dw(pre_dw)
             y_dw = self.bn(y_dw)
             y_dw = F.silu(y_dw)
             y = self.pw2(y_dw)
-            y = y.transpose(1, 2)
-            return x + y
+            return y.transpose(1, 2)   # [B, T, D]
 
-        block_table = attn_metadata.block_table_tensor    # [B, n_blocks]
+        block_table = attn_metadata.block_table_tensor
         page_indices = block_table[:, 0]
 
-        store = self.conv_cache.kv_cache[fctx.virtual_engine]    # [num_pages, L, D]
+        # the length of the cache is not exactly equal to the left context length
+        # because of an invariant that vLLM enforces where the page size must
+        # be the same for both conv and attention layers.
+        store = self.conv_cache.kv_cache[fctx.virtual_engine]  # [num_pages, L', D]
+        # we should only read/write the rightmost L elements for each page
+        L = self.conv_cache.left_ctx
+        hist_full = store[page_indices]                   # [B, L', D]
+        hist = hist_full[:, -L:, :].transpose(1, 2).contiguous()   # [B, D, L]
 
-        hist = store[page_indices]              # [B, L, D]
-        hist = hist.transpose(1, 2).contiguous()   # [B, D, L]
+        x_cat = torch.cat([hist, pre_dw], dim=-1)                 # [B, D, L+T]
 
-        x_cat = torch.cat([hist, pre_dw], dim=-1)   # [B, D, L+T]
-
-        y_dw = F.conv1d(
-            x_cat, self.dw.weight, self.dw.bias,
-            stride=1, padding=0, dilation=1, groups=D
-        )[:,:,-T:]                                        # [B,D,T]
+        y_dw = F.conv1d(x_cat, self.dw.weight, self.dw.bias,
+                        stride=1, padding=0, dilation=1, groups=D)[:, :, -T:]
         y_dw = self.bn(y_dw)
         y_dw = F.silu(y_dw)
-
-        y = self.pw2(y_dw)                       # [B,D,T]
-        y = y.transpose(1, 2)                    # [B,T,D]
+        y = self.pw2(y_dw).transpose(1, 2)                        # [B, T, D]
 
         # update cache
-        new_hist = x_cat[:, :, -self.conv_cache.left_shape:]  # [B,D,L]
-        store[page_indices] = new_hist.transpose(1, 2)  # back to [B,L,D]
+        new_hist = x_cat[:, :, -L:]                       # [B, D, L]
+        store[page_indices, -L:, :] = new_hist.transpose(1, 2)   # [B, L, D]
 
-        return x + y
-
+        return y
 
 class ConformerBlock(nn.Module):
     def __init__(self,
@@ -336,23 +599,86 @@ class ConformerBlock(nn.Module):
         prefix: str,
     ):
         super().__init__()
+        self.ln_ff1 = nn.LayerNorm(d_model)
         self.ff1 = ConformerFFN(d_model, ff_mult)
         self.ln_attn = nn.LayerNorm(d_model)
         self.attn = RelPosSelfAttention(d_model, n_heads, attn_window, cache_config, prefix=f"{prefix}.attn")
+        self.ln_conv = nn.LayerNorm(d_model)
         self.conv = ConformerConvModule(d_model, k_conv, prefix=f"{prefix}.conv", cache_config=cache_config)
+        self.ln_ff2 = nn.LayerNorm(d_model)
         self.ff2 = ConformerFFN(d_model, ff_mult)
         self.ln_out = nn.LayerNorm(d_model)
+        self.fc_factor = 0.5
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.ff1(x, scale=0.5)
+        y = self.ln_ff1(x)
+        y = self.ff1(y)
+        x = x + y * self.fc_factor
+
         y = self.ln_attn(x)
         y = self.attn(y)
         x = x + y
-        x = self.conv(x)
-        x = self.ff2(x, scale=0.5)
+
+        y = self.ln_conv(x)
+        y = self.conv(y)
+        x = x + y
+
+        y = self.ln_ff2(x)
+        y = self.ff2(y)
+        x = x + y * self.fc_factor
+
         x = self.ln_out(x)
         return x
 
+def apply_channel_mask(tensor, mask):
+    """Apply mask to tensor with channel dimension."""
+    # tensor: (batch, channels, time, features)
+    # mask: (batch, time, features)
+    batch_size, channels, time, features = tensor.shape
+    expanded_mask = mask.unsqueeze(1).expand(batch_size, channels, time, features)
+    return tensor * expanded_mask
+
+
+def calculate_conv_output_size(input_size: torch.Tensor, kernel_size: int, stride: int, padding: tuple[int, int]):
+    """Calculate exact output size after convolution."""
+    return (input_size + padding[0] + padding[1] - kernel_size) // stride + 1
+
+
+class MaskedConvSequential(nn.Sequential):
+    def forward(self, x, lengths):
+        # Convert input (batch, time, features) to conv format
+        x = x.unsqueeze(1)  # (batch, 1, time, features)
+        current_lengths = lengths.clone().float()
+        mask = self._create_mask(x, current_lengths.long())
+
+        # Process through each layer with mask propagation
+        for i, layer in enumerate(self):
+            # Apply current mask before layer
+            x = apply_channel_mask(x, mask)
+
+            # Apply layer
+            x = layer(x)
+
+            # Update lengths for stride operations with proper padding
+            if hasattr(layer, 'stride') and layer.stride != (1, 1):
+                if hasattr(layer, "_left_padding"):
+                    padding = (layer._left_padding, layer._right_padding)  # CausalConv2D
+                else:
+                    padding = layer.padding
+                current_lengths = calculate_conv_output_size(
+                    current_lengths, layer.kernel_size[0], layer.stride[0], padding
+                )
+                mask = self._create_mask(x, current_lengths.long())
+
+        # Final masking
+        x = apply_channel_mask(x, mask)
+        return x, current_lengths.long()
+
+    def _create_mask(self, tensor, lengths):
+        """Create mask matching tensor dimensions."""
+        batch_size, channels, time, features = tensor.shape
+        time_mask = torch.arange(time, device=tensor.device).expand(batch_size, time) < lengths.unsqueeze(1)
+        return time_mask.unsqueeze(-1).expand(batch_size, time, features).to(tensor.dtype)
 
 class FastConformerCTC(nn.Module):
     """FastConformerCTC for vLLM."""
@@ -374,8 +700,19 @@ class FastConformerCTC(nn.Module):
         subs = config.subsampling or {}
         assert subs.get("type", "dw_striding") == "dw_striding", "Only 'dw_striding' subsampling is implemented"
         assert subs.get("factor", 8) == 8, "Only 8x subsampling is assumed"
-        mid_ch = subs.get("channels", 256) # unused for now
-        self.subsample = NemoSubsample8x2D(d_out=self.d_model, mels=80)
+        assert subs.get("channels", 256) == 256, "Only 256 channels are supported"
+        mid_ch = subs.get("channels", 256)
+        # self.subsample = NemoSubsample8x2D(d_out=self.d_model, mid_ch=mid_ch, mels=80)
+        # self.subsample = ConvSubsamplingDWStridingCausalReference(feat_in=80, feat_out=self.d_model, conv_channels=mid_ch)
+        from nemo.collections.asr.parts.submodules.subsampling import ConvSubsampling
+        self.subsample = ConvSubsampling(
+            subsampling="dw_striding",
+            subsampling_factor=8,
+            feat_in=80,
+            feat_out=self.d_model,
+            conv_channels=mid_ch,
+            is_causal=True,
+        ).to(torch.float32).eval()
 
         att_window = int(config.att_left_ctx + config.att_right_ctx)
         assert att_window > 0, "att_window must be positive"
@@ -394,6 +731,8 @@ class FastConformerCTC(nn.Module):
             )
             for i in range(config.n_layers)
         ])
+
+        # self.attn = RelPosSelfAttention(d_model=self.d_model, num_heads=config.num_attention_heads, window=att_window, cache_config=vllm_config.cache_config, prefix=f"{prefix}.attn.0")
 
         self.proj = nn.Linear(self.d_model, self.vocab_size)
 
@@ -417,7 +756,6 @@ class FastConformerCTC(nn.Module):
         feature_dim = x.shape[-1]
         return x.view(batch_size, time_dim * 8, feature_dim)
 
-
     def _add_ragged_format(self, x: torch.Tensor) -> torch.Tensor:
         return x.squeeze(0)
 
@@ -438,12 +776,34 @@ class FastConformerCTC(nn.Module):
 
         x = self._remove_ragged_format(x)
 
-        x = self.subsample(x)
+        # _check("/home/scratch.jdaw_coreai/landrew/tmp/audio_signal_pre.pt", x)
 
-        for blk in self.blocks:
+        length = x.new_full(
+                (x.size(0),), x.size(1), dtype=torch.int64, device=x.device
+            )
+
+        x, _ = self.subsample(x, length)
+        # _check("/home/scratch.jdaw_coreai/landrew/tmp/audio_signal.pt", x)
+        import math
+        xscale = math.sqrt(self.d_model)
+        x = (x * xscale)
+        # print(f"[vllm_debug] x.shape {x.shape} x.dtype {x.dtype}")
+        # print(f"[vllm_debug] self.d_model {self.d_model}")
+        # _check("/home/scratch.jdaw_coreai/landrew/tmp/audio_signal_post.pt", x)
+
+        # x = x[:,1:,:]
+        # print(f"[vllm_debug] after sli x.shape {x.shape} x.dtype {x.dtype}")
+
+        for i, blk in enumerate(self.blocks):
             x = blk(x)                 # [T/8, D]
+            # _check(f"/home/scratch.jdaw_coreai/landrew/tmp/audio_signal_post_{i}.pt", x)
+        # x = self.attn(x)
 
+        # print(f"[vllm_debug] before _add_ragged_format x.shape {x.shape} x.dtype {x.dtype}")
+        # slice last n frames
+        x = x[:,1:,:]
         x = self._add_ragged_format(x)
+        # print(f"[vllm_debug] after _add_ragged_format x.shape {x.shape} x.dtype {x.dtype}")
         return x
 
     def compute_logits(
@@ -477,17 +837,34 @@ class FastConformerCTC(nn.Module):
             loaded_pairs.append((src_name, dst_name))
             loaded_param_names.add(dst_name)
 
+        # sub_map = [
+        #     ("encoder.pre_encode.conv.0.weight", self.subsample.conv0.weight, "subsample.conv0.weight"),
+        #     ("encoder.pre_encode.conv.0.bias",   self.subsample.conv0.bias,   "subsample.conv0.bias"),
+        #     ("encoder.pre_encode.conv.2.weight", self.subsample.conv2.weight, "subsample.conv2.weight"),
+        #     ("encoder.pre_encode.conv.2.bias",   self.subsample.conv2.bias,   "subsample.conv2.bias"),
+        #     ("encoder.pre_encode.conv.3.weight", self.subsample.conv3.weight, "subsample.conv3.weight"),
+        #     ("encoder.pre_encode.conv.3.bias",   self.subsample.conv3.bias,   "subsample.conv3.bias"),
+        #     ("encoder.pre_encode.conv.5.weight", self.subsample.conv5.weight, "subsample.conv5.weight"),
+        #     ("encoder.pre_encode.conv.5.bias",   self.subsample.conv5.bias,   "subsample.conv5.bias"),
+        #     ("encoder.pre_encode.conv.6.weight", self.subsample.conv6.weight, "subsample.conv6.weight"),
+        #     ("encoder.pre_encode.conv.6.bias",   self.subsample.conv6.bias,   "subsample.conv6.bias"),
+        #     ("encoder.pre_encode.out.weight",    self.subsample.out.weight,   "subsample.out.weight"),
+        #     ("encoder.pre_encode.out.bias",      self.subsample.out.bias,     "subsample.out.bias"),
+        # ]
+        # inside load_weights(), after nemo = {...}
+        # print([k for k in nemo if "pre_encode" in k][:50])
+        # print([k for k in nemo if "ctc" in k or "decoder" in k][:50])
         sub_map = [
-            ("encoder.pre_encode.conv.0.weight", self.subsample.conv0.weight, "subsample.conv0.weight"),
-            ("encoder.pre_encode.conv.0.bias",   self.subsample.conv0.bias,   "subsample.conv0.bias"),
-            ("encoder.pre_encode.conv.2.weight", self.subsample.conv2.weight, "subsample.conv2.weight"),
-            ("encoder.pre_encode.conv.2.bias",   self.subsample.conv2.bias,   "subsample.conv2.bias"),
-            ("encoder.pre_encode.conv.3.weight", self.subsample.conv3.weight, "subsample.conv3.weight"),
-            ("encoder.pre_encode.conv.3.bias",   self.subsample.conv3.bias,   "subsample.conv3.bias"),
-            ("encoder.pre_encode.conv.5.weight", self.subsample.conv5.weight, "subsample.conv5.weight"),
-            ("encoder.pre_encode.conv.5.bias",   self.subsample.conv5.bias,   "subsample.conv5.bias"),
-            ("encoder.pre_encode.conv.6.weight", self.subsample.conv6.weight, "subsample.conv6.weight"),
-            ("encoder.pre_encode.conv.6.bias",   self.subsample.conv6.bias,   "subsample.conv6.bias"),
+            ("encoder.pre_encode.conv.0.weight", self.subsample.conv[0].weight, "subsample.conv.0.weight"),
+            ("encoder.pre_encode.conv.0.bias",   self.subsample.conv[0].bias,   "subsample.conv.0.bias"),
+            ("encoder.pre_encode.conv.2.weight", self.subsample.conv[2].weight, "subsample.conv.2.weight"),
+            ("encoder.pre_encode.conv.2.bias",   self.subsample.conv[2].bias,   "subsample.conv.2.bias"),
+            ("encoder.pre_encode.conv.3.weight", self.subsample.conv[3].weight, "subsample.conv.3.weight"),
+            ("encoder.pre_encode.conv.3.bias",   self.subsample.conv[3].bias,   "subsample.conv.3.bias"),
+            ("encoder.pre_encode.conv.5.weight", self.subsample.conv[5].weight, "subsample.conv.5.weight"),
+            ("encoder.pre_encode.conv.5.bias",   self.subsample.conv[5].bias,   "subsample.conv.5.bias"),
+            ("encoder.pre_encode.conv.6.weight", self.subsample.conv[6].weight, "subsample.conv.6.weight"),
+            ("encoder.pre_encode.conv.6.bias",   self.subsample.conv[6].bias,   "subsample.conv.6.bias"),
             ("encoder.pre_encode.out.weight",    self.subsample.out.weight,   "subsample.out.weight"),
             ("encoder.pre_encode.out.bias",      self.subsample.out.bias,     "subsample.out.bias"),
         ]
@@ -499,14 +876,14 @@ class FastConformerCTC(nn.Module):
             base = f"encoder.layers.{i}"
 
             ln_pairs = [
-                (f"{base}.norm_feed_forward1.weight", blk.ff1.ln.weight, f"blocks.{i}.ff1.ln.weight"),
-                (f"{base}.norm_feed_forward1.bias",   blk.ff1.ln.bias,   f"blocks.{i}.ff1.ln.bias"),
+                (f"{base}.norm_feed_forward1.weight", blk.ln_ff1.weight, f"blocks.{i}.ln_ff1.weight"),
+                (f"{base}.norm_feed_forward1.bias",   blk.ln_ff1.bias,   f"blocks.{i}.ln_ff1.bias"),
                 (f"{base}.norm_self_att.weight",      blk.ln_attn.weight,f"blocks.{i}.ln_attn.weight"),
                 (f"{base}.norm_self_att.bias",        blk.ln_attn.bias,  f"blocks.{i}.ln_attn.bias"),
-                (f"{base}.norm_conv.weight",          blk.conv.ln.weight,f"blocks.{i}.conv.ln.weight"),
-                (f"{base}.norm_conv.bias",            blk.conv.ln.bias,  f"blocks.{i}.conv.ln.bias"),
-                (f"{base}.norm_feed_forward2.weight", blk.ff2.ln.weight, f"blocks.{i}.ff2.ln.weight"),
-                (f"{base}.norm_feed_forward2.bias",   blk.ff2.ln.bias,   f"blocks.{i}.ff2.ln.bias"),
+                (f"{base}.norm_conv.weight",          blk.ln_conv.weight,f"blocks.{i}.ln_conv.weight"),
+                (f"{base}.norm_conv.bias",            blk.ln_conv.bias,  f"blocks.{i}.ln_conv.bias"),
+                (f"{base}.norm_feed_forward2.weight", blk.ln_ff2.weight, f"blocks.{i}.ln_ff2.weight"),
+                (f"{base}.norm_feed_forward2.bias",   blk.ln_ff2.bias,   f"blocks.{i}.ln_ff2.bias"),
                 (f"{base}.norm_out.weight",           blk.ln_out.weight, f"blocks.{i}.ln_out.weight"),
                 (f"{base}.norm_out.bias",             blk.ln_out.bias,   f"blocks.{i}.ln_out.bias"),
             ]
@@ -515,10 +892,10 @@ class FastConformerCTC(nn.Module):
                     copy_(p_dst, nemo[n_src], n_dst, n_src)
 
             ffn1 = [
-                (f"{base}.feed_forward1.linear1.weight", blk.ff1.fc1.weight, f"blocks.{i}.ff1.fc1.weight"),
-                (f"{base}.feed_forward1.linear1.bias",   blk.ff1.fc1.bias,   f"blocks.{i}.ff1.fc1.bias"),
-                (f"{base}.feed_forward1.linear2.weight", blk.ff1.fc2.weight, f"blocks.{i}.ff1.fc2.weight"),
-                (f"{base}.feed_forward1.linear2.bias",   blk.ff1.fc2.bias,   f"blocks.{i}.ff1.fc2.bias"),
+                (f"{base}.feed_forward1.linear1.weight", blk.ff1.linear1.weight, f"blocks.{i}.ff1.linear1.weight"),
+                (f"{base}.feed_forward1.linear1.bias",   blk.ff1.linear1.bias,   f"blocks.{i}.ff1.linear1.bias"),
+                (f"{base}.feed_forward1.linear2.weight", blk.ff1.linear2.weight, f"blocks.{i}.ff1.linear2.weight"),
+                (f"{base}.feed_forward1.linear2.bias",   blk.ff1.linear2.bias,   f"blocks.{i}.ff1.linear2.bias"),
             ]
             for n_src, p_dst, n_dst in ffn1:
                 if n_src in nemo:
@@ -548,6 +925,9 @@ class FastConformerCTC(nn.Module):
                 (f"{base}.conv.depthwise_conv.bias",    blk.conv.dw.bias,    f"blocks.{i}.conv.dw.bias"),
                 (f"{base}.conv.batch_norm.weight",      blk.conv.bn.weight,  f"blocks.{i}.conv.bn.weight"),
                 (f"{base}.conv.batch_norm.bias",        blk.conv.bn.bias,    f"blocks.{i}.conv.bn.bias"),
+                (f"{base}.conv.batch_norm.running_mean", blk.conv.bn.running_mean, f"blocks.{i}.conv.bn.running_mean"),
+                (f"{base}.conv.batch_norm.running_var",  blk.conv.bn.running_var,  f"blocks.{i}.conv.bn.running_var"),
+                (f"{base}.conv.batch_norm.num_batches_tracked", blk.conv.bn.num_batches_tracked, f"blocks.{i}.conv.bn.num_batches_tracked"),
                 (f"{base}.conv.pointwise_conv2.weight", blk.conv.pw2.weight, f"blocks.{i}.conv.pw2.weight"),
                 (f"{base}.conv.pointwise_conv2.bias",   blk.conv.pw2.bias,   f"blocks.{i}.conv.pw2.bias"),
             ]
@@ -556,10 +936,10 @@ class FastConformerCTC(nn.Module):
                     copy_(p_dst, nemo[n_src], n_dst, n_src)
 
             ffn2 = [
-                (f"{base}.feed_forward2.linear1.weight", blk.ff2.fc1.weight, f"blocks.{i}.ff2.fc1.weight"),
-                (f"{base}.feed_forward2.linear1.bias",   blk.ff2.fc1.bias,   f"blocks.{i}.ff2.fc1.bias"),
-                (f"{base}.feed_forward2.linear2.weight", blk.ff2.fc2.weight, f"blocks.{i}.ff2.fc2.weight"),
-                (f"{base}.feed_forward2.linear2.bias",   blk.ff2.fc2.bias,   f"blocks.{i}.ff2.fc2.bias"),
+                (f"{base}.feed_forward2.linear1.weight", blk.ff2.linear1.weight, f"blocks.{i}.ff2.linear1.weight"),
+                (f"{base}.feed_forward2.linear1.bias",   blk.ff2.linear1.bias,   f"blocks.{i}.ff2.linear1.bias"),
+                (f"{base}.feed_forward2.linear2.weight", blk.ff2.linear2.weight, f"blocks.{i}.ff2.linear2.weight"),
+                (f"{base}.feed_forward2.linear2.bias",   blk.ff2.linear2.bias,   f"blocks.{i}.ff2.linear2.bias"),
             ]
             for n_src, p_dst, n_dst in ffn2:
                 if n_src in nemo:
