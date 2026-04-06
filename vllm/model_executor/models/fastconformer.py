@@ -8,7 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig, CacheConfig, get_current_vllm_config
+from vllm.attention.layer import Attention
 from vllm.sequence import IntermediateTensors
 
 from vllm.v1.attention.backends.fastconformer_attn import (
@@ -17,7 +18,8 @@ from vllm.v1.attention.backends.fastconformer_attn import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.attention.backends.abstract import AttentionBackend
-from vllm.v1.kv_cache_interface import KVCacheSpec, FastConformerSpec
+from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend, FlexAttentionMetadata
+from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec, FastConformerConvSpec
 
 from vllm.transformers_utils.configs.fastconformer import FastConformerCTCConfig
 import math
@@ -65,58 +67,57 @@ class NemoSubsample8x2D(nn.Module):
 
 
 class ConformerFFN(nn.Module):
-    def __init__(self, d_model: int, ff_mult: int = 4, pdrop: float = 0.0):
+    def __init__(self, d_model: int, ff_mult: int = 4):
         super().__init__()
         self.ln = nn.LayerNorm(d_model)
         self.fc1 = nn.Linear(d_model, ff_mult * d_model)
         self.fc2 = nn.Linear(ff_mult * d_model, d_model)
-        self.drop = nn.Dropout(pdrop)
 
     def forward(self, x: torch.Tensor, scale: float = 0.5) -> torch.Tensor:
         # x: [B, T, D]
         y = self.ln(x)
         y = self.fc2(F.silu(self.fc1(y)))
-        return x + self.drop(y) * scale
+        return x + y * scale
 
-
-class FastConformerCache(torch.nn.Module, AttentionLayerBase):
-    def __init__(
-        self,
-        sliding_window: int,
-        num_kv_heads: int,
-        head_dim: int,
-        prefix: str,
-    ):
+class FastConformerConvCache(torch.nn.Module, AttentionLayerBase):
+    def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig):
         super().__init__()
-        self.kv_cache = [torch.tensor([])]
-        self.head_dim = head_dim
-        self.prefix = prefix
         self.dtype = torch.bfloat16
-        self.sliding_window = sliding_window
-        self.num_kv_heads = num_kv_heads
-        compilation_config = get_current_vllm_config().compilation_config
-        if prefix in compilation_config.static_forward_context:
+        self.d_model = int(d_model)
+        self.k = int(k)
+        self.left_ctx = self.k - 1  # L
+        # TODO: this is a hack to get the page size to match attn page size
+        # we should try to get smth more durable to work
+        self.left_shape = self.left_ctx * 32
+        self.prefix = prefix
+        self.cache_config = cache_config
+        self.kv_cache = [torch.tensor([])]
+
+        compilation = get_current_vllm_config().compilation_config
+        if prefix in compilation.static_forward_context:
             raise ValueError(f"duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
+        compilation.static_forward_context[prefix] = self
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
-        return FastConformerSpec(
-            block_size=self.sliding_window, # `block_size` controls the shape of the KV cache
-            sliding_window=self.sliding_window,
-            num_kv_heads=self.num_kv_heads,
-            head_size=self.head_dim,
+        return FastConformerConvSpec(
+            # TODO: i think this should just be block_size=1?
+            # need to re-check how the attn metadata is constructed
+            block_size=self.cache_config.block_size,
+            # shape=(self.left_ctx, self.d_model),
+            shape=(self.left_shape, self.d_model),
             dtype=self.dtype,
         )
 
-    def forward(self): ...
+    def forward(self):
+        pass
 
     def get_attn_backend(self) -> AttentionBackend:
         return FastConformerBackend
 
 
+
 class RelPosSelfAttention(nn.Module):
-    """scores = (q + u) @ k^T + (q + v) @ r^T."""
-    def __init__(self, d_model: int, num_heads: int, window: int, prefix: str):
+    def __init__(self, d_model: int, num_heads: int, window: int, cache_config: CacheConfig, prefix: str):
         super().__init__()
         assert d_model % num_heads == 0
         self.h = num_heads
@@ -133,129 +134,130 @@ class RelPosSelfAttention(nn.Module):
         self.pos_bias_v = nn.Parameter(torch.zeros(self.h, self.dh))
 
         self.prefix = prefix
-        self.cache_prefix = f"{self.prefix}.kv_cache"
 
-        self.cache = FastConformerCache(
-            sliding_window=self.window,
+        self.attn = Attention(
+            num_heads=self.h,
+            head_size=self.dh,
+            scale=self.dh**-0.5,
             num_kv_heads=self.h,
-            head_dim=self.dh,
-            prefix=self.cache_prefix,
+            cache_config=CacheConfig(
+                sliding_window=self.window,
+                cache_dtype="auto",
+                block_size=cache_config.block_size,
+                calculate_kv_scales=False,
+            ),
+            prefix=self.prefix,
+            attn_backend=FlexAttentionBackend
         )
 
-    @staticmethod
-    def _build_rel_sin_table(T: int, D: int, device, dtype):
-        # Standard sinusoidal table for relative positions [-T+1, ..., 0, ..., +T-1]
-        # shape: [2T-1, D]
-        pos = torch.arange(-(T - 1), T, device=device, dtype=dtype).unsqueeze(1)   # [2T-1, 1]
-        div = torch.exp(torch.arange(0, D, 2, device=device, dtype=dtype) * (-math.log(10000.0) / D))  # [D/2]
-        sin = torch.sin(pos * div)  # [2T-1, D/2]
-        cos = torch.cos(pos * div)  # [2T-1, D/2]
-        table = torch.zeros((2 * T - 1, D), device=device, dtype=dtype)
-        table[:, 0::2] = sin
-        table[:, 1::2] = cos
-        return table  # [2T-1, D]
+        # TODO: verify whether this is needed
+        self._k_scale = torch.tensor(1.0, dtype=torch.float32)
+        self._v_scale = torch.tensor(1.0, dtype=torch.float32)
+        self._q_scale = torch.tensor(1.0, dtype=torch.float32)
+        self._prob_scale = torch.tensor(1.0, dtype=torch.float32)
 
-    @staticmethod
-    def _rel_shift(x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H, T, 2T-1] -> [B, H, T, T] (Transformer-XL trick, batched)
-        B, H, T, m = x.shape
-        x = F.pad(x, (1, 0))  # pad width in dim=3 (2T-1 -> 2T)
-        x = x.view(B, H, -1, T)  # [B, H, (T + (T-1)), T]
-        x = x[:, :, 1:, :]  # drop the first element in new "S"-dim
-        return x[:, :, :T, :]  # return [B, H, T, T]
+        if cache_config.block_size != 128:
+            # attn page size must match conv page size
+            raise Exception(f"attn cache block size must be 128, got {cache_config.block_size}")
+
+    def _build_shaw_band_bias(self, q: torch.Tensor, W: int) -> torch.Tensor:
+        B, H, T, Dh = q.shape
+        D = H * Dh
+        device, dtype = q.device, q.dtype
+
+        deltas = torch.arange(-(W - 1), W, device=device)
+        pos = deltas[:, None].to(dtype)  # [2W-1, 1]
+        div = torch.exp(torch.arange(0, D, 2, device=device, dtype=dtype)
+                        * (-math.log(10000.0) / D))
+        sin = torch.sin(pos * div)  # [2W-1, D/2]
+        cos = torch.cos(pos * div)
+        rel = torch.zeros((2 * W - 1, D), device=device, dtype=dtype)
+        rel[:, 0::2] = sin
+        rel[:, 1::2] = cos
+        rel = self.linear_pos(rel)                              # [2W-1, D]
+        rel = rel.view(2 * W - 1, H, Dh).permute(1, 2, 0)       # [H, Dh, 2W-1]
+
+        q_with_v = q + self.pos_bias_v.unsqueeze(0).unsqueeze(2)  # [B,H,T,Dh]
+        band_bias = torch.einsum("bhtd,hdm->bhtm", q_with_v, rel) # [B,H,T,2W-1]
+        return band_bias
+
+    def _make_shaw_score_mod(self, band_bias: torch.Tensor, W: int):
+        # band_bias: [B, H, T, 2W-1]
+        @torch.jit.script_if_tracing
+        def score_mod(score: torch.Tensor,
+                    b: torch.Tensor, h: torch.Tensor,
+                    q_idx: torch.Tensor, kv_idx: torch.Tensor,
+                    physical_q: torch.Tensor = None) -> torch.Tensor:
+            rel = q_idx - kv_idx
+            low = -(W - 1); high = (W - 1)
+            rel = torch.clamp(rel, low, high)
+            idx = rel + (W - 1)  # [0..2W-2]
+            return score + band_bias[b.long(), h.long(), q_idx.long(), idx.long()]
+        return score_mod
+
+    def _prepare_flex(self, attn_metadata: FlexAttentionMetadata, score_mod):
+        # TODO: verify whether this is needed. for example,
+        # - is block_mask already set?
+        # - is score_mod already set?
+        # - is transformed_score_mod already set?
+        attn_metadata.sliding_window = int(self.window)
+
+        attn_metadata.score_mod = score_mod
+        attn_metadata.transformed_score_mod = attn_metadata.get_transformed_score_mod()
+
+        attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attn_metadata = get_forward_context().attn_metadata
-        if attn_metadata is None:
-            # NOTE: attention metadata is not populated for dummy runs
-            return self.forward_no_cache(x)
+        B, T, D = x.shape
+        H, Dh = self.h, self.dh
+
+        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()  # [B,H,T,Dh]
+        k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()  # [B,H,T,Dh]
+        v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2).contiguous()  # [B,H,T,Dh]
+
+        q_plus_u = q + self.pos_bias_u.unsqueeze(0).unsqueeze(2)            # [B,H,T,Dh]
+
+        band_bias = self._build_shaw_band_bias(q, self.window)
+        score_mod = self._make_shaw_score_mod(band_bias, self.window)
+
+        query = q_plus_u.reshape(-1, H, Dh)
+        key   = k.reshape(-1, H, Dh)
+        value = v.reshape(-1, H, Dh)
+
+        fctx = get_forward_context()
+        attn_metadata_all = fctx.attn_metadata
+        if isinstance(attn_metadata_all, dict):
+            attn_metadata: FlexAttentionMetadata = attn_metadata_all[self.prefix]
+            self._prepare_flex(attn_metadata, score_mod=score_mod)
         else:
-            return self.forward_cache(x, attn_metadata[self.cache_prefix])
+            # dummy run; compute normal attention
+            attn_scores = torch.matmul(query, key.transpose(-2, -1)) / (Dh ** 0.5)
+            attn_probs = torch.softmax(attn_scores, dim=-1)
+            attn_output = torch.matmul(attn_probs, value)
+            out = attn_output.view(B, T, H, Dh).transpose(1, 2).contiguous().view(B, T, D)
+            return self.o_proj(out)
 
-    def forward_no_cache(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        H, Dh = self.h, self.dh
-        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
-        k = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
-        v = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
-        return self._attention_forward(q, k, v)
+        self_kv_cache = self.attn.kv_cache[fctx.virtual_engine]
 
-    def forward_cache(self, x: torch.Tensor, ctx: FastConformerMetadata) -> torch.Tensor:
-        B, T, D = x.shape
-        H, Dh = self.h, self.dh
-
-        q = self.q_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
-        k_new = self.k_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
-        v_new = self.v_proj(x).view(B, T, H, Dh).transpose(1, 2)  # [B, H, T, Dh]
-
-        with torch.no_grad():
-            kv_cache = self.cache.kv_cache[0]  # (2, n_pages, window, H, Dh)
-            k_cache = kv_cache[0][ctx.slot_mapping, ...]  # [B, window, H, Dh]
-            v_cache = kv_cache[1][ctx.slot_mapping, ...]  # [B, window, H, Dh]
-
-        k_cache = k_cache.permute(0, 2, 1, 3).contiguous()  # [B, H, window, Dh]
-        v_cache = v_cache.permute(0, 2, 1, 3).contiguous()  # [B, H, window, Dh]
-
-        k_cat = torch.cat([k_cache, k_new], dim=2)  # [B, H, window+T, Dh]
-        v_cat = torch.cat([v_cache, v_new], dim=2)  # [B, H, window+T, Dh]
-
-        # update kv cache by rolling left T
-        k_cache_new = torch.cat(
-            [k_cache[:, :, T:, :].permute(0, 2, 1, 3), k_new.permute(0, 2, 1, 3)], dim=1
-        )  # [B, window, H, Dh]
-        v_cache_new = torch.cat(
-            [v_cache[:, :, T:, :].permute(0, 2, 1, 3), v_new.permute(0, 2, 1, 3)], dim=1
-        )  # [B, window, H, Dh]
-
-        with torch.no_grad():
-            self.cache.kv_cache[0][0][ctx.slot_mapping, ...] = k_cache_new
-            self.cache.kv_cache[0][1][ctx.slot_mapping, ...] = v_cache_new
-
-        return self._attention_forward(q, k_cat, v_cat)
-
-    def _attention_forward(self, q, k, v) -> torch.Tensor:
-        # q, k, v: [B, H, T/S, Dh]
-        B, H, T, Dh = q.shape
-        S = k.shape[2]
-        D = H * Dh
-        device = q.device
-        dtype = q.dtype
-
-        # (q + u) @ k^T
-        pos_bias_u = self.pos_bias_u.unsqueeze(0).unsqueeze(2)  # [1, H, 1, Dh]
-        q_with_u = q + pos_bias_u                               # [B, H, T, Dh]
-        content_scores = torch.matmul(q_with_u, k.transpose(-2, -1))  # [B, H, T, S]
-
-        # TODO: can we cache this?
-        rel = self._build_rel_sin_table(S, D, device, dtype)            # [2S-1, D]
-        rel = self.linear_pos(rel)                                      # [2S-1, D]
-        rel = rel.view(2 * S - 1, H, Dh).permute(1, 0, 2).contiguous()  # [H, 2S-1, Dh]
-
-        # Compute (q + v) @ r^T with correct batching
-        pos_bias_v = self.pos_bias_v.unsqueeze(0).unsqueeze(2)          # [1, H, 1, Dh]
-        q_with_v = q + pos_bias_v                                      # [B, H, T, Dh]
-        rel_t = rel.transpose(1, 2)                                    # [H, Dh, 2S-1]
-
-        # Compute: [B, H, T, Dh] x [H, Dh, 2S-1] -> [B, H, T, 2S-1]
-        rel_scores = torch.einsum('bhtd,hdm->bhtm', q_with_v, rel_t)   # [B, H, T, 2S-1]
-        rel_scores = self._rel_shift(rel_scores)                       # [B, H, T, S]
-
-        scores = (content_scores + rel_scores) * (Dh ** -0.5)          # [B, H, T, S]
-
-        mask = build_local_band_mask(T, S, device=device, dtype=scores.dtype)  # [T, S]
-        scores = scores + mask.unsqueeze(0).unsqueeze(0)  # [1,1,T,S], broadcast over B, H
-
-        attn = F.softmax(scores, dim=-1)                               # [B, H, T, S]
-
-        y = torch.matmul(attn, v)                                      # [B, H, T, Dh]
-        y = y.transpose(1, 2).contiguous().view(B, T, D)               # [B, T, D]
-        return self.o_proj(y)
+        out_buf = torch.empty_like(query)
+        out = self.attn.impl.forward(
+            layer=self,
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=self_kv_cache,
+            attn_metadata=attn_metadata,
+            output=out_buf,
+        )
+        out = out.view(B, T, H, Dh).transpose(1, 2).contiguous().view(B, T, D)
+        return self.o_proj(out)
 
 
 class ConformerConvModule(nn.Module):
-    def __init__(self, d_model: int, k: int = 9):
+    def __init__(self, d_model: int, k: int, prefix: str, cache_config: CacheConfig):
         super().__init__()
         assert k % 2 == 1
+        self.prefix = prefix
         self.ln = nn.LayerNorm(d_model)
         self.pw1 = nn.Conv1d(d_model, 2 * d_model, 1)
         self.dw  = nn.Conv1d(d_model, d_model, k, padding=(k-1)//2,
@@ -263,24 +265,64 @@ class ConformerConvModule(nn.Module):
         self.bn  = nn.BatchNorm1d(d_model, eps=1e-3, momentum=0.1)
         self.pw2 = nn.Conv1d(d_model, d_model, 1)
 
+        self.conv_cache = FastConformerConvCache(
+            d_model=d_model,
+            k=k,
+            prefix=f"{prefix}.conv_cache",
+            cache_config=cache_config,
+        )
+
+        self.d_model = d_model
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, D]
         B, T, D = x.shape
-        y = self.ln(x)                         # [B, T, D]
-        y = y.transpose(1, 2)                  # [B, D, T] (N, C, L)
+        assert D == self.d_model
 
-        y = self.pw1(y)                        # [B, 2D, T]
-        a, b = y.chunk(2, dim=1)               # split along channel dim
-        y = a * torch.sigmoid(b)               # [B, D, T]
+        y = self.ln(x)              # [B,T,D]
+        y = y.transpose(1, 2)       # [B,D,T] (N,C,L)
+        y = self.pw1(y)             # [B,2D,T]
+        a, b = y.chunk(2, dim=1)
+        pre_dw = a * torch.sigmoid(b)   # [B,D,T]
 
-        y = self.dw(y)                         # [B, D, T]
-        y = self.bn(y)                         # [B, D, T]
-        y = F.silu(y)                          # [B, D, T]
+        fctx = get_forward_context()
+        attn_meta_all = fctx.attn_metadata
+        if isinstance(attn_meta_all, dict):
+            attn_metadata: FastConformerMetadata = attn_meta_all[self.conv_cache.prefix]
+        else:
+            # dummy run; compute normal conv
+            y_dw = self.dw(pre_dw)
+            y_dw = self.bn(y_dw)
+            y_dw = F.silu(y_dw)
+            y = self.pw2(y_dw)
+            y = y.transpose(1, 2)
+            return x + y
 
-        y = self.pw2(y)                        # [B, D, T]
-        y = y.transpose(1, 2)                  # [B, T, D]
+        block_table = attn_metadata.block_table_tensor    # [B, n_blocks]
+        page_indices = block_table[:, 0]
 
-        return x + y                           # [B, T, D]
+        store = self.conv_cache.kv_cache[fctx.virtual_engine]    # [num_pages, L, D]
+
+        hist = store[page_indices]              # [B, L, D]
+        hist = hist.transpose(1, 2).contiguous()   # [B, D, L]
+
+        x_cat = torch.cat([hist, pre_dw], dim=-1)   # [B, D, L+T]
+
+        y_dw = F.conv1d(
+            x_cat, self.dw.weight, self.dw.bias,
+            stride=1, padding=0, dilation=1, groups=D
+        )[:,:,-T:]                                        # [B,D,T]
+        y_dw = self.bn(y_dw)
+        y_dw = F.silu(y_dw)
+
+        y = self.pw2(y_dw)                       # [B,D,T]
+        y = y.transpose(1, 2)                    # [B,T,D]
+
+        # update cache
+        new_hist = x_cat[:, :, -self.conv_cache.left_shape:]  # [B,D,L]
+        store[page_indices] = new_hist.transpose(1, 2)  # back to [B,L,D]
+
+        return x + y
 
 
 class ConformerBlock(nn.Module):
@@ -290,13 +332,14 @@ class ConformerBlock(nn.Module):
         k_conv: int,
         ff_mult: int,
         attn_window: int,
+        cache_config: CacheConfig,
         prefix: str,
     ):
         super().__init__()
         self.ff1 = ConformerFFN(d_model, ff_mult)
         self.ln_attn = nn.LayerNorm(d_model)
-        self.attn = RelPosSelfAttention(d_model, n_heads, attn_window, prefix=f"{prefix}.attn")
-        self.conv = ConformerConvModule(d_model, k_conv)
+        self.attn = RelPosSelfAttention(d_model, n_heads, attn_window, cache_config, prefix=f"{prefix}.attn")
+        self.conv = ConformerConvModule(d_model, k_conv, prefix=f"{prefix}.conv", cache_config=cache_config)
         self.ff2 = ConformerFFN(d_model, ff_mult)
         self.ln_out = nn.LayerNorm(d_model)
 
@@ -342,10 +385,11 @@ class FastConformerCTC(nn.Module):
         self.blocks = nn.ModuleList([
             ConformerBlock(
                 d_model=self.d_model,
-                n_heads=config.n_heads,
+                n_heads=config.num_attention_heads,
                 k_conv=config.k_conv,
                 ff_mult=config.ff_mult,
                 attn_window=att_window,
+                cache_config=vllm_config.cache_config,
                 prefix=f"{prefix}.blocks.{i}",
             )
             for i in range(config.n_layers)
@@ -361,7 +405,7 @@ class FastConformerCTC(nn.Module):
         if attn_metadata is None:
             # attn_metadata is None during dummy runs
             return x.unsqueeze(0)
-        ctx: FastConformerMetadata = attn_metadata.values()[0]
+        ctx: FastConformerMetadata = list(attn_metadata.values())[0]
         num_seqs = ctx.num_reqs
         seq_lens = ctx.query_start_loc[1:] - ctx.query_start_loc[:-1]
         if not torch.all(seq_lens == seq_lens[0]):
@@ -371,7 +415,7 @@ class FastConformerCTC(nn.Module):
         batch_size = num_seqs
         time_dim = seq_lens[0].item()
         feature_dim = x.shape[-1]
-        return x.view(batch_size, time_dim, feature_dim)
+        return x.view(batch_size, time_dim * 8, feature_dim)
 
 
     def _add_ragged_format(self, x: torch.Tensor) -> torch.Tensor:

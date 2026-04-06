@@ -1176,7 +1176,9 @@ class FlexAttentionImpl(AttentionImpl):
         # torch._dynamo.try_mark_dynamic(query, 2)
 
         assert attn_metadata.block_mask is not None
-        block_m, block_n = attn_metadata.block_mask.BLOCK_SIZE
+        # block_m, block_n = attn_metadata.block_mask.BLOCK_SIZE
+        # TODO: figure out how to get around this
+        block_m, block_n = 4, 4
 
         kernel_options = get_kernel_options(
             query, block_m, block_n, attn_metadata.direct_build
