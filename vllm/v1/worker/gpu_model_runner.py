@@ -5974,17 +5974,25 @@ class GPUModelRunner(
         # like `inf` or `nan`.
         # To avoid breaking the sampler, we use a random tensor here instead.
 
+        # Check if hidden states is an integer tensor (long or int32)
+        is_int_tensor = hidden_states.dtype in (torch.int32, torch.int64, torch.long, torch.int16)
+
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
             # MM Encoder only model no need to run sampler.
             return torch.tensor([])
 
-        hidden_states = torch.rand_like(hidden_states)
+        # Skip this for integer tensors.
+        if not is_int_tensor:
+            hidden_states = torch.rand_like(hidden_states)
 
         logits = self.model.compute_logits(hidden_states)
         num_reqs = logits.size(0)
 
         dummy_tensors = lambda v: torch.full((num_reqs,), v, device=self.device)
+
+        # Skip sampling for integer tensors
+        skip_sampling = is_int_tensor
 
         dummy_metadata = SamplingMetadata(
             temperature=dummy_tensors(0.5),
@@ -6005,32 +6013,38 @@ class GPUModelRunner(
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
             logitsprocs=LogitsProcessors(),
-            skip_sampling=False,
+            skip_sampling=skip_sampling,
         )
         try:
-            sampler_output = self.sampler(
-                logits=logits, sampling_metadata=dummy_metadata
-            )
-            # Also warm forward_native (taken when generators dict is non-empty),
-            # but skip the extra call in 'processed_logits' / 'processed_logprobs'
-            # modes — there TopKTopPSampler binds forward = forward_native at
-            # init time, so the warmup call is redundant and only inflates peak
-            # memory during profile_run.
-            # No .clone() of logits: warmup output is discarded, so any in-place
-            # mutation by forward_native does not affect correctness.
-            if self.sampler.logprobs_mode not in (
-                "processed_logits",
-                "processed_logprobs",
-            ):
-                self.sampler(
-                    logits=logits,
-                    sampling_metadata=replace(
-                        dummy_metadata,
-                        generators={
-                            0: torch.Generator(device=self.device).manual_seed(0)
-                        },
-                    ),
+            if skip_sampling:
+                sampler_output = SamplerOutput(
+                    sampled_token_ids=torch.zeros((num_reqs, 1), dtype=torch.int32, device="cpu"),
+                    logprobs_tensors=None,
                 )
+            else:
+                sampler_output = self.sampler(
+                    logits=logits, sampling_metadata=dummy_metadata
+                )
+                # Also warm forward_native (taken when generators dict is non-empty),
+                # but skip the extra call in 'processed_logits' / 'processed_logprobs'
+                # modes — there TopKTopPSampler binds forward = forward_native at
+                # init time, so the warmup call is redundant and only inflates peak
+                # memory during profile_run.
+                # No .clone() of logits: warmup output is discarded, so any in-place
+                # mutation by forward_native does not affect correctness.
+                if self.sampler.logprobs_mode not in (
+                    "processed_logits",
+                    "processed_logprobs",
+                ):
+                    self.sampler(
+                        logits=logits,
+                        sampling_metadata=replace(
+                            dummy_metadata,
+                            generators={
+                                0: torch.Generator(device=self.device).manual_seed(0)
+                            },
+                        ),
+                    )
         except RuntimeError as e:
             if "out of memory" in str(e):
                 raise RuntimeError(
