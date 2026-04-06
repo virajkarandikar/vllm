@@ -100,8 +100,8 @@ class EngineCoreRequest(
     lora_request: LoRARequest | None
     cache_salt: str | None
     data_parallel_rank: int | None
-    is_streaming: bool | None = None
     prompt_embeds: torch.Tensor | None = None
+    custom_inputs: dict[str, torch.Tensor] | None = None
 
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). `True` means the position is a real
@@ -144,6 +144,16 @@ class EngineCoreRequest(
             return self.sampling_params
         assert self.pooling_params is not None
         return self.pooling_params
+
+
+class EngineCoreAppendRequest(
+    msgspec.Struct,
+    array_like=True,  # type: ignore[call-arg]
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,
+):  # type: ignore[call-arg]
+    request_id: str
+    custom_inputs: dict[str, torch.Tensor]
 
 
 class EngineCoreEventType(enum.IntEnum):

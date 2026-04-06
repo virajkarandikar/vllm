@@ -58,6 +58,7 @@ from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.engine import (
     EEP_NOTIFICATION_CALL_ID,
     EEPNotificationType,
+    EngineCoreAppendRequest,
     EngineCoreOutput,
     EngineCoreOutputs,
     EngineCoreReadyResponse,
@@ -385,8 +386,9 @@ class EngineCore:
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
 
-    def set_input_embeds(self, request_id: str, input_embeds: torch.Tensor):
-        self.scheduler.set_input_embeds(request_id, input_embeds)
+    def set_custom_inputs(self, request_id: str, custom_inputs: dict[str, torch.Tensor]):
+        """Set custom inputs for a request."""
+        self.scheduler.set_custom_inputs(request_id, custom_inputs)
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -1364,8 +1366,8 @@ class EngineCoreProc(EngineCore):
                 return
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.APPEND:
-            request_id, input_embeds = request
-            self.set_input_embeds(request_id, input_embeds)
+            request_id, custom_inputs = request
+            self.set_custom_inputs(request_id, custom_inputs)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -1559,13 +1561,8 @@ class EngineCoreProc(EngineCore):
                             self._handle_request_preproc_error(req)
                             continue
                     elif request_type == EngineCoreRequestType.APPEND:
-                        if len(data_frames) < 1 or len(data_frames) > 2:
-                            raise ValueError(f"Unexpected number of data frames {len(data_frames)} for APPEND request")
-                        request_id, (dtype, shape, mem) = generic_decoder.decode(data_frames[0])
-                        if len(data_frames) == 2:
-                            mem = data_frames[1]
-                        input_embeds = generic_decoder._decode_tensor((dtype, shape, mem))
-                        request = (request_id, input_embeds)
+                        append_req: EngineCoreAppendRequest = generic_decoder.decode(data_frames)
+                        request = (append_req.request_id, append_req.custom_inputs)
                     else:
                         request = generic_decoder.decode(data_frames)
 

@@ -295,6 +295,7 @@ class AsyncLLM(EngineClient):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         is_streaming: bool | None = None,
+        custom_inputs: dict[str, torch.Tensor] | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
@@ -359,8 +360,8 @@ class AsyncLLM(EngineClient):
                 priority=priority,
                 data_parallel_rank=data_parallel_rank,
             )
-            if is_streaming is not None:
-                request.is_streaming = is_streaming
+            if custom_inputs is not None:
+                request.custom_inputs = custom_inputs
             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
         if reasoning_ended is not None:
@@ -400,15 +401,15 @@ class AsyncLLM(EngineClient):
             )
         return queue
 
-    async def append_request(self, request_id: str, input_embeds: torch.Tensor):
+    async def append_request(self, request_id: str, custom_inputs: dict[str, torch.Tensor]):
         """
-        Adds new input embedding into existing request.
-        Once embeddings are added, the request will be scheduled for execution.
+        Adds new custom inputs into existing request.
+        Once inputs are added, the request will be scheduled for execution.
         """
         if self.errored:
             raise EngineDeadError()
 
-        await self.engine_core.set_input_embeds_async(request_id, input_embeds)
+        await self.engine_core.set_custom_inputs_async(request_id, custom_inputs)
 
     async def _add_request(
         self,
@@ -552,6 +553,7 @@ class AsyncLLM(EngineClient):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         is_streaming: bool | None = None,
+        custom_inputs: dict[str, torch.Tensor] | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
         """
         Main function called by the API server to kick off a request
@@ -583,6 +585,7 @@ class AsyncLLM(EngineClient):
                 reasoning_ended=reasoning_ended,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
                 is_streaming=is_streaming,
+                custom_inputs=custom_inputs,
             )
 
             # The output_handler task pushes items into the queue.
