@@ -173,7 +173,9 @@ class RequestState:
         self.queue = queue
         self.num_cached_tokens = 0
 
-        self.cumulative_hidden_states: list[torch.Tensor] | None = None
+        # TODO: do cumulative custom outputs if needed
+        # for now, will replace the custom outputs on each iteration
+        self.custom_outputs: dict[str, torch.Tensor] | None = None
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -278,7 +280,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
-        new_hidden_states: torch.Tensor | None = None,
+        new_custom_outputs: dict[str, torch.Tensor] | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -320,7 +322,7 @@ class RequestState:
             )
 
         output = self._new_completion_output(
-            new_token_ids, finish_reason, stop_reason, new_hidden_states
+            new_token_ids, finish_reason, stop_reason, new_custom_outputs
         )
 
         if self.parent_req is None:
@@ -383,7 +385,7 @@ class RequestState:
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
-        hidden_states: torch.Tensor | None = None,
+        custom_outputs: dict[str, torch.Tensor] | None = None,
     ) -> CompletionOutput:
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
@@ -393,10 +395,7 @@ class RequestState:
         # Prepare text and token_ids, based on delta mode
         text = self.detokenizer.get_next_output_text(finished, delta)
         if not delta:
-            hidden_states = self.cumulative_hidden_states
             token_ids = self.detokenizer.output_token_ids
-        else:
-            hidden_states = [hidden_states]
 
         # Prepare logprobs, based on delta mode
         logprobs = self.logprobs_processor.logprobs
@@ -412,7 +411,7 @@ class RequestState:
             index=self.request_index,
             text=text,
             token_ids=token_ids,
-            hidden_states=hidden_states,
+            custom_outputs=custom_outputs,
             routed_experts=routed_experts,
             logprobs=logprobs,
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
@@ -626,7 +625,7 @@ class OutputProcessor:
             )
 
             new_token_ids = engine_core_output.new_token_ids
-            new_hidden_states = engine_core_output.new_hidden_states
+            new_custom_outputs = engine_core_output.new_custom_outputs
             pooling_output = engine_core_output.pooling_output
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
@@ -658,12 +657,10 @@ class OutputProcessor:
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
-                # 4) Update the cumulative hidden states.
-                if new_hidden_states is not None:
-                    if req_state.cumulative_hidden_states is None:
-                        req_state.cumulative_hidden_states = [new_hidden_states]
-                    else:
-                        req_state.cumulative_hidden_states.append(new_hidden_states)
+                # 4) Update custom outputs in request state
+                # TODO: switch to accumulation of the custom outputs if needed
+                if new_custom_outputs:
+                    req_state.custom_outputs = new_custom_outputs
 
             # 5) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
@@ -672,7 +669,7 @@ class OutputProcessor:
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
-                new_hidden_states,
+                new_custom_outputs,
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

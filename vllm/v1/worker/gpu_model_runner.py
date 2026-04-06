@@ -4403,13 +4403,27 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
-                # True when EAGLE 3 is used.
-                hidden_states, aux_hidden_states = model_output
-            else:
-                # Common case.
+            aux_hidden_states = None
+            custom_outputs_flat = None
+            if isinstance(model_output, torch.Tensor):
                 hidden_states = model_output
-                aux_hidden_states = None
+            else:
+                outputs = model_output
+                hidden_states = outputs[0]
+                offset = 1
+                if self.use_aux_hidden_state_outputs:
+                    aux_hidden_states = outputs[offset]
+                    offset += 1
+                if self.model_config.custom_outputs:
+                    custom_outputs = outputs[offset:]
+                    if len(custom_outputs) != len(self.model_config.custom_outputs):
+                        raise RuntimeError(
+                            f"Expected [{self.model_config.custom_outputs}] but got {len(custom_outputs)} outputs from model"
+                        )
+                    custom_outputs_flat = {
+                        name: val
+                        for name, val in zip(self.model_config.custom_outputs, custom_outputs)
+                    }
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -4691,14 +4705,22 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
-            hidden_states_list = None
-            if self.model_config.return_hidden_states:
-                # Extract hidden states per request
-                hidden_states_list = []
+            custom_outputs_list = None
+            if custom_outputs_flat:
+                custom_outputs_list = []
+                num_scheduled_tokens_np = np.array(
+                    [scheduler_output.num_scheduled_tokens[req_id]
+                     for req_id in req_ids_output_copy],
+                    dtype=np.int32,
+                )
+                query_start_loc_np = self.query_start_loc.np[:num_reqs]
                 for i in range(num_reqs):
-                    start = int(self.query_start_loc.np[i])
-                    end = int(self.query_start_loc.np[i + 1])
-                    hidden_states_list.append(hidden_states[start:end].cpu())
+                    start = int(query_start_loc_np[i])
+                    length = int(num_scheduled_tokens_np[i])
+                    request_custom_outputs = {}
+                    for name, arr in custom_outputs_flat.items():
+                        request_custom_outputs[name] = arr[start:start + length].cpu()
+                    custom_outputs_list.append(request_custom_outputs)
 
 
             output = ModelRunnerOutput(
@@ -4707,7 +4729,7 @@ class GPUModelRunner(
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
-                hidden_states=hidden_states_list,
+                custom_outputs=custom_outputs_list,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
@@ -6047,10 +6069,10 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
 
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
-            else:
+            if isinstance(outputs, torch.Tensor):
                 hidden_states = outputs
+            else:
+                hidden_states = outputs[0]
 
             if self.speculative_config and (
                 self.speculative_config.use_eagle()

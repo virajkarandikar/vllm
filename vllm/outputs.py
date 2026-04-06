@@ -40,7 +40,7 @@ class CompletionOutput:
     index: int
     text: str
     token_ids: GenericSequence[int]
-    hidden_states: list[torch.Tensor] | None = None
+    custom_outputs: dict[str, torch.Tensor] | None = None
     cumulative_logprob: float | None = None
     logprobs: SampleLogprobs | None = None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
@@ -56,7 +56,7 @@ class CompletionOutput:
             f"CompletionOutput(index={self.index}, "
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
-            f"hidden_states={'...' if self.hidden_states is not None else None}, "
+            f"custom_outputs={'...' if self.custom_outputs else None}, "
             f"routed_experts={self.routed_experts}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
