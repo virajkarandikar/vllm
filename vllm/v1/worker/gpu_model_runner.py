@@ -3565,6 +3565,8 @@ class GPUModelRunner(
                 )
 
             input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
+            # TODO: which should be used for custom inputs,
+            # num_input_tokens or num_scheduled_tokens?
             model_kwargs = {
                 **self._init_model_kwargs(num_input_tokens),
                 **self._extract_mm_kwargs(scheduler_output),
@@ -6005,14 +6007,10 @@ class GPUModelRunner(
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
-                model_kwargs = {
-                    **model_kwargs,
-                    **self._dummy_mm_kwargs(num_reqs),
-                }
+                model_kwargs.update(self._dummy_mm_kwargs(num_reqs))
             elif self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
-                model_kwargs = self._init_model_kwargs(num_tokens_padded)
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
