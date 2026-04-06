@@ -3624,7 +3624,13 @@ class GPUModelRunner(
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
-        if spec_decode_metadata is None:
+        if sampling_metadata.skip_sampling:
+            num_reqs = self.input_batch.num_reqs
+            return SamplerOutput(
+                sampled_token_ids=torch.zeros((num_reqs, 1), dtype=torch.int32, device="cpu"),
+                logprobs_tensors=None,
+            )
+        elif spec_decode_metadata is None:
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
@@ -6134,6 +6140,7 @@ class GPUModelRunner(
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
             logitsprocs=LogitsProcessors(),
+            skip_sampling=False,
         )
         try:
             sampler_output = self.sampler(
