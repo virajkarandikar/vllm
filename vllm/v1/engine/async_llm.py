@@ -397,6 +397,16 @@ class AsyncLLM(EngineClient):
             )
         return queue
 
+    async def append_request(self, request_id: str, input_embeds: torch.Tensor):
+        """
+        Adds new input embedding into existing request.
+        Once embeddings are added, the request will be scheduled for execution.
+        """
+        if self.errored:
+            raise EngineDeadError()
+
+        await self.engine_core.set_input_embeds_async(request_id, input_embeds)
+
     async def _add_request(
         self,
         request: EngineCoreRequest,

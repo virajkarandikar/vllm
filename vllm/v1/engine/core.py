@@ -18,6 +18,7 @@ from multiprocessing.queues import Queue
 from typing import Any, TypeVar, cast
 
 import msgspec
+import torch
 import zmq
 
 import vllm.envs as envs
@@ -405,6 +406,9 @@ class EngineCore:
             # Immediately abort so the connector's request_finished hook runs
             # to free any pre-admission KV-transfer resources.
             self.abort_requests([request.request_id])
+
+    def set_input_embeds(self, request_id: str, input_embeds: torch.Tensor):
+        self.scheduler.set_input_embeds(request_id, input_embeds)
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -1381,6 +1385,9 @@ class EngineCoreProc(EngineCore):
             if self._reject_add_in_shutdown(req):
                 return
             self.add_request(req, request_wave)
+        elif request_type == EngineCoreRequestType.APPEND:
+            request_id, input_embeds = request
+            self.set_input_embeds(request_id, input_embeds)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
         elif request_type == EngineCoreRequestType.UTILITY:
@@ -1573,6 +1580,14 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                    elif request_type == EngineCoreRequestType.APPEND:
+                        if len(data_frames) < 1 or len(data_frames) > 2:
+                            raise ValueError(f"Unexpected number of data frames {len(data_frames)} for APPEND request")
+                        request_id, (dtype, shape, mem) = generic_decoder.decode(data_frames[0])
+                        if len(data_frames) == 2:
+                            mem = data_frames[1]
+                        input_embeds = generic_decoder._decode_tensor((dtype, shape, mem))
+                        request = (request_id, input_embeds)
                     else:
                         request = generic_decoder.decode(data_frames)
 
