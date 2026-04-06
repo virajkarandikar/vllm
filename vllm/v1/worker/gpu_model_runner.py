@@ -756,6 +756,26 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int32
         )
 
+        # Only relevant for multimodal models
+        if self.supports_mm_inputs:
+            # Double buffer to avoid race condition: previous iteration's async
+            # copy may still be reading from CPU while current iteration writes.
+            self.is_mm_embed_buffers = [
+                self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+                self._make_buffer(self.max_num_tokens, dtype=torch.bool),
+            ]
+            self.is_mm_embed_idx = 0
+
+        # Buffers for custom inputs
+        self.custom_inputs: dict[str, Any] = {}
+        if self.model_config.custom_input_specs is not None:
+            for spec in self.model_config.custom_input_specs:
+                self.custom_inputs[spec.name] = self._make_buffer(
+                    *spec.get_buffer_shape(self.max_num_tokens),
+                    dtype=spec.get_torch_dtype() or self.dtype,
+                    numpy=False,
+                )
+
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
             # NOTE: `mrope_positions` is implemented with one additional dummy
@@ -1012,8 +1032,16 @@ class GPUModelRunner(
             )
         return self._mamba_bufs
 
-    def _init_model_kwargs(self):
+    def _init_model_kwargs(self, num_tokens: int | None = None):
         model_kwargs = dict[str, Any]()
+
+        # set the custom inputs if buffers are available
+        if self.custom_inputs:
+            for input_name, buffer in self.custom_inputs.items():
+                if num_tokens is not None:
+                    model_kwargs[input_name] = buffer.gpu[:num_tokens]
+                else:
+                    model_kwargs[input_name] = buffer.gpu
 
         if not self.is_pooling_model:
             return model_kwargs
@@ -1217,8 +1245,7 @@ class GPUModelRunner(
                 prompt_token_ids=new_req_data.prompt_token_ids,
                 prompt_embeds=new_req_data.prompt_embeds,
                 prompt_is_token_ids=new_req_data.prompt_is_token_ids,
-                # for a new request, use prompt embeds
-                next_input_embeds=None,
+                custom_inputs=new_req_data.custom_inputs,
                 mm_features=new_req_data.mm_features,
                 sampling_params=sampling_params,
                 pooling_params=pooling_params,
@@ -1280,7 +1307,7 @@ class GPUModelRunner(
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
-            req_state.next_input_embeds = req_data.new_input_embeds[i]
+            req_state.custom_inputs = req_data.new_custom_inputs[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
             if req_state.prev_num_draft_len and self.use_async_scheduling:
@@ -1978,35 +2005,32 @@ class GPUModelRunner(
 
                 output_idx += num_sched
 
-        # same as with `req_prompt_embeds`, copy the explicitly
-        # provided input embeddings to `self.inputs_embeds`
-        # TODO: can this iteration be combined with the one for `req_prompt_embeds`?
-        if self.input_batch.req_next_embeds:
-            output_idx = 0
-            for req_idx in range(num_reqs):
-                num_sched = num_scheduled_tokens[req_idx]
+        if self.input_batch.req_custom_inputs:
+            # copy custom inputs into GPU buffers
+            for input_name in self.custom_inputs.keys():
+                in_requests = [
+                    input_name in self.input_batch.req_custom_inputs.get(req_idx, {})
+                    for req_idx in range(num_reqs)
+                ]
+                if not all(in_requests):
+                    raise RuntimeError(
+                        f"Custom input {input_name} should be set for all of the requests"
+                    )
 
-                # skip request if it doesnt have embeddings
-                if req_idx not in self.input_batch.req_next_embeds:
+                output_idx = 0
+                for req_idx in range(num_reqs):
+                    num_sched = num_scheduled_tokens[req_idx]
+                    custom_input = self.input_batch.req_custom_inputs[req_idx][input_name]
+                    if custom_input.shape[0] != num_sched:
+                        raise RuntimeError(
+                            f"Expected {num_sched} tokens for custom input {input_name} "
+                            f"for request {req_idx}, but got {custom_input.shape[0]}"
+                        )
+                    self.custom_inputs[input_name].cpu[
+                        output_idx : output_idx + num_sched
+                    ].copy_(custom_input)
                     output_idx += num_sched
-                    continue
-
-                # Skip if no tokens scheduled
-                if num_sched <= 0:
-                    output_idx += num_sched
-                    continue
-
-                next_embeds = self.input_batch.req_next_embeds[req_idx]
-                if next_embeds is None:
-                    output_idx += num_sched
-                    continue
-
-                if next_embeds.shape[0] != num_sched:
-                    raise RuntimeError(f"Expected {num_sched} embeddings for request {req_idx}, but got {next_embeds.shape[0]}")
-
-                self.inputs_embeds.cpu[output_idx : output_idx + num_sched].copy_(next_embeds)
-                self.is_token_ids.cpu[output_idx : output_idx + num_sched] = False
-                output_idx += num_sched
+                self.custom_inputs[input_name].copy_to_gpu(output_idx)
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -3440,7 +3464,7 @@ class GPUModelRunner(
 
             input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
             model_kwargs = {
-                **self._init_model_kwargs(),
+                **self._init_model_kwargs(num_input_tokens),
                 **self._extract_mm_kwargs(scheduler_output),
             }
         elif self.enable_prompt_embeds and is_first_rank:
@@ -3467,7 +3491,7 @@ class GPUModelRunner(
                 self.inputs_embeds.gpu[token_ids_idx] = tokens_to_embeds
 
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
-            model_kwargs = self._init_model_kwargs()
+            model_kwargs = self._init_model_kwargs(num_input_tokens)
             input_ids = None
         else:
             # For text-only models, we use token ids as input.
@@ -3476,7 +3500,7 @@ class GPUModelRunner(
             # then the embedding layer is not included in the CUDA graph.
             input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = None
-            model_kwargs = self._init_model_kwargs()
+            model_kwargs = self._init_model_kwargs(num_input_tokens)
 
         if self.uses_mrope:
             positions = self.mrope_positions.gpu[:, :num_input_tokens]
@@ -5820,7 +5844,7 @@ class GPUModelRunner(
         ):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
-            model_kwargs = self._init_model_kwargs()
+            model_kwargs = self._init_model_kwargs(num_tokens_padded)
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
                 input_ids, inputs_embeds = self._prepare_mm_inputs(num_tokens_padded)
 
@@ -5831,7 +5855,7 @@ class GPUModelRunner(
             elif self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
-                model_kwargs = self._init_model_kwargs()
+                model_kwargs = self._init_model_kwargs(num_tokens_padded)
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None

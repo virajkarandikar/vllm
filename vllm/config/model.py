@@ -3,7 +3,7 @@
 
 import warnings
 from collections.abc import Callable
-from dataclasses import InitVar, field
+from dataclasses import InitVar, dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
@@ -111,6 +111,41 @@ _RUNNER_CONVERTS: dict[RunnerType, list[ConvertType]] = {
 AttnTypeStr = Literal[
     "decoder", "encoder", "encoder_only", "encoder_decoder", "attention_free", "hybrid"
 ]
+
+
+@dataclass
+class CustomInputSpec:
+    """Specification for a custom input tensor."""
+
+    name: str
+    dtype: str | torch.dtype | None = None
+    dim: int | None = None
+
+    def get_torch_dtype(self) -> torch.dtype | None:
+        if self.dtype is None:
+            return None
+        if isinstance(self.dtype, torch.dtype):
+            return self.dtype
+        dtype_map = {
+            "int32": torch.int32,
+            "int64": torch.int64,
+            "float16": torch.float16,
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "float": torch.float32,
+            "half": torch.float16,
+        }
+        if self.dtype not in dtype_map:
+            raise ValueError(
+                f"Unsupported dtype: {self.dtype}. "
+                f"Supported: {list(dtype_map.keys())}"
+            )
+        return dtype_map[self.dtype]
+
+    def get_buffer_shape(self, max_tokens: int) -> tuple[int, ...]:
+        if self.dim is None:
+            return (max_tokens,)
+        return (max_tokens, self.dim)
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -331,6 +366,11 @@ class ModelConfig:
     definitions"""
     io_processor_plugin: str | None = None
     """IOProcessor plugin name to load at model startup"""
+    custom_input_specs: list[CustomInputSpec] | None = None
+    """List of custom input specifications. Each spec defines name, dtype, and shape
+    for a custom input that will be provided via append_request. If specified, the model
+    will wait for custom inputs before scheduling.
+    """
     renderer_num_workers: int = 1
     """Number of worker threads in the renderer thread pool. The pool is
     consumed by the async renderer path (e.g. the OpenAI-compatible API
@@ -743,6 +783,19 @@ class ModelConfig:
                 "tokenizer. Please specify the unquantized hf model's "
                 "repo name or path using the --tokenizer argument."
             )
+
+        self.custom_input_specs = None
+        custom_specs_dict = getattr(self.hf_config, "custom_input_specs", None)
+        if custom_specs_dict:
+            self.custom_input_specs = []
+            try:
+                for spec_dict in custom_specs_dict:
+                    spec = CustomInputSpec(**spec_dict)
+                    self.custom_input_specs.append(spec)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Error parsing custom input specifications from hf_config: {e}"
+                ) from e
 
         if self.disable_sliding_window:
             # Set after get_and_verify_max_len to ensure that max_model_len

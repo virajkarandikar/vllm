@@ -41,6 +41,7 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    custom_inputs: "dict[str, torch.Tensor] | None" = None
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -63,6 +64,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
+            custom_inputs=request.read_custom_inputs(),
             prefill_token_ids=prefill_token_ids,
         )
 
@@ -126,7 +128,7 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
-    new_input_embeds: list[torch.Tensor]
+    new_custom_inputs: list[dict[str, torch.Tensor]]
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -177,6 +179,7 @@ class CachedRequestData:
             new_block_ids=[],
             num_computed_tokens=[],
             num_output_tokens=[],
+            new_custom_inputs=[],
         )
 
 
