@@ -45,6 +45,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
     # `FalconConfig` class from the official HuggingFace transformers library.
     "RWConfig": "vllm.transformers_utils.configs.falcon",
+    "FastConformerCTCConfig": "vllm.transformers_utils.configs.fastconformer",
     "JAISConfig": "vllm.transformers_utils.configs.jais",
     "LagunaConfig": "vllm.transformers_utils.configs.laguna",
     "Lfm2MoeConfig": "vllm.transformers_utils.configs.lfm2_moe",
@@ -100,6 +101,7 @@ __all__ = [
     "DeepseekV4Config",
     "DotsOCRConfig",
     "EAGLEConfig",
+    "FastConformerCTCConfig",
     "FlexOlmoConfig",
     "FireRedLIDConfig",
     "FunAudioChatConfig",
