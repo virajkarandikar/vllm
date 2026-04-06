@@ -4520,12 +4520,14 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
-            # Extract hidden states per request
-            hidden_states_list = []
-            for i in range(num_reqs):
-                start = int(self.query_start_loc.np[i])
-                end = int(self.query_start_loc.np[i + 1])
-                hidden_states_list.append(hidden_states[start:end].cpu())
+            hidden_states_list = None
+            if self.model_config.return_hidden_states:
+                # Extract hidden states per request
+                hidden_states_list = []
+                for i in range(num_reqs):
+                    start = int(self.query_start_loc.np[i])
+                    end = int(self.query_start_loc.np[i + 1])
+                    hidden_states_list.append(hidden_states[start:end].cpu())
 
 
             output = ModelRunnerOutput(
