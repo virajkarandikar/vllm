@@ -256,6 +256,9 @@ class ModelRunnerOutput:
         default_factory=dict
     )
 
+    # [num_reqs] where each element is [num_tokens, hidden_size]
+    hidden_states: list[torch.Tensor] | None = None
+
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None
 

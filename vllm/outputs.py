@@ -40,8 +40,9 @@ class CompletionOutput:
     index: int
     text: str
     token_ids: GenericSequence[int]
-    cumulative_logprob: float | None
-    logprobs: SampleLogprobs | None
+    hidden_states: torch.Tensor | None = None
+    cumulative_logprob: float | None = None
+    logprobs: SampleLogprobs | None = None
     routed_experts: np.ndarray | None = None  # [seq_len,layer_num,topk]
     finish_reason: str | None = None
     stop_reason: int | str | None = None
@@ -55,6 +56,7 @@ class CompletionOutput:
             f"CompletionOutput(index={self.index}, "
             f"text={self.text!r}, "
             f"token_ids={self.token_ids}, "
+            f"hidden_states={self.hidden_states.shape if self.hidden_states is not None else None}, "
             f"routed_experts={self.routed_experts}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
