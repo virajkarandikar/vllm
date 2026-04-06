@@ -13,18 +13,16 @@ reshape_and_cache_flash = triton_reshape_and_cache_flash
 
 from vllm.v1.attention.backend import (
     AttentionBackend,
-    AttentionCGSupport
+    AttentionCGSupport,
     AttentionImpl,
     AttentionMetadata,
+    AttentionMetadataBuilder,
     AttentionType,
+    CommonAttentionMetadata,
     is_quantized_kv_cache,
 )
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.utils import (
-    AttentionMetadataBuilder,
-    CommonAttentionMetadata,
-)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.platforms import current_platform
 

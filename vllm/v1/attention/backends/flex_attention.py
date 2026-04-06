@@ -6,7 +6,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
-from typing import ClassVar, NamedTuple
+from typing import ClassVar, NamedTuple, Optional
 
 import torch
 import torch._dynamo.decorators

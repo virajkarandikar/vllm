@@ -31,7 +31,7 @@ from vllm.model_executor.models.fastconformer_preprocessor import FastConformerP
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn,
 )
-from vllm.utils import direct_register_custom_op
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.transformers_utils.configs.fastconformer import FastConformerCTCConfig
 import math
 
