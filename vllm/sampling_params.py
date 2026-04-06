@@ -309,6 +309,10 @@ class SamplingParams(
     generated token can complete the sequence."""
     _bad_words_token_ids: list[list[int]] | None = None
 
+    # skip sampling in case sampling is not needed (streaming encoders)
+    # or custom sampling happens inside model definition
+    skip_sampling: bool = False
+
     skip_reading_prefix_cache: bool | None = None
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
