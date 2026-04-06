@@ -15,7 +15,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
-    FastConformerSpec,
+    FastConformerConvSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheSpec,
@@ -1389,7 +1389,7 @@ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     MambaSpec: MambaManager,
     CrossAttentionSpec: CrossAttentionManager,
     SinkFullAttentionSpec: SinkFullAttentionManager,
-    FastConformerSpec: FullAttentionManager,
+    FastConformerConvSpec: FullAttentionManager,
 }
 
 

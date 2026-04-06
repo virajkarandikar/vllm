@@ -56,6 +56,7 @@ async def main():
         model=BUNDLE_DIR,
         max_model_len=4096,
         gpu_memory_utilization=0.85,
+        block_size=128,
         enable_prompt_embeds=True,
         enforce_eager=True,
         return_hidden_states=True,

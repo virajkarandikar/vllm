@@ -73,7 +73,7 @@ from vllm.model_executor.model_loader.reload import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
 )
-from vllm.model_executor.models.fastconformer import FastConformerCache
+from vllm.model_executor.models.fastconformer import FastConformerConvCache
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -147,6 +147,7 @@ from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
+    FastConformerConvSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -7209,6 +7210,12 @@ class GPUModelRunner(
                         packing,
                     )
 
+                elif isinstance(kv_cache_spec, FastConformerConvSpec):
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    kv_cache_shape = (num_blocks, *kv_cache_spec.shape)
+                    kv_caches[layer_name] = (
+                        raw_tensor.view(kv_cache_spec.dtype).view(kv_cache_shape)
+                    )
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
@@ -7551,11 +7558,11 @@ class GPUModelRunner(
                     spec = replace(spec, indexes_kv_by_block_stride=indexes)
                 kv_cache_spec[layer_name] = spec
 
-        fastconformer_layers = get_layers_from_vllm_config(
-            self.vllm_config, FastConformerCache
+        fastconformer_conv_layers = get_layers_from_vllm_config(
+            self.vllm_config, FastConformerConvCache
         )
-        for layer_name, fastconformer_module in fastconformer_layers.items():
-            kv_cache_spec[layer_name] = fastconformer_module.get_kv_cache_spec()
+        for layer_name, fastconformer_conv_module in fastconformer_conv_layers.items():
+            kv_cache_spec[layer_name] = fastconformer_conv_module.get_kv_cache_spec()
 
         return kv_cache_spec
 

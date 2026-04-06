@@ -26,7 +26,7 @@ class FastConformerCTCConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.d_model = d_model
         self.n_layers = n_layers
-        self.n_heads = n_heads
+        self.num_attention_heads = n_heads
         self.ff_mult = ff_mult
         self.k_conv = k_conv
         self.subsampling = subsampling if subsampling is not None else {}
