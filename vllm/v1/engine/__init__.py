@@ -175,6 +175,7 @@ class EngineCoreOutput(
     new_token_ids: list[int]
 
     new_logprobs: LogprobsLists | None = None
+    new_hidden_states: torch.Tensor | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
 
     pooling_output: torch.Tensor | None = None
