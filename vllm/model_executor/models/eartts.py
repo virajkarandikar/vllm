@@ -553,9 +553,7 @@ class EarTTSForCausalLM(nn.Module):
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
         codes = self._generate_step(hidden_states)  # quantizers x BT
-        return codes.transpose(0, 1).to(inputs_embeds.dtype)
-        #return hidden_states
-        return codes
+        return codes.transpose(0, 1)  # BT x quantizers
 
     def compute_logits(
         self,
