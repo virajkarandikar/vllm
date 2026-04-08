@@ -258,7 +258,9 @@ class AsyncLLM(EngineClient):
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown, cleaning up the background proc and IPC."""
-        shutdown_prometheus()
+        # Guard against interpreter shutdown where module globals become None
+        if callable(shutdown_prometheus):
+            shutdown_prometheus()
 
         if renderer := getattr(self, "renderer", None):
             renderer.shutdown()

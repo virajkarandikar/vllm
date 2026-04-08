@@ -1208,14 +1208,18 @@ class FastConformerConvManager(SingleTypeKVCacheManager):
     """
 
     def get_num_blocks_to_allocate(
-        self, request_id: str, num_tokens: int,
-        new_computed_blocks: list[KVCacheBlock],
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
     ) -> int:
         already = len(self.req_to_blocks[request_id])
         return max(1 - already, 0)
 
     def allocate_new_blocks(
-        self, request_id: str, num_tokens: int,
+        self, request_id: str, num_tokens: int, num_tokens_main_model: int,
     ) -> list[KVCacheBlock]:
         req_blocks = self.req_to_blocks[request_id]
         if len(req_blocks) >= 1:
@@ -1231,13 +1235,15 @@ class FastConformerConvManager(SingleTypeKVCacheManager):
     @classmethod
     def find_longest_cache_hit(
         cls,
-        block_hashes: list[BlockHash],
+        block_hashes: BlockHashList,
         max_length: int,
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         kv_cache_spec: KVCacheSpec,
         use_eagle: bool,
+        alignment_tokens: int,
         dcp_world_size: int = 1,
+        pcp_world_size: int = 1,
     ) -> tuple[list[KVCacheBlock], ...]:
         # No prefix caching for conv layers — every request starts fresh.
         return tuple([] for _ in range(len(kv_cache_group_ids)))
@@ -1248,9 +1254,7 @@ class FastConformerConvManager(SingleTypeKVCacheManager):
         # Only 1 block per request, nothing to evict.
         pass
 
-    def get_num_common_prefix_blocks(
-        self, request_id: str, num_running_requests: int,
-    ) -> int:
+    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         return 0
 
 

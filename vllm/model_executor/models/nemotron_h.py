@@ -961,9 +961,10 @@ class NemotronHForCausalLM(
         asr_token_ids: torch.Tensor | None = None,
         **kwargs,
     ):
+        inputs_embeds = kwargs.get("combined_embeds", None)
         # Compute combined embeddings inside the model
         # combined = acoustic_embeds + embed_tokens(text_token_ids) + embed_asr_tokens(asr_token_ids)
-        inputs_embeds = acoustic_embeds + self.model.embed_tokens(input_ids) + self.model.embed_asr_tokens(asr_token_ids)
+        # inputs_embeds = acoustic_embeds + self.model.embed_tokens(input_ids) + self.model.embed_asr_tokens(asr_token_ids)
 
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, input_asr_ids=None
