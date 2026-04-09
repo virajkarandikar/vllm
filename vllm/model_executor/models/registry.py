@@ -102,6 +102,7 @@ _TEXT_GENERATION_MODELS = {
     "Dots1ForCausalLM": ("dots1", "Dots1ForCausalLM"),
     "Ernie4_5ForCausalLM": ("ernie45", "Ernie4_5ForCausalLM"),
     "Ernie4_5_MoeForCausalLM": ("ernie45_moe", "Ernie4_5_MoeForCausalLM"),
+    "EarTTSForCausalLM": ("eartts", "EarTTSForCausalLM"),
     "ExaoneForCausalLM": ("exaone", "ExaoneForCausalLM"),
     "Exaone4ForCausalLM": ("exaone4", "Exaone4ForCausalLM"),
     "ExaoneMoEForCausalLM": ("exaone_moe", "ExaoneMoeForCausalLM"),
