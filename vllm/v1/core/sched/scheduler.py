@@ -994,13 +994,6 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
-        scheduled_requests = (
-            scheduled_new_reqs + scheduled_running_reqs + scheduled_resumed_reqs
-        )
-        structured_output_request_ids, grammar_bitmask = self.get_grammar_bitmask(
-            scheduled_requests, scheduled_spec_decode_tokens
-        )
-
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
