@@ -345,6 +345,13 @@ class EarTTSInputEmbedding(nn.Module):
                 hidden_size, hidden_size, hidden_size, config.num_quantizers
             )
 
+        self.use_audio_prompt_frozen_projection = config.use_audio_prompt_frozen_projection
+        if self.use_audio_prompt_frozen_projection:
+            self.audio_prompt_projection_W = nn.Parameter(
+                torch.empty(hidden_size, hidden_size),
+                requires_grad=False,
+            )
+
     def forward(
         self,
         acoustic_tokens: torch.Tensor,
@@ -369,7 +376,15 @@ class EarTTSInputEmbedding(nn.Module):
 
         acoustic_tokens = acoustic_tokens.transpose(0, 1)  # 31 x BT
         audio_emb = sum(emb(acoustic_tokens[i]) for i, emb in enumerate(self.rvq_embs))  # BT x latent_size
-        audio_emb = self.embed_code(audio_emb) + bos_emb  # BT x hidden_size
+        audio_emb = self.embed_code(audio_emb)  # BT x hidden_size
+
+        if self.use_audio_prompt_frozen_projection:
+            audio_prompt_latent = torch.nn.functional.linear(audio_emb, self.audio_prompt_projection_W.T)
+            # bos_mask is 0 before BOS, 1 at BOS position; pre_bos_mask selects tokens before BOS
+            pre_bos_mask = (bos_mask == 0).unsqueeze(-1)  # BT x 1
+            audio_emb = torch.where(pre_bos_mask, audio_prompt_latent, audio_emb)
+
+        audio_emb = audio_emb + bos_emb  # BT x hidden_size
 
         # embed text tokens by expanding them to chars and passing through transformer
         # apply the mask that turns this embedding to zeros for prefill tokens
@@ -811,6 +826,9 @@ class EarTTSForCausalLM(nn.Module):
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         # this is for compatability, it is not supposed to be used
         return self.model.backbone.get_input_embeddings(input_ids)
+
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.get_input_embeddings(input_ids)
 
     def forward(
         self,
