@@ -421,6 +421,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    custom_outputs_flat: dict[str, torch.Tensor] | None
 
 
 class GPUModelRunner(
@@ -4667,6 +4668,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            custom_outputs_flat,
         )
         self.kv_connector_output = kv_connector_output
 
@@ -4718,6 +4720,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            custom_outputs_flat,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -4890,13 +4893,14 @@ class GPUModelRunner(
             custom_outputs_list = None
             if custom_outputs_flat:
                 custom_outputs_list = []
+                num_output_reqs = len(req_ids_output_copy)
                 num_scheduled_tokens_np = np.array(
                     [scheduler_output.num_scheduled_tokens[req_id]
                      for req_id in req_ids_output_copy],
                     dtype=np.int32,
                 )
-                query_start_loc_np = self.query_start_loc.np[:num_reqs]
-                for i in range(num_reqs):
+                query_start_loc_np = self.query_start_loc.np[:num_output_reqs]
+                for i in range(num_output_reqs):
                     start = int(query_start_loc_np[i])
                     length = int(num_scheduled_tokens_np[i])
                     request_custom_outputs = {}
