@@ -411,7 +411,17 @@ class AsyncLLM(EngineClient):
         if self.errored:
             raise EngineDeadError()
 
-        await self.engine_core.set_custom_inputs_async(request_id, custom_inputs)
+        # Translate external request_id to internal request_id(s).
+        # The engine core stores requests under randomized internal IDs;
+        # the output_processor maintains the external→internal mapping.
+        internal_req_ids = self.output_processor.external_req_ids.get(request_id)
+        if not internal_req_ids:
+            raise ValueError(
+                f"append_request: request {request_id!r} not found "
+                "(already finished or never started)"
+            )
+        for internal_req_id in internal_req_ids:
+            await self.engine_core.set_custom_inputs_async(internal_req_id, custom_inputs)
 
     async def _add_request(
         self,
