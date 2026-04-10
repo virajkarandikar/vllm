@@ -1481,6 +1481,9 @@ class EngineCoreProc(EngineCore):
         add_request_decoder = MsgpackDecoder(
             EngineCoreRequest, oob_tensor_provider=self.tensor_ipc_receiver
         )
+        append_request_decoder = MsgpackDecoder(
+            EngineCoreAppendRequest, oob_tensor_provider=self.tensor_ipc_receiver
+        )
         generic_decoder = MsgpackDecoder(oob_tensor_provider=self.tensor_ipc_receiver)
 
         with ExitStack() as stack, zmq.Context() as ctx:
@@ -1561,8 +1564,10 @@ class EngineCoreProc(EngineCore):
                             self._handle_request_preproc_error(req)
                             continue
                     elif request_type == EngineCoreRequestType.APPEND:
-                        append_req: EngineCoreAppendRequest = generic_decoder.decode(data_frames)
-                        request = (append_req.request_id, append_req.custom_inputs)
+                        #append_req: EngineCoreAppendRequest = generic_decoder.decode(data_frames)
+                        #request = (append_req.request_id, append_req.custom_inputs)
+                        core_request = append_request_decoder.decode(data_frames)
+                        request = (core_request.request_id, core_request.custom_inputs)
                     else:
                         request = generic_decoder.decode(data_frames)
 
