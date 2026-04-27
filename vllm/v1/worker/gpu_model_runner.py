@@ -1201,6 +1201,11 @@ class GPUModelRunner(
         if scheduler_output.new_block_ids_to_zero:
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
+        # Zero freed KV cache blocks to prevent state contamination
+        if scheduler_output.block_ids_to_zero:
+            logger.info(f"zero freed KV cache blocks {scheduler_output.block_ids_to_zero}")
+            self._zero_block_ids(scheduler_output.block_ids_to_zero)
+
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
             self.encoder_cache.pop(mm_hash, None)

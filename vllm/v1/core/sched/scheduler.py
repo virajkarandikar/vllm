@@ -1020,6 +1020,11 @@ class Scheduler(SchedulerInterface):
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
+        # collect freed block IDs that need to be zeroed by the worker
+        freed_block_ids = self.kv_cache_manager.take_freed_block_ids()
+        if freed_block_ids:
+            scheduler_output.block_ids_to_zero = freed_block_ids
+
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
