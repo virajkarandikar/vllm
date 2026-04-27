@@ -243,6 +243,11 @@ class SchedulerOutput:
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None
 
+    # Block IDs that were freed and should be zeroed by the worker.
+    # This is needed to prevent state contamination when blocks are reused,
+    # particularly for Mamba layers that maintain conv_state and ssm_state.
+    block_ids_to_zero: list[int] | None = None
+
 
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
