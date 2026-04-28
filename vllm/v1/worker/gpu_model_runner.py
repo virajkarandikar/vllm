@@ -1211,7 +1211,6 @@ class GPUModelRunner(
 
         # Zero freed KV cache blocks to prevent state contamination
         if scheduler_output.block_ids_to_zero:
-            logger.info(f"zero freed KV cache blocks {scheduler_output.block_ids_to_zero}")
             self._zero_block_ids(scheduler_output.block_ids_to_zero)
 
         # Free the cached encoder outputs.
