@@ -4364,6 +4364,15 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
+                if hasattr(self.model, '_sampling_metadata'):
+                    self.model._sampling_metadata = self.input_batch.sampling_metadata
+                if hasattr(self.model, '_req_prompt_token_ids'):
+                    num_reqs = self.input_batch.num_reqs
+                    self.model._req_prompt_token_ids = {
+                        self.input_batch.req_ids[i]:
+                            self.input_batch.token_ids_cpu[i, :self.input_batch.num_prompt_tokens[i]].tolist()
+                        for i in range(num_reqs)
+                    }
                 logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
@@ -4383,6 +4392,15 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
+                    if hasattr(self.model, '_sampling_metadata'):
+                        self.model._sampling_metadata = self.input_batch.sampling_metadata
+                    if hasattr(self.model, '_req_prompt_token_ids'):
+                        num_reqs = self.input_batch.num_reqs
+                        self.model._req_prompt_token_ids = {
+                            self.input_batch.req_ids[i]:
+                                self.input_batch.token_ids_cpu[i, :self.input_batch.num_prompt_tokens[i]].tolist()
+                            for i in range(num_reqs)
+                        }
                     logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
@@ -6077,6 +6095,7 @@ class GPUModelRunner(
             presence_penalties=dummy_tensors(0.1),
             repetition_penalties=dummy_tensors(0.1),
             output_token_ids=[[] for _ in range(num_reqs)],
+            req_ids=[f"dummy-{i}" for i in range(num_reqs)],
             spec_token_ids=[[] for _ in range(num_reqs)],
             allowed_token_ids_mask=None,
             bad_words_token_ids={},
