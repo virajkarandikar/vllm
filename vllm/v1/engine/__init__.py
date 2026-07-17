@@ -100,6 +100,7 @@ class EngineCoreRequest(
     lora_request: LoRARequest | None
     cache_salt: str | None
     data_parallel_rank: int | None
+    is_streaming: bool | None = None
     prompt_embeds: torch.Tensor | None = None
     custom_inputs: dict[str, torch.Tensor] | None = None
 
