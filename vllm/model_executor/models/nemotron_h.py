@@ -970,13 +970,13 @@ class NemotronHForCausalLM(
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, input_asr_ids=None
         )
-        # Compute ASR tokens (always greedy/argmax - no sampling)
-        asr_logits = self.logits_processor(self.asr_head, hidden_states)
-        asr_tokens = torch.argmax(asr_logits, dim=1)
-        # Compute text logits for custom output
+        # Compute text logits for custom output (named 'text_logits' in custom_outputs config)
         text_logits = self.logits_processor(self.lm_head, hidden_states)
-        # Return: hidden_states + custom outputs (text_logits, asr_tokens, asr_logits)
-        return hidden_states, text_logits, asr_tokens, asr_logits
+        # Compute ASR/function tokens (argmax; named 'function_tokens' in custom_outputs config)
+        asr_logits = self.logits_processor(self.asr_head, hidden_states)
+        function_tokens = torch.argmax(asr_logits, dim=1)
+        # Return: hidden_states + exactly the custom outputs declared in config
+        return hidden_states, text_logits, function_tokens
 
     def compute_logits(
         self,
