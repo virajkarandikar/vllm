@@ -808,6 +808,7 @@ class NemotronHForCausalLM(
             "stt_model.embed_asr_tokens": "model.embed_asr_tokens",
             "stt_model.lm_head": "lm_head",
             "stt_model.asr_head": "asr_head",
+            "stt_model.function_head": None,  # not used in vllm model, skip
         },
         orig_to_new_substr={"A_log": "A", "embeddings": "embed_tokens"},
     )
