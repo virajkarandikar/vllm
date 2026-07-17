@@ -11,6 +11,7 @@ import triton.language as tl
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import triton_reshape_and_cache_flash
 reshape_and_cache_flash = triton_reshape_and_cache_flash
 
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -19,7 +20,6 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     AttentionType,
     CommonAttentionMetadata,
-    is_quantized_kv_cache,
 )
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
