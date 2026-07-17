@@ -161,6 +161,7 @@ class Request:
 
         self.spec_token_ids: list[int] = []
         self.num_computed_tokens = 0
+        self.num_cached_tokens = -1  # -1 = not yet set; scheduler sets on first schedule
         self.cache_salt: str | None = cache_salt
 
         # Multi-modal related
