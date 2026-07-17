@@ -40,7 +40,7 @@ class EarTTSConfig(PretrainedConfig):
         query_pre_attn_scalar: float = 256.0,  # Default attention scaling
         attention_bias: bool = False,  # Gemma models typically don't use attention bias
         rms_norm_eps: float = 1e-6,  # RMS normalization epsilon
-        layer_types: Optional[list] = None,  # Layer types ("global_attention" or "sliding_attention")
+        layer_types: Optional[list] = None,  # Layer types ("full_attention" in transformers>=5.x, was "global_attention")
         sliding_window: Optional[int] = 4096,  # Sliding window size for local attention
         rope_local_base_freq: float = 10000.0,  # RoPE base frequency for local attention
         rope_theta: float = 10000.0,  # RoPE theta for global attention
@@ -96,7 +96,11 @@ class EarTTSConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.rms_norm_eps = rms_norm_eps
         # Default all layers to global attention if not specified
-        self.layer_types = layer_types if layer_types is not None else ["global_attention"] * num_hidden_layers
+        # transformers>=5.x renamed "global_attention" → "full_attention"
+        if layer_types is not None:
+            self.layer_types = ["full_attention" if lt == "global_attention" else lt for lt in layer_types]
+        else:
+            self.layer_types = ["full_attention"] * num_hidden_layers
         self.sliding_window = sliding_window
         self.rope_local_base_freq = rope_local_base_freq
         self.rope_theta = rope_theta
