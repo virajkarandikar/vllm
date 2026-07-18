@@ -805,10 +805,10 @@ class NemotronHForCausalLM(
             "backbone": "model",
             "stt_model.llm": "model",
             "stt_model.embed_tokens": "model.embed_tokens",
-            "stt_model.embed_asr_tokens": "model.embed_asr_tokens",
             "stt_model.lm_head": "lm_head",
-            "stt_model.asr_head": "asr_head",
-            "stt_model.function_head": None,  # not used in vllm model, skip
+            # Checkpoint uses function_head for function/tool-call token prediction;
+            # the model calls this module asr_head.
+            "stt_model.function_head": "asr_head",
         },
         orig_to_new_substr={"A_log": "A", "embeddings": "embed_tokens"},
     )
