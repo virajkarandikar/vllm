@@ -358,6 +358,7 @@ class EarTTSInputEmbedding(nn.Module):
         text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
         bos_mask: torch.Tensor,
+        audio_prompt_latent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Works for context and generation phases to prepare total input embeddings
@@ -367,6 +368,8 @@ class EarTTSInputEmbedding(nn.Module):
             text_tokens: (BT) - text token to embed
             text_mask: (BT) - masks text embeddings for prefill
             bos_mask: (BT) - specifies where BOS is applied (first frame of prefill)
+            audio_prompt_latent: (BT x hidden_size) - pre-baked speaker latent; when
+                provided, bypasses live frozen-projection computation
         Returns:
             embedding of shape (BT x dim)
         """
@@ -379,10 +382,11 @@ class EarTTSInputEmbedding(nn.Module):
         audio_emb = self.embed_code(audio_emb)  # BT x hidden_size
 
         if self.use_audio_prompt_frozen_projection:
-            audio_prompt_latent = torch.nn.functional.linear(audio_emb, self.audio_prompt_projection_W.T)
+            if audio_prompt_latent is None:
+                audio_prompt_latent = torch.nn.functional.linear(audio_emb, self.audio_prompt_projection_W.T)
             # bos_mask is 0 before BOS, 1 at BOS position; pre_bos_mask selects tokens before BOS
             pre_bos_mask = (bos_mask == 0).unsqueeze(-1)  # BT x 1
-            audio_emb = torch.where(pre_bos_mask, audio_prompt_latent, audio_emb)
+            audio_emb = torch.where(pre_bos_mask, audio_prompt_latent.to(dtype=audio_emb.dtype), audio_emb)
 
         audio_emb = audio_emb + bos_emb  # BT x hidden_size
 
@@ -798,6 +802,7 @@ class EarTTSModel(nn.Module):
         text_tokens: torch.Tensor,
         text_mask: torch.Tensor,
         bos_mask: torch.Tensor,
+        audio_prompt_latent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Forward pass through embeddings and backbone transformer.
@@ -808,6 +813,7 @@ class EarTTSModel(nn.Module):
             text_tokens=text_tokens,
             text_mask=text_mask,
             bos_mask=bos_mask,
+            audio_prompt_latent=audio_prompt_latent,
         )
         hidden_states = self.backbone(input_ids, positions, intermediate_tensors, inputs_embeds=total_emb)
         codes = self.sampler(hidden_states)
@@ -841,8 +847,10 @@ class EarTTSForCausalLM(nn.Module):
         text_tokens: Optional[torch.Tensor] = None,
         # text tokens are not used for prompt
         text_mask: Optional[torch.Tensor] = None,
-        # bos is applied only to the first frame of audio embedding in prefill 
+        # bos is applied only to the first frame of audio embedding in prefill
         bos_mask: Optional[torch.Tensor] = None,
+        # pre-baked speaker latent; when provided, bypasses live frozen projection
+        audio_prompt_latent: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         """
         input_ids, positions, intermediate_tensors, inputs_embeds - not used,
@@ -860,6 +868,7 @@ class EarTTSForCausalLM(nn.Module):
             text_tokens=text_tokens,
             text_mask=text_mask,
             bos_mask=bos_mask,
+            audio_prompt_latent=audio_prompt_latent,
         )
         return hidden_states, codes
 
