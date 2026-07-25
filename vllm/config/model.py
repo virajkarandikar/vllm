@@ -753,14 +753,6 @@ class ModelConfig:
                     "disable the cache with --mm-processor-cache-gb 0."
                 )
 
-        # Multimodal GGUF models must use original repo for mm processing
-        if is_gguf(self.tokenizer) and self.is_multimodal_model:
-            raise ValueError(
-                "Loading a multimodal GGUF model needs to use original "
-                "tokenizer. Please specify the unquantized hf model's "
-                "repo name or path using the --tokenizer argument."
-            )
-
         self.custom_input_specs = None
         custom_specs_dict = getattr(self.hf_config, "custom_input_specs", None)
         if custom_specs_dict:
