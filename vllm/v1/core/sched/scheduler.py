@@ -1041,6 +1041,9 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                # Only track requests that will still be prefilling after this chunk.
+                if num_computed_tokens + num_new_tokens < request.num_tokens:
+                    self._inflight_prefills.add(request)
 
                 # Also record CFG uncond if present
                 if cfg_uncond is not None:
@@ -1155,6 +1158,13 @@ class Scheduler(SchedulerInterface):
             if self.needs_kv_cache_zeroing
             else None
         )
+
+        # Dynamic speculative decoding: compute optimal K
+        num_spec_tokens_to_schedule = self.num_spec_tokens
+        if self.dynamic_sd_lookup is not None and len(num_scheduled_tokens) > 0:
+            num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
+                len(num_scheduled_tokens)
+            ]
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,

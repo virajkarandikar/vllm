@@ -536,7 +536,9 @@ class CommonAttentionMetadata:
             max_seq_len=self.max_seq_len,
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
-            causal=self.causal,
+            causal=self.causal[:num_actual_reqs]
+            if isinstance(self.causal, torch.Tensor)
+            else self.causal,
             doc_ids=self.doc_ids[:num_actual_tokens] if self.doc_ids is not None else None,
             decode_offset=maybe_slice_reqs(self.decode_offset),
             logits_indices_padded=self.logits_indices_padded,

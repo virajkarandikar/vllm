@@ -8,7 +8,7 @@ import math
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 import msgspec
 from pydantic import BeforeValidator

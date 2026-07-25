@@ -512,7 +512,10 @@ class GPUModelRunner(
         self.use_async_scheduling = self.scheduler_config.async_scheduling
 
         # Sampler
-        self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        self.sampler = Sampler(
+            logprobs_mode=self.model_config.logprobs_mode,
+            use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+        )
         # Number of dummy tokens produced per step when skip_sampling=True.
         # Allows non-autoregressive models (e.g. FastConformer) to process
         # multiple frames per decode step.

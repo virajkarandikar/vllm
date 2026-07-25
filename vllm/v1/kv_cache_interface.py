@@ -615,6 +615,15 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             model_version=model_version_set.pop(),
         )
 
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, SlidingWindowMLASpec)
+            and spec.sliding_window == self.sliding_window
+            for spec in kv_cache_specs.values()
+        )
+
 
 @dataclass(frozen=True, eq=False)
 class FastConformerConvSpec(KVCacheSpec):
@@ -831,55 +840,8 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         if len(block_sizes) > 1:
             # Different block sizes, not uniform.
             return False
-        one_spec = next(iter(kv_cache_specs.values()))
-        # NOTE: Check subclasses before parent classes since isinstance()
-        # returns True for subclasses.
-        if isinstance(one_spec, SlidingWindowMLASpec):
-            # SlidingWindowMLASpec is uniform if all specs are SlidingWindowMLASpec
-            # with the same sliding_window size.
-            return all(
-                isinstance(spec, SlidingWindowMLASpec)
-                and spec.sliding_window == one_spec.sliding_window
-                for spec in kv_cache_specs.values()
-            )
-        elif isinstance(one_spec, FullAttentionSpec):
-            return all(
-                isinstance(spec, FullAttentionSpec) for spec in kv_cache_specs.values()
-            )
-        elif isinstance(one_spec, CrossAttentionSpec):
-            return all(
-                isinstance(spec, CrossAttentionSpec) for spec in kv_cache_specs.values()
-            )
-        elif isinstance(one_spec, SlidingWindowSpec):
-            return all(
-                isinstance(spec, SlidingWindowSpec)
-                and spec.sliding_window == one_spec.sliding_window
-                for spec in kv_cache_specs.values()
-            )
-        elif isinstance(one_spec, ChunkedLocalAttentionSpec):
-            return all(
-                isinstance(spec, ChunkedLocalAttentionSpec)
-                and spec.attention_chunk_size == one_spec.attention_chunk_size
-                for spec in kv_cache_specs.values()
-            )
-        elif isinstance(one_spec, MambaSpec):
-            return all(
-                isinstance(spec, MambaSpec)
-                and spec.num_speculative_blocks == one_spec.num_speculative_blocks
-                for spec in kv_cache_specs.values()
-            )
-        elif isinstance(one_spec, FastConformerConvSpec):
-            # All FastConformerConvSpec layers are considered uniform type
-            # as long as they have the same block_size (checked above)
-            return all(
-                isinstance(spec, FastConformerConvSpec)
-                for spec in kv_cache_specs.values()
-            )
-        else:
-            # NOTE(Chen): Please add new branches for new KV cache spec types.
-            raise NotImplementedError(
-                f"Unsupported KV cache spec type: {type(one_spec)}"
-            )
+        first_spec = next(iter(kv_cache_specs.values()))
+        return first_spec.is_uniform_with_collection(kv_cache_specs)
 
     @classmethod
     def from_specs(cls, kv_cache_specs: dict[str, KVCacheSpec]) -> Self | None:

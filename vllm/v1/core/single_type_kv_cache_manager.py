@@ -1420,7 +1420,7 @@ class FastConformerConvManager(SingleTypeKVCacheManager):
         kv_cache_group_ids: list[int],
         block_pool: BlockPool,
         kv_cache_spec: KVCacheSpec,
-        use_eagle: bool,
+        drop_eagle_block: bool,
         alignment_tokens: int,
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
@@ -1436,21 +1436,6 @@ class FastConformerConvManager(SingleTypeKVCacheManager):
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         return 0
-
-
-spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
-    FullAttentionSpec: FullAttentionManager,
-    TQFullAttentionSpec: FullAttentionManager,
-    MLAAttentionSpec: FullAttentionManager,
-    HiddenStateCacheSpec: FullAttentionManager,
-    SlidingWindowSpec: SlidingWindowManager,
-    SlidingWindowMLASpec: SlidingWindowManager,
-    ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,
-    MambaSpec: MambaManager,
-    CrossAttentionSpec: CrossAttentionManager,
-    SinkFullAttentionSpec: SinkFullAttentionManager,
-    FastConformerConvSpec: FastConformerConvManager,
-}
 
 
 def get_manager_for_kv_cache_spec(
@@ -1545,6 +1530,15 @@ def register_all_kvcache_specs(vllm_config):
         SinkFullAttentionSpec,
         SinkFullAttentionManager,
         uniform_type_base_spec=FullAttentionSpec,
+    )
+
+    # FastConformer conv/mel/stft ring-buffer layers (voicechat fork).
+    # uniform_type_base_spec=FastConformerConvSpec replaces the fork's old
+    # explicit FastConformerConvSpec branch in KVCacheSpec.is_uniform_with_collection.
+    KVCacheSpecRegistry.register(
+        FastConformerConvSpec,
+        FastConformerConvManager,
+        uniform_type_base_spec=FastConformerConvSpec,
     )
 
     from vllm.platforms import current_platform
