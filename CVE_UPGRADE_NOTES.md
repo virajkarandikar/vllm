@@ -57,7 +57,21 @@ porting the *net* custom diff onto a fresh upstream base, then replayed as above
 Until this is done and validated, the 3 vLLM CVEs are handled by temporary GlobalVEX
 (not inference-reachable unless spec-decode / M-RoPE prompt_embeds / guided-regex are exposed).
 
-### Conflict-resolution status (branch `voicechat_v0.24.0`, WIP — py-compiles, NOT runtime-validated)
+### RUNTIME-VALIDATED (2026-07): nemotron-voicechat loads under vllm 0.24.0
+
+Built `docker/Dockerfile.s2s` through the vllm step against fork tip `712a1b369` +
+`v0.24.0+cu129` wheel, then ran the model: **Triton loads both engines (nano-v2-vllm +
+eartts_vllm) and goes health-READY**. Two port bugs surfaced by the model run and fixed
+in the fork (commits on top of the reconcile):
+- `config/model.py`: dropped stray GGUF check (`is_gguf` undefined in v0.24.0 model.py) —
+  was v0.22.0 diff-context, not a fork feature.
+- `v1/worker/gpu_model_runner.py`: CFGBuffers now use the module-level `PIN_MEMORY` constant
+  instead of the removed `self.pin_memory` instance attr.
+Note: the FULL Dockerfile build is currently blocked LATER (after vllm) by a stale NeMo pin
+(`2f5697bd…` no longer reachable in NVIDIA-NeMo/Speech) — unrelated to vllm; needs a fresh
+NeMo commit. The model run above used a working image with only vllm swapped to isolate the bump.
+
+### Conflict-resolution status (branch `voicechat_v0.24.0`)
 
 Steps 1–2 above are DONE on the local `voicechat_v0.24.0` branch. **All 10 conflicts are
 resolved.** Validation performed (2026-07, inside the riva-s2s A100 container):
