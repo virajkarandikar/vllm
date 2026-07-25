@@ -878,7 +878,7 @@ class GPUModelRunner(
                 max_num_reqs=self.max_num_reqs,
                 max_num_tokens=self.max_num_tokens,
                 device=self.device,
-                pin_memory=self.pin_memory,
+                pin_memory=PIN_MEMORY,
             )
 
         # Cached outputs.
