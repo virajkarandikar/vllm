@@ -4,40 +4,64 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
 
-from vllm.triton_utils import triton
 from vllm.v1.attention.ops import triton_unified_attention as base_unified
 
 
-def _get_tile_size_override(
-    head_size: int,
-    sliding_window: int,
-    element_size: int,
-    is_prefill: bool,
-) -> int:
-    """Allow env overrides for tile sizes while reusing base defaults."""
-    if is_prefill:
-        override = os.getenv("VLLM_CUSTOM_TILE_SIZE_PREFILL")
-    else:
-        override = os.getenv("VLLM_CUSTOM_TILE_SIZE_DECODE")
+def _env_tile_size(name: str) -> int | None:
+    """Read a positive int tile size from ``name``, or None if unset/invalid."""
+    override = os.getenv(name)
+    if not override:
+        return None
+    try:
+        value = int(override)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
-    if override:
-        try:
-            override_val = int(override)
-            if override_val > 0:
-                return override_val
-        except ValueError:
-            pass
 
-    return base_unified._get_tile_size(
-        head_size=head_size,
-        sliding_window=sliding_window,
-        element_size=element_size,
-        is_prefill=is_prefill,
-    )
+@contextlib.contextmanager
+def _tile_size_override():
+    """Scope an env override of the base tile-size heuristic.
+
+    ``unified_attention`` picks its tile sizes internally via
+    ``_get_tile_size``; there is no parameter to inject them.  Rather than
+    fork the whole wrapper (~80 kernel kwargs that would have to be kept in
+    sync with upstream by hand), swap the module-level helper for the
+    duration of the call.
+
+    When neither env var is set this is a no-op and the delegated call is
+    bit-identical to upstream.  vLLM runs the forward pass single-threaded
+    per worker process, so the temporary rebind is not raced.
+    """
+    prefill = _env_tile_size("VLLM_CUSTOM_TILE_SIZE_PREFILL")
+    decode = _env_tile_size("VLLM_CUSTOM_TILE_SIZE_DECODE")
+    if prefill is None and decode is None:
+        yield
+        return
+
+    original = base_unified._get_tile_size
+
+    def patched(head_size, sliding_window, element_size, is_prefill):
+        override = prefill if is_prefill else decode
+        if override is not None:
+            return override
+        return original(
+            head_size=head_size,
+            sliding_window=sliding_window,
+            element_size=element_size,
+            is_prefill=is_prefill,
+        )
+
+    base_unified._get_tile_size = patched
+    try:
+        yield
+    finally:
+        base_unified._get_tile_size = original
 
 
 def custom_unified_attention(
@@ -72,181 +96,33 @@ def custom_unified_attention(
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
-    if sinks is not None:
-        assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
-
-    use_mm_prefix = False
-    max_mm_ranges = 0
-    if mm_prefix_range is not None:
-        if mm_prefix_range.ndim == 3:
-            use_mm_prefix = True
-            max_mm_ranges = mm_prefix_range.shape[1]
-        else:
-            raise ValueError(
-                f"Unsupported mm_prefix_range shape: {mm_prefix_range.shape}"
-            )
-
-    use_alibi_slopes = alibi_slopes is not None
-    use_qq_bias = qq_bias is not None
-
-    block_size = v.shape[1]
-    num_seqs = len(seqused_k)
-    num_query_heads = q.shape[1]
-    num_kv_heads = k.shape[2]
-    num_queries_per_kv = num_query_heads // num_kv_heads
-    head_size = q.shape[2]
-
-    BLOCK_M = (
-        16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
-    )
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
-
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
-
-    sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
-    TILE_SIZE_PREFILL = _get_tile_size_override(
-        head_size,
-        sliding_window_val,
-        q.element_size(),
-        is_prefill=True,
-    )
-    TILE_SIZE_DECODE = _get_tile_size_override(
-        head_size,
-        sliding_window_val,
-        q.element_size(),
-        is_prefill=False,
-    )
-
-    if (
-        seq_threshold_3D is None
-        or num_par_softmax_segments is None
-        or softmax_segm_output is None
-        or softmax_segm_max is None
-        or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
-    ):
-        base_unified.kernel_unified_attention_2d[
-            (total_num_q_blocks, num_kv_heads)
-        ](
-            output_ptr=out,
-            query_ptr=q,
-            key_cache_ptr=k,
-            value_cache_ptr=v,
-            sink_ptr=sinks,
-            block_tables_ptr=block_table,
-            seq_lens_ptr=seqused_k,
-            alibi_slopes_ptr=alibi_slopes,
-            qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            out_scale=1 / output_scale if output_scale is not None else 1.0,
+    with _tile_size_override():
+        base_unified.unified_attention(
+            q=q,
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            seqused_k=seqused_k,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            block_table=block_table,
             softcap=softcap,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            BLOCK_SIZE=block_size,
-            TILE_SIZE=TILE_SIZE_PREFILL,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_ALIBI_SQRT=use_alibi_sqrt,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
-            USE_MM_PREFIX=use_mm_prefix,
-            MAX_MM_RANGES=max_mm_ranges,
-            mm_prefix_range_ptr=mm_prefix_range,
-            SLIDING_WINDOW=(1 + window_size[0]),
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
-            USE_FP8=output_scale is not None,
-        )
-    else:
-        base_unified.kernel_unified_attention_3d[
-            (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
-        ](
-            segm_output_ptr=softmax_segm_output,
-            segm_max_ptr=softmax_segm_max,
-            segm_expsum_ptr=softmax_segm_expsum,
-            query_ptr=q,
-            key_cache_ptr=k,
-            value_cache_ptr=v,
-            sink_ptr=sinks,
-            block_tables_ptr=block_table,
-            seq_lens_ptr=seqused_k,
-            alibi_slopes_ptr=alibi_slopes,
-            qq_bias_ptr=qq_bias,
-            scale=softmax_scale,
-            k_scale=k_descale,
-            v_scale=v_descale,
-            softcap=softcap,
-            num_query_heads=num_query_heads,
-            num_queries_per_kv=num_queries_per_kv,
-            block_table_stride=block_table.stride(0),
-            query_stride_0=q.stride(0),
-            query_stride_1=q.stride(1),
-            qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
-            BLOCK_SIZE=block_size,
-            TILE_SIZE=TILE_SIZE_DECODE,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            USE_ALIBI_SLOPES=use_alibi_slopes,
-            USE_ALIBI_SQRT=use_alibi_sqrt,
-            USE_QQ_BIAS=use_qq_bias,
-            USE_SOFTCAP=(softcap > 0),
-            USE_SINKS=(sinks is not None),
-            USE_MM_PREFIX=use_mm_prefix,
-            MAX_MM_RANGES=max_mm_ranges,
-            mm_prefix_range_ptr=mm_prefix_range,
-            SLIDING_WINDOW=(1 + window_size[0]),
-            stride_k_cache_0=k.stride(0),
-            stride_k_cache_1=k.stride(1),
-            stride_k_cache_2=k.stride(2),
-            stride_k_cache_3=k.stride(3),
-            stride_v_cache_0=v.stride(0),
-            stride_v_cache_1=v.stride(1),
-            stride_v_cache_2=v.stride(2),
-            stride_v_cache_3=v.stride(3),
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            num_seqs=num_seqs,
-            BLOCK_M=BLOCK_M,
-            NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
-        )
-        base_unified.reduce_segments[(q.shape[0], num_query_heads)](
-            output_ptr=out,
-            segm_output_ptr=softmax_segm_output,
-            segm_max_ptr=softmax_segm_max,
-            segm_expsum_ptr=softmax_segm_expsum,
-            seq_lens_ptr=seqused_k,
-            num_seqs=num_seqs,
-            num_query_heads=num_query_heads,
-            out_scale_inv=1 / output_scale if output_scale is not None else 1.0,
-            output_stride_0=out.stride(0),
-            output_stride_1=out.stride(1),
-            block_table_stride=block_table.stride(0),
-            TILE_SIZE=TILE_SIZE_DECODE,
-            HEAD_SIZE=head_size,
-            HEAD_SIZE_PADDED=triton.next_power_of_2(head_size),
-            query_start_len_ptr=cu_seqlens_q,
-            BLOCK_Q=BLOCK_Q,
-            NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
-            USE_FP8=output_scale is not None,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            seq_threshold_3D=seq_threshold_3D,
+            num_par_softmax_segments=num_par_softmax_segments,
+            softmax_segm_output=softmax_segm_output,
+            softmax_segm_max=softmax_segm_max,
+            softmax_segm_expsum=softmax_segm_expsum,
+            alibi_slopes=alibi_slopes,
+            output_scale=output_scale,
+            qq_bias=qq_bias,
+            sinks=sinks,
+            mm_prefix_range=mm_prefix_range,
+            use_alibi_sqrt=use_alibi_sqrt,
         )
