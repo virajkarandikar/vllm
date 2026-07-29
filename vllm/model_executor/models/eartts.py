@@ -127,7 +127,9 @@ class SubwordFlagEmbedding(nn.Module):
 
     def __init__(self, model_name: str, d_model: int):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name, local_files_only=os.path.isdir(model_name)
+        )
         self.vocab_size = self.tokenizer.vocab_size
         self.d_model = d_model
 
@@ -169,7 +171,9 @@ class BOSEOSEmbedding(nn.Module):
 
     def __init__(self, model_name: str, d_model: int):
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_name, local_files_only=os.path.isdir(model_name)
+        )
         # vocab size that includes special tokens
         vocab_dict = self.tokenizer.get_vocab()
         self.vocab_size = max(vocab_dict.values())
@@ -182,7 +186,7 @@ class BOSEOSEmbedding(nn.Module):
         # Identify BOS and EOS tokens (may be None)
         tokens = [self.tokenizer.convert_ids_to_tokens(i) for i in range(self.vocab_size)]
 
-        if 'Qwen2.5' in model_name:
+        if 'Qwen2' in type(self.tokenizer).__name__:
             # For Qwen, '<|im_start|>' is a common choice for a BOS token.
             # You can check your tokenizer's vocabulary for the best candidate.
             print("Tokenizer does not have a `bos_token`. Setting it to '<|im_start|>'.", flush=True)
