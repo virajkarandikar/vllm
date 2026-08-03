@@ -338,6 +338,17 @@ class EarTTSInputEmbedding(nn.Module):
 
         self.use_subword_flag_emb = config.use_subword_flag_emb
         pretrained_tokenizer_name = config.pretrained_tokenizer_name
+        # Resolve relative paths or stale absolute paths from a different host.
+        # config.name_or_path is the eartts_vllm/ dir set by vLLM from Triton,
+        # so dirname gives the runtime model_repo_path.
+        if pretrained_tokenizer_name and not os.path.isdir(pretrained_tokenizer_name):
+            model_dir = os.path.normpath(getattr(config, 'name_or_path', '') or '')
+            if model_dir:
+                rel = (pretrained_tokenizer_name if not os.path.isabs(pretrained_tokenizer_name)
+                       else os.path.basename(pretrained_tokenizer_name))
+                pretrained_tokenizer_name = os.path.normpath(
+                    os.path.join(os.path.dirname(model_dir), rel)
+                )
         if self.use_subword_flag_emb:
             self.subword_flag_emb = SubwordFlagEmbedding(pretrained_tokenizer_name, hidden_size)
         self.use_bos_eos_emb = config.use_bos_eos_emb
